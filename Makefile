@@ -1,143 +1,117 @@
-VERSION := $(shell cat VERSION)
-PREFIX ?= /usr/local
-BINDIR ?= ${PREFIX}/bin
-LIBEXECDIR ?= ${PREFIX}/libexec
-PKG_CONFIG ?= pkg-config
-HEADERS := $(wildcard src/*.h)
-
-OBJS := src/conmon.o src/cmsg.o src/ctr_logging.o src/utils.o src/cli.o src/globals.o src/cgroup.o src/conn_sock.o src/oom.o src/ctrl.o src/ctr_stdio.o src/parent_pipe_fd.o src/ctr_exit.o src/runtime_args.o src/close_fds.o src/seccomp_notify.o
-
 MAKEFILE_PATH := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+BINARY := conmon
+CONTAINER_RUNTIME ?= podman
+BUILD_DIR ?= .build
+TEST_FLAGS ?=
+PACKAGE_NAME ?= $(shell cargo metadata --no-deps --format-version 1 | jq -r '.packages[2] | [ .name, .version ] | join("-v")')
+PREFIX ?= /usr
+CI_TAG ?=
+CONMON_V2_DIR ?= conmon-v2
+CONMON_V2_URL ?= https://github.com/containers/conmon.git
+CONMON_V2_REMOTE ?= upstream
+CONMON_V2_BRANCH ?= main
 
-.PHONY: all git-vars docs
-all: git-vars bin bin/conmon
+COLOR:=\\033[36m
+NOCOLOR:=\\033[0m
+WIDTH:=25
 
-git-vars:
-ifeq ($(shell bash -c '[[ `command -v git` && `git rev-parse --git-dir 2>/dev/null` ]] && echo 0'),0)
-	$(eval COMMIT_NO :=$(shell git rev-parse HEAD 2> /dev/null || true))
-	$(eval GIT_COMMIT := $(if $(shell git status --porcelain --untracked-files=no),"${COMMIT_NO}-dirty","${COMMIT_NO}"))
-	$(eval GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null))
-	$(eval GIT_BRANCH_CLEAN := $(shell echo $(GIT_BRANCH) | sed -e "s/[^[:alnum:]]/-/g"))
-else
-	$(eval COMMIT_NO := unknown)
-	$(eval GIT_COMMIT := unknown)
-	$(eval GIT_BRANCH := unknown)
-	$(eval GIT_BRANCH_CLEAN := unknown)
-endif
+all: default
 
-override LIBS += $(shell $(PKG_CONFIG) --libs glib-2.0)
+.PHONY: help
+help:  ## Display this help.
+	@awk \
+		-v "col=${COLOR}" -v "nocol=${NOCOLOR}" \
+		' \
+			BEGIN { \
+				FS = ":.*##" ; \
+				printf "Usage:\n  make %s<target>%s\n", col, nocol \
+			} \
+			/^[./a-zA-Z_-]+:.*?##/ { \
+				printf "  %s%-${WIDTH}s%s %s\n", col, $$1, nocol, $$2 \
+			} \
+			/^##@/ { \
+				printf "\n%s\n", substr($$0, 5) \
+			} \
+		' $(MAKEFILE_LIST)
 
-CFLAGS ?= -std=c99 -Os -Wall -Wextra -Werror
-override CFLAGS += $(shell $(PKG_CONFIG) --cflags glib-2.0) -DVERSION=\"$(VERSION)\" -DGIT_COMMIT=\"$(GIT_COMMIT)\"
+##@ Build targets:
 
-# Conditionally compile journald logging code if the libraries can be found
-# if they can be found, set USE_JOURNALD macro for use in conmon code.
-#
-# "pkg-config --exists" will error if the package doesn't exist. Make can only compare
-# output of commands, so the echo commands are to allow pkg-config to error out, make to catch it,
-# and allow the compilation to complete.
-#
-# For static builds, systemd can be disabled with DISABLE_SYSTEMD=1
-ifneq ($(DISABLE_SYSTEMD), 1)
-ifeq ($(shell $(PKG_CONFIG) --exists libsystemd && echo "0"), 0)
-	override LIBS += $(shell $(PKG_CONFIG) --libs libsystemd)
-	override CFLAGS += $(shell $(PKG_CONFIG) --cflags libsystemd) -D USE_JOURNALD=1
-endif
-endif
+.PHONY: default
+default: ## Build the conmon binary.
+	cargo build
 
-ifeq ($(shell hack/seccomp-notify.sh), 0)
-	override LIBS += $(shell $(PKG_CONFIG) --libs libseccomp) -ldl
-	override CFLAGS += $(shell $(PKG_CONFIG) --cflags libseccomp) -D USE_SECCOMP=1
-endif
+.PHONY: release
+release: ## Build the conmon binary in release mode.
+	cargo build --release
 
-# Update nix/nixpkgs.json its latest stable commit
-.PHONY: nixpkgs
-nixpkgs:
-	@nix run -f channel:nixpkgs-unstable nix-prefetch-git -- \
-		--no-deepClone https://github.com/nixos/nixpkgs > nix/nixpkgs.json
+.PHONY: release-static
+release-static: ## Build the conmon binary in release-static mode.
+	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu
+	strip -s target/x86_64-unknown-linux-gnu/release/conmon
+	ldd target/x86_64-unknown-linux-gnu/release/conmon 2>&1 | grep -qE '(statically linked)|(not a dynamic executable)'
 
-# Build statically linked binary
-.PHONY: static
-static:
-	@nix build -f nix/
-	mkdir -p ./bin
-	cp -rfp ./result/bin/* ./bin/
-
-bin/conmon: $(OBJS) | bin
-	$(CC) $(LDFLAGS) $(CFLAGS) $(DEBUGFLAG) -o $@ $^ $(LIBS)
-
-%.o: %.c $(HEADERS)
-	$(CC) $(CFLAGS) $(DEBUGFLAG) -o $@ -c $<
-
-# config target removed - no longer using Go build system
-
-.PHONY: test-binary
-test-binary: bin/conmon
-	CONMON_BINARY="$(MAKEFILE_PATH)bin/conmon" test/run-tests.sh
+##@ Test targets:
 
 .PHONY: test
-test: test-binary
+test: unit e2e ## Run both `unit` and `e2e` tests
 
-.PHONY: test-coverage
-test-coverage: DEBUGFLAG += --coverage
-test-coverage: clean test-binary
-	@echo "=== Coverage Summary ==="
-	@if command -v gcovr >/dev/null 2>&1; then \
-		gcovr -r . --txt-metric=branch || true; \
-	else \
-		echo "WARNING: gcovr not found in PATH, falling back to gcov."; \
-		for file in src/*.c; do \
-			gcov "$$file" 2>/dev/null \
-			| grep -E '(^File|^Lines executed)' \
-			| paste - - \
-			| sed "s|File 'src/\([^.]*\)\.c'.*Lines executed:\([0-9.]*%\).*|\1.c: \2|"; \
-		done | grep -E '\.c: [0-9]' | sort; \
-	fi
+.PHONY: unit
+unit: ## Run the unit tests.
+	cargo test --no-fail-fast
 
-bin:
-	mkdir -p bin
+.PHONY: e2e
+e2e: conmon-v2 ## Run the e2e tests.
+	CONMON_BINARY="$(MAKEFILE_PATH)target/debug/conmon" conmon-v2/test/run-tests.sh
 
-# vendor target removed - no longer using Go modules
+.PHONY: lint
+lint: ## Run the linter.
+	cargo fmt && git diff --exit-code
+	cargo clippy --all-targets --all-features -- -D warnings
 
-.PHONY: docs
-docs:
-	$(MAKE) -C docs
+##@ Utility targets:
+
+.PHONY: prettier
+prettier: ## Prettify supported files.
+	$(CONTAINER_RUNTIME) run -it --privileged -v ${PWD}:/w -w /w --entrypoint bash node:latest -c \
+		'npm install -g prettier && prettier -w .'
 
 .PHONY: clean
-clean:
-	rm -rf bin/ src/*.o src/*.gcno src/*.gcda *.gcov
-	$(MAKE) -C docs clean
+clean: ## Cleanup the project files.
+	rm -rf target/
+	rm -rf conmon-v2/
 
-.PHONY: install install.bin install.crio install.podman podman crio
-install: install.bin docs
-	$(MAKE) -C docs install
+.PHONY: install
+install: ## Install the binary.
+	mkdir -p "${DESTDIR}$(PREFIX)/bin"
+	install -D -t "${DESTDIR}$(PREFIX)/bin" target/release/conmon
 
-podman: install.podman
-
-crio: install.crio
-
-install.bin: bin/conmon
-	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(BINDIR)
-	install ${SELINUXOPT} -m 755 bin/conmon $(DESTDIR)$(BINDIR)/conmon
-
-install.crio: bin/conmon
-	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(LIBEXECDIR)/crio
-	install ${SELINUXOPT} -m 755 bin/conmon $(DESTDIR)$(LIBEXECDIR)/crio/conmon
-
-install.podman: bin/conmon
-	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(LIBEXECDIR)/podman
-	install ${SELINUXOPT} -m 755 bin/conmon $(DESTDIR)$(LIBEXECDIR)/podman/conmon
-
-.PHONY: fmt
-fmt:
-	git ls-files -z \*.c \*.h | xargs -0 clang-format -i
-	git ls-files -z '*.bats' | xargs -0 sed -i 's/[[:space:]]\+$$//'
-
-.PHONY: dbuild
-dbuild:
-	-mkdir -p bin
-	-podman rm conmon-devenv
-	podman build -t conmon-devenv:latest .
-	podman create --name conmon-devenv conmon-devenv:latest
-	podman cp conmon-devenv:/devenv/bin/conmon bin/conmon
-	@echo "for installation move conmon file to /usr/local/libexec/podman/"
+.PHONY: conmon-v2
+conmon-v2: ## Fetch the conmon-v2 into "conmon-v2" directory.
+	@set -euo pipefail; \
+	# Ensure 'upstream' remote exists (add if missing)
+	if git remote get-url "$(CONMON_V2_REMOTE)" >/dev/null 2>&1; then \
+		echo "Remote '$(CONMON_V2_REMOTE)' exists -> $$(git remote get-url $(CONMON_V2_REMOTE))"; \
+	else \
+		echo "Adding remote '$(CONMON_V2_REMOTE)' -> $(CONMON_V2_URL)"; \
+		git remote add "$(CONMON_V2_REMOTE)" "$(CONMON_V2_URL)"; \
+	fi; \
+	\
+	# Ensure we know the latest remote state
+	git fetch "$(CONMON_V2_REMOTE)" "$(CONMON_V2_BRANCH)"; \
+	\
+	# Add the worktree if it doesn't exist/registered
+	if ! git worktree list --porcelain | awk '/^worktree /{print $$2}' | grep "/$(CONMON_V2_DIR)" >/dev/null 2>&1; then \
+		if [ -d "$(CONMON_V2_DIR)" ]; then \
+			echo "ERROR: $(CONMON_V2_DIR) exists but is not a git worktree."; \
+			exit 1; \
+		fi; \
+		echo "Adding worktree at $(CONMON_V2_DIR) -> $(CONMON_V2_REMOTE)/$(CONMON_V2_BRANCH)"; \
+		git worktree add --force "$(CONMON_V2_DIR)" "$(CONMON_V2_REMOTE)/$(CONMON_V2_BRANCH)"; \
+	fi; \
+	\
+	# Update the worktree to the latest origin/main
+	git -C "$(CONMON_V2_DIR)" fetch "$(CONMON_V2_REMOTE)" "$(CONMON_V2_BRANCH)"; \
+	git -C "$(CONMON_V2_DIR)" checkout -B "$(CONMON_V2_BRANCH)" "$(CONMON_V2_REMOTE)/$(CONMON_V2_BRANCH)"; \
+	git -C "$(CONMON_V2_DIR)" reset --hard "$(CONMON_V2_REMOTE)/$(CONMON_V2_BRANCH)"; \
+	git -C "$(CONMON_V2_DIR)" clean -fdx; \
+	echo "Worktree ready at $(CONMON_V2_DIR) -> $$(git -C "$(CONMON_V2_DIR)" rev-parse --short HEAD)"

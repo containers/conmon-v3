@@ -1,4 +1,4 @@
-# conmon
+# conmon-v3
 
 An OCI container runtime monitor.
 
@@ -15,11 +15,11 @@ watch over and connect to the child process (the container).
 
 While the container runs, conmon does two things:
 
-  - Provides a socket for attaching to the container, holding open the
-    container's standard streams and forwarding them over the socket.
-  - Writes the contents of the container's streams to a log file (or to
-    the systemd journal) so they can be read after the container's
-    death.
+- Provides a socket for attaching to the container, holding open the
+  container's standard streams and forwarding them over the socket.
+- Writes the contents of the container's streams to a log file (or to
+  the systemd journal) so they can be read after the container's
+  death.
 
 Finally, upon the containers death, conmon will record its exit time and
 code to be read by the managing programs.
@@ -38,38 +38,27 @@ These dependencies are required for the build:
 
 ### Fedora, CentOS, RHEL, and related distributions:
 
-``` shell
+```shell
 sudo yum install -y \
-  gcc \
-  git \
-  glib2-devel \
-  glibc-devel \
-  libseccomp-devel \
-  systemd-devel \
+  rust \
   make \
-  pkgconfig \
-  runc
+  cargo
 ```
 
 ### Debian, Ubuntu, and related distributions:
 
-``` shell
+```shell
 sudo apt-get install \
-  gcc \
-  git \
-  libc6-dev \
-  libglib2.0-dev \
-  libseccomp-dev \
-  pkg-config \
+  rust \
   make \
-  runc
+  cargo
 ```
 
 ## Build
 
 Once all the dependencies are installed:
 
-``` shell
+```shell
 make
 ```
 
@@ -77,58 +66,9 @@ There are three options for installation, depending on your environment.
 Each can have the PREFIX overridden. The PREFIX defaults to `/usr/local`
 for most Linux distributions.
 
-  - `make install` installs to `$PREFIX/bin`, for adding conmon to the
-    path.
-  - `make podman` installs to `$PREFIX/libexec/podman`, which is used to
-    override the conmon version that Podman uses.
-  - `make crio` installs to `$PREFIX/libexec/crio`, which is used to
-    override the conmon version that CRI-O uses.
+- `make install` installs to `$PREFIX/bin`, for adding conmon to the
+  path.
 
 Note, to run conmon, you'll also need to have an OCI compliant runtime
 installed, like [runc](https://github.com/opencontainers/runc) or
 [crun](https://github.com/containers/crun).
-
-## Testing
-
-Once you have successfully built `conmon`, run the tests using:
-
-``` shell
-make test
-```
-
-Note that you'll also need the `bats` and `socat` packages install if not
-present.
-
-## Static build
-
-It is possible to build a statically linked binary of conmon by using
-the officially provided
-[nix](https://nixos.org/nixos/packages.html?attr=conmon&channel=unstable&query=conmon)
-package and the derivation of it [within this repository](nix/). The
-builds are completely reproducible and will create a x86\_64/amd64
-stripped ELF binary for [glibc](https://www.gnu.org/software/libc).
-
-### Nix
-
-To build the binaries by locally installing the nix package manager:
-
-``` shell
-nix build -f nix/
-```
-
-### Ansible
-
-An [Ansible Role](https://github.com/alvistack/ansible-role-conmon) is
-also available to automate the installation of the above statically
-linked binary on its supported OS:
-
-``` shell
-sudo su -
-mkdir -p ~/.ansible/roles
-cd ~/.ansible/roles
-git clone https://github.com/alvistack/ansible-role-conmon.git conmon
-cd ~/.ansible/roles/conmon
-pip3 install --upgrade --ignore-installed --requirement requirements.txt
-molecule converge
-molecule verify
-```
