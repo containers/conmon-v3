@@ -1,0 +1,17 @@
+[package]
+name = "conmon"
+version = "3.0.0-dev"
+edition = "2024"
+authors = ["github.com/containers"]
+license = "Apache-2.0"
+readme = "README.md"
+description = "An OCI container runtime monitor, version 3"
+homepage = "https://github.com/containers/conmon-v3"
+repository = "https://github.com/containers/conmon-v3"
+exclude = ["/.cirrus.yml", "/.github/*"]
+
+[[bin]]
+name = "conmon"
+path = "src/main.rs"
+
+[dependencies]
