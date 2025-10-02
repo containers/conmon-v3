@@ -1,19 +1,19 @@
 use clap::Parser;
-use std::process::ExitCode;
-use conmon::error::ConmonResult;
-use conmon::cli::{Opts, Cmd, determine_cmd};
-use conmon::commands::version::Version;
-use conmon::commands::run::Run;
-use conmon::commands::restore::Restore;
+use conmon::cli::{Cmd, Opts, determine_cmd};
 use conmon::commands::exec::Exec;
+use conmon::commands::restore::Restore;
+use conmon::commands::run::Run;
+use conmon::commands::version::Version;
+use conmon::error::ConmonResult;
+use std::process::ExitCode;
 
 fn run_conmon() -> ConmonResult<()> {
     let opts = Opts::parse();
     match determine_cmd(opts)? {
-        Cmd::Run(cfg)     => Run {}.exec(cfg)?,
-        Cmd::Exec(cfg)    => Exec {}.exec(cfg)?,
+        Cmd::Run(cfg) => Run {}.exec(cfg)?,
+        Cmd::Exec(cfg) => Exec {}.exec(cfg)?,
         Cmd::Restore(cfg) => Restore {}.exec(cfg)?,
-        Cmd::Version      => Version {}.exec()?,
+        Cmd::Version => Version {}.exec()?,
     }
     Ok(())
 }
