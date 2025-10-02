@@ -6,6 +6,9 @@ env:
   ####
   CONMON_SLUG: "github.com/containers/conmon-v3"
 
+  # Rust package cache also lives here
+  CARGO_HOME: "/var/cache/cargo"
+
   # Overrides default location (/tmp/cirrus) for repo clone (will become $SRC)
   CIRRUS_WORKING_DIR: "/var/tmp/src/${CONMON_SLUG}"
   # Required so $ENVLIB gets loaded and /bin/sh is not used
@@ -18,10 +21,6 @@ env:
   # Use the netavark image - it has the rust installed already.
   IMAGE_SUFFIX: "c20250422t130822z-f42f41d13"
   FEDORA_NETAVARK_IMAGE: "fedora-netavark-${IMAGE_SUFFIX}"
-
-  # Container FQIN's
-  FEDORA_CONTAINER_FQIN: "quay.io/libpod/fedora_podman:${IMAGE_SUFFIX}"
-  PRIOR_FEDORA_CONTAINER_FQIN: "quay.io/libpod/prior-fedora_podman:${IMAGE_SUFFIX}"
 
 # Only github users with write-access can define or use encrypted variables
 # This credential represents a service account with access to manage both VMs
@@ -50,7 +49,7 @@ build_task:
     disk: 200
 
   script:
-    - dnf install -y rust make cargo
+    - source $CARGO_HOME/env
     - cd $CIRRUS_WORKING_DIR
     - make
 
@@ -64,7 +63,7 @@ lint_task:
     disk: 200
 
   script:
-    - dnf install -y rust make cargo
+    - source $CARGO_HOME/env
     - cd $CIRRUS_WORKING_DIR
     - make lint
 
@@ -78,7 +77,7 @@ unit_task:
     disk: 200
 
   script:
-    - dnf install -y rust make cargo
+    - source $CARGO_HOME/env
     - cd $CIRRUS_WORKING_DIR
     - make
     - make unit
@@ -93,7 +92,7 @@ e2e_task:
     disk: 200
 
   script:
-    - dnf install -y rust make cargo
+    - source $CARGO_HOME/env
     - cd $CIRRUS_WORKING_DIR
     - make
     - make e2e
