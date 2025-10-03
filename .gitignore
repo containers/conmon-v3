@@ -9,3 +9,4 @@ latest-*.txt
 /*.tar.gz
 .vscode
 /conmon-v2
+*.code-workspace
