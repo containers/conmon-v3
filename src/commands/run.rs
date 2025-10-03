@@ -1,5 +1,5 @@
-use crate::error::ConmonResult;
 use crate::cli::RunCfg;
+use crate::error::ConmonResult;
 
 pub struct Run {}
 
@@ -8,7 +8,9 @@ impl Run {
         println!("OK: run");
         println!("  cid={}", cfg.common.cid);
         println!("  runtime={}", cfg.common.runtime.display());
-        if let Some(b) = cfg.bundle { println!("  bundle={}", b.display()); }
+        if let Some(b) = cfg.bundle {
+            println!("  bundle={}", b.display());
+        }
         println!("  container-pidfile={}", cfg.container_pidfile.display());
 
         Ok(())

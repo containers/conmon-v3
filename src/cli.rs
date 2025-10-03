@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use std::path::Path;
+use crate::error::{ConmonError, ConmonResult};
 use std::fs;
-use crate::error::{ConmonResult, ConmonError};
+use std::path::Path;
+use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 
@@ -267,28 +267,49 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
     }
 
     // basic presence validation
-    let cid = opts.cid.take().ok_or_else(|| ConmonError::new("Container ID not provided. Use --cid", 1))?;
-    let runtime = opts.runtime.take().ok_or_else(|| ConmonError::new("Runtime path not provided. Use --runtime", 1))?;
+    let cid = opts
+        .cid
+        .take()
+        .ok_or_else(|| ConmonError::new("Container ID not provided. Use --cid", 1))?;
+    let runtime = opts
+        .runtime
+        .take()
+        .ok_or_else(|| ConmonError::new("Runtime path not provided. Use --runtime", 1))?;
 
     // mutual exclusions and dependencies
     if opts.restore.is_some() && opts.exec {
-        return Err(ConmonError::new("Cannot use 'exec' and 'restore' at the same time", 1));
+        return Err(ConmonError::new(
+            "Cannot use 'exec' and 'restore' at the same time",
+            1,
+        ));
     }
     if !opts.exec && opts.attach {
-        return Err(ConmonError::new("Attach can only be specified with exec", 1));
+        return Err(ConmonError::new(
+            "Attach can only be specified with exec",
+            1,
+        ));
     }
     if api_version < 1 && opts.attach {
-        return Err(ConmonError::new("Attach can only be specified for a non-legacy exec session", 1));
+        return Err(ConmonError::new(
+            "Attach can only be specified for a non-legacy exec session",
+            1,
+        ));
     }
 
     // cuuid rule: required unless legacy exec API (<1) with --exec
     if opts.cuuid.is_none() && (!opts.exec || api_version >= 1) {
-        return Err(ConmonError::new("Container UUID not provided. Use --cuuid", 1));
+        return Err(ConmonError::new(
+            "Container UUID not provided. Use --cuuid",
+            1,
+        ));
     }
 
     // runtime must be executable
     if !is_executable(&runtime) {
-        return Err(ConmonError::new(format!("Runtime path {} is not valid", runtime.display()), 1));
+        return Err(ConmonError::new(
+            format!("Runtime path {} is not valid", runtime.display()),
+            1,
+        ));
     }
 
     let common = CommonCfg {
@@ -300,11 +321,17 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
 
     // decide which subcommand this flag combination means
     if let Some(restore_path) = opts.restore.take() {
-        Ok(Cmd::Restore(RestoreCfg { common, restore_path }))
+        Ok(Cmd::Restore(RestoreCfg {
+            common,
+            restore_path,
+        }))
     } else if opts.exec {
-        let exec_process_spec = opts.exec_process_spec
-            .take()
-            .ok_or_else(|| ConmonError::new("Exec process spec path not provided. Use --exec-process-spec", 1))?;
+        let exec_process_spec = opts.exec_process_spec.take().ok_or_else(|| {
+            ConmonError::new(
+                "Exec process spec path not provided. Use --exec-process-spec",
+                1,
+            )
+        })?;
         Ok(Cmd::Exec(ExecCfg {
             common,
             exec_process_spec,
