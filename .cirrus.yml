@@ -93,6 +93,7 @@ e2e_task:
 
   script:
     - source $CARGO_HOME/env
+    - dnf install -y podman runc
     - cd $CIRRUS_WORKING_DIR
     - make
     - make e2e
