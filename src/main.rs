@@ -5,10 +5,14 @@ use conmon::commands::restore::Restore;
 use conmon::commands::run::Run;
 use conmon::commands::version::Version;
 use conmon::error::ConmonResult;
+use conmon::log_plugin::LoadedLogPlugin;
 use std::process::ExitCode;
 
 fn run_conmon() -> ConmonResult<()> {
     let opts = Opts::parse();
+
+    let _log_plugin = LoadedLogPlugin::load("none", &[])?;
+
     match determine_cmd(opts)? {
         Cmd::Run(cfg) => Run {}.exec(cfg)?,
         Cmd::Exec(cfg) => Exec {}.exec(cfg)?,
