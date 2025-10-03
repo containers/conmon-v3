@@ -1,0 +1,15 @@
+[package]
+name = "none_log_plugin"
+version = "3.0.0-dev"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use the Rust ABI types; the crate name is "conmon_abi" even if the package is "conmon-abi"
+conmon-abi = { path = "../../conmon-abi" }
+
+# Optional helpers
+once_cell = "1.19"

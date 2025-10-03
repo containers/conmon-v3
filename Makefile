@@ -8,7 +8,7 @@ PREFIX ?= /usr
 CI_TAG ?=
 CONMON_V2_DIR ?= conmon-v2
 CONMON_V2_URL ?= https://github.com/containers/conmon.git
-CONMON_V2_REMOTE ?= upstream
+CONMON_V2_REMOTE ?= conmon-v2
 CONMON_V2_BRANCH ?= main
 
 COLOR:=\\033[36m
@@ -38,15 +38,15 @@ help:  ## Display this help.
 
 .PHONY: default
 default: ## Build the conmon binary.
-	cargo build
+	cargo build --workspace
 
 .PHONY: release
 release: ## Build the conmon binary in release mode.
-	cargo build --release
+	cargo build --release --workspace
 
 .PHONY: release-static
 release-static: ## Build the conmon binary in release-static mode.
-	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu
+	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu --workspace
 	strip -s target/x86_64-unknown-linux-gnu/release/conmon
 	ldd target/x86_64-unknown-linux-gnu/release/conmon 2>&1 | grep -qE '(statically linked)|(not a dynamic executable)'
 
@@ -57,7 +57,7 @@ test: unit e2e ## Run both `unit` and `e2e` tests
 
 .PHONY: unit
 unit: ## Run the unit tests.
-	cargo test --no-fail-fast
+	cargo test --no-fail-fast --workspace
 
 .PHONY: e2e
 e2e: conmon-v2 ## Run the e2e tests.
@@ -88,7 +88,7 @@ install: ## Install the binary.
 .PHONY: conmon-v2
 conmon-v2: ## Fetch the conmon-v2 into "conmon-v2" directory.
 	@set -euo pipefail; \
-	# Ensure 'upstream' remote exists (add if missing)
+	# Ensure 'conmon-v2' remote exists (add if missing)
 	if git remote get-url "$(CONMON_V2_REMOTE)" >/dev/null 2>&1; then \
 		echo "Remote '$(CONMON_V2_REMOTE)' exists -> $$(git remote get-url $(CONMON_V2_REMOTE))"; \
 	else \

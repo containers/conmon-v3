@@ -1,0 +1,10 @@
+[package]
+name = "conmon-abi"
+version = "3.0.0-dev"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[build-dependencies]
+cbindgen = "0.29"
