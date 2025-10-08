@@ -1,5 +1,6 @@
 use crate::error::{ConmonError, ConmonResult};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -11,6 +12,7 @@ use clap::{ArgAction, Parser};
     override_usage = "conmon [OPTIONS] -c <CID> --runtime <PATH>",
     disable_version_flag = true
 )]
+#[derive(Default)]
 pub struct Opts {
     /// Conmon API version to use
     #[arg(long = "api-version", value_parser = clap::value_parser!(i32))]
@@ -241,22 +243,13 @@ pub struct RestoreCfg {
     pub restore_path: PathBuf,
 }
 
-/// Try to detect "executable" bit on Unix-y platforms.
-/// On non-Unix, we accept existence as "good enough".
+/// Try to detect "executable" bit.
 fn is_executable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(md) = fs::metadata(p) {
-            let mode = md.permissions().mode();
-            return (mode & 0o111) != 0;
-        }
-        false
+    if let Ok(md) = fs::metadata(p) {
+        let mode = md.permissions().mode();
+        return (mode & 0o111) != 0;
     }
-    #[cfg(not(unix))]
-    {
-        p.exists()
-    }
+    false
 }
 
 pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
@@ -355,5 +348,234 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             bundle,
             container_pidfile,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Create a temp file with the given mode.
+    fn make_temp_file_with_mode(mode: u32) -> NamedTempFile {
+        let f = NamedTempFile::new().expect("tmp file");
+        let p = f.path().to_path_buf();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(&p, perms).unwrap();
+        f
+    }
+
+    #[test]
+    fn version_flag_returns_version_cmd() -> ConmonResult<()> {
+        let o = Opts {
+            version_flag: true,
+            ..Default::default()
+        };
+        // Even if other required fields are missing, version should short-circuit
+        let cmd = determine_cmd(o).expect("ok");
+        match cmd {
+            Cmd::Version => {}
+            _ => panic!("expected Version"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_cid_errors() -> ConmonResult<()> {
+        let o = Opts {
+            ..Default::default()
+        };
+        let err = determine_cmd(o).unwrap_err();
+        assert!(err.to_string().contains("Container ID not provided"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_runtime_errors() -> ConmonResult<()> {
+        let o = Opts {
+            cid: Some("abc".into()),
+            ..Default::default()
+        };
+        let err = determine_cmd(o).unwrap_err();
+        assert!(err.to_string().contains("Runtime path not provided"));
+        Ok(())
+    }
+
+    #[test]
+    fn attach_without_exec_errors() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            attach: true,
+            cid: Some("abc".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            ..Default::default()
+        };
+        let err = determine_cmd(o).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Attach can only be specified with exec")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attach_legacy_api_errors_even_with_exec() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            api_version: Some(0),
+            exec: true,
+            attach: true,
+            cid: Some("abc".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            ..Default::default()
+        };
+        let err = determine_cmd(o).unwrap_err();
+        assert!(err.to_string().contains("non-legacy exec session"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_cuuid_for_run_errors() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            cid: Some("abc".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            ..Default::default()
+        };
+        // run path (no exec/restore) requires cuuid
+        let err = determine_cmd(o).unwrap_err();
+        assert!(err.to_string().contains("Container UUID not provided"));
+        Ok(())
+    }
+
+    #[test]
+    fn cannot_mix_exec_and_restore() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            exec: true,
+            restore: Some(PathBuf::from("checkpoint")),
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            ..Default::default()
+        };
+        let err = determine_cmd(o).unwrap_err();
+        assert!(err.to_string().contains("Cannot use 'exec' and 'restore'"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_must_be_executable() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o600);
+        let o = Opts {
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            ..Default::default()
+        };
+        let err = determine_cmd(o).unwrap_err();
+        assert!(err.to_string().contains("is not valid"));
+        Ok(())
+    }
+
+    #[test]
+    fn exec_success_with_spec_and_attach_new_api() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            api_version: Some(1),
+            exec: true,
+            attach: true,
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            exec_process_spec: Some(PathBuf::from("proc.json")),
+            ..Default::default()
+        };
+        let cmd = determine_cmd(o).expect("ok");
+        match cmd {
+            Cmd::Exec(cfg) => {
+                assert_eq!(cfg.common.api_version, 1);
+                assert_eq!(cfg.common.cid, "abc");
+                assert!(cfg.attach);
+                assert_eq!(cfg.exec_process_spec, PathBuf::from("proc.json"));
+            }
+            _ => panic!("expected Exec"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exec_missing_spec_errors() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            api_version: Some(1),
+            exec: true,
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            ..Default::default()
+        };
+        let err = determine_cmd(o).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Exec process spec path not provided")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_success() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            restore: Some(PathBuf::from("checkpoint")),
+            ..Default::default()
+        };
+        let cmd = determine_cmd(o).expect("ok");
+        match cmd {
+            Cmd::Restore(cfg) => {
+                assert_eq!(cfg.common.cid, "abc");
+                assert_eq!(cfg.restore_path, PathBuf::from("checkpoint"));
+            }
+            _ => panic!("expected Restore"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_defaults_success() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            ..Default::default()
+        };
+        // no bundle/container_pidfile specified -> defaults should kick in
+        let cwd = std::env::current_dir()?;
+        let cmd = determine_cmd(o).expect("ok");
+        match cmd {
+            Cmd::Run(cfg) => {
+                // bundle defaults to cwd
+                assert_eq!(cfg.bundle.unwrap(), cwd);
+                // container-pidfile defaults to "$cwd/pidfile-$cid"
+                assert_eq!(cfg.container_pidfile, cwd.join("pidfile-abc"));
+            }
+            _ => panic!("expected Run"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn is_executable_behaves_as_expected() -> ConmonResult<()> {
+        let exec = make_temp_file_with_mode(0o700);
+        assert!(is_executable(exec.path()));
+
+        let nonexec = make_temp_file_with_mode(0o600);
+        assert!(!is_executable(nonexec.path()));
+        Ok(())
     }
 }
