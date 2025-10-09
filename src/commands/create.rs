@@ -1,6 +1,7 @@
 use crate::cli::CreateCfg;
 use crate::error::ConmonResult;
 use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
+use crate::runtime::run::{run_runtime, wait_for_runtime};
 
 pub struct Create {
     cfg: CreateCfg,
@@ -12,8 +13,10 @@ impl Create {
     }
 
     pub fn exec(&self) -> ConmonResult<()> {
-        let _runtime_args = generate_runtime_args(&self.cfg.common, self);
-
+        let runtime_args = generate_runtime_args(&self.cfg.common, self)?;
+        let runtime_pid = run_runtime(&runtime_args)?;
+        let runtime_status = wait_for_runtime(runtime_pid)?;
+        eprintln!("Runtime exited with status: {}", runtime_status);
         Ok(())
     }
 }
