@@ -6,6 +6,9 @@ env:
   ####
   CONMON_SLUG: "github.com/containers/conmon-v3"
 
+  # Rust package cache also lives here
+  CARGO_HOME: "/var/cache/cargo"
+
   # Overrides default location (/tmp/cirrus) for repo clone (will become $SRC)
   CIRRUS_WORKING_DIR: "/var/tmp/src/${CONMON_SLUG}"
   # Required so $ENVLIB gets loaded and /bin/sh is not used
@@ -15,13 +18,9 @@ env:
   # Spoof self as travis, as cirrus has the same test issues as travis does
   TRAVIS: "true"
 
-  # VM Image built in containers/automation_images
-  IMAGE_SUFFIX: "c20250721t181111z-f42f41d13"
-  FEDORA_CACHE_IMAGE_NAME: "fedora-${IMAGE_SUFFIX}"
-
-  # Container FQIN's
-  FEDORA_CONTAINER_FQIN: "quay.io/libpod/fedora_podman:${IMAGE_SUFFIX}"
-  PRIOR_FEDORA_CONTAINER_FQIN: "quay.io/libpod/prior-fedora_podman:${IMAGE_SUFFIX}"
+  # Use the netavark image - it has the rust installed already.
+  IMAGE_SUFFIX: "c20250422t130822z-f42f41d13"
+  FEDORA_NETAVARK_IMAGE: "fedora-netavark-${IMAGE_SUFFIX}"
 
 # Only github users with write-access can define or use encrypted variables
 # This credential represents a service account with access to manage both VMs
@@ -35,7 +34,7 @@ gce_instance:
   cpu: 2
   memory: "4Gb"
   disk: 200 # Required for performance reasons
-  image_name: "${FEDORA_CACHE_IMAGE_NAME}"
+  image_name: "${FEDORA_NETAVARK_IMAGE}"
 
 # Default timeout for each task
 timeout_in: "120m"
@@ -44,27 +43,41 @@ timeout_in: "120m"
 build_task:
   # Runs within Cirrus's "community cluster"
   gce_instance:
-    image_name: "${FEDORA_CACHE_IMAGE_NAME}"
+    image_name: "${FEDORA_NETAVARK_IMAGE}"
     cpu: 1
     memory: 4
     disk: 200
 
   script:
-    - dnf install -y rust make cargo
+    - source $CARGO_HOME/env
     - cd $CIRRUS_WORKING_DIR
     - make
+
+# Run the code linters
+lint_task:
+  # Runs within Cirrus's "community cluster"
+  gce_instance:
+    image_name: "${FEDORA_NETAVARK_IMAGE}"
+    cpu: 1
+    memory: 4
+    disk: 200
+
+  script:
+    - source $CARGO_HOME/env
+    - cd $CIRRUS_WORKING_DIR
+    - make lint
 
 # Run the `make unit`
 unit_task:
   # Runs within Cirrus's "community cluster"
   gce_instance:
-    image_name: "${FEDORA_CACHE_IMAGE_NAME}"
+    image_name: "${FEDORA_NETAVARK_IMAGE}"
     cpu: 1
     memory: 4
     disk: 200
 
   script:
-    - dnf install -y rust make cargo
+    - source $CARGO_HOME/env
     - cd $CIRRUS_WORKING_DIR
     - make
     - make unit
@@ -73,17 +86,17 @@ unit_task:
 e2e_task:
   # Runs within Cirrus's "community cluster"
   gce_instance:
-    image_name: "${FEDORA_CACHE_IMAGE_NAME}"
+    image_name: "${FEDORA_NETAVARK_IMAGE}"
     cpu: 1
     memory: 4
     disk: 200
 
   script:
-    - dnf install -y rust make cargo
+    - source $CARGO_HOME/env
+    - dnf install -y podman runc
     - cd $CIRRUS_WORKING_DIR
     - make
     - make e2e
-
 
 # This task is critical.  It updates the "last-used by" timestamp stored
 # in metadata for all VM images.  This mechanism functions in tandem with
@@ -98,7 +111,7 @@ meta_task:
   env:
     # Space-separated list of images used by this repository state
     IMGNAMES: >-
-      ${FEDORA_CACHE_IMAGE_NAME}
+      ${FEDORA_NETAVARK_IMAGE}
     BUILDID: "${CIRRUS_BUILD_ID}"
     REPOREF: "${CIRRUS_REPO_NAME}"
     GCPJSON: ENCRYPTED[abcb0db1941b566334e14509776e4d93e816613d106afde68bfd13e207974a7941653c94c6070fb4c79412e6b623add1]
