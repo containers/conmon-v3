@@ -8,7 +8,7 @@ PREFIX ?= /usr
 CI_TAG ?=
 CONMON_V2_DIR ?= conmon-v2
 CONMON_V2_URL ?= https://github.com/containers/conmon.git
-CONMON_V2_REMOTE ?= upstream
+CONMON_V2_REMOTE ?= conmon-v2
 CONMON_V2_BRANCH ?= main
 
 COLOR:=\\033[36m
@@ -88,7 +88,7 @@ install: ## Install the binary.
 .PHONY: conmon-v2
 conmon-v2: ## Fetch the conmon-v2 into "conmon-v2" directory.
 	@set -euo pipefail; \
-	# Ensure 'upstream' remote exists (add if missing)
+	# Ensure 'conmon-v2' remote exists (add if missing)
 	if git remote get-url "$(CONMON_V2_REMOTE)" >/dev/null 2>&1; then \
 		echo "Remote '$(CONMON_V2_REMOTE)' exists -> $$(git remote get-url $(CONMON_V2_REMOTE))"; \
 	else \
