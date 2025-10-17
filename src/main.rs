@@ -1,8 +1,8 @@
 use clap::Parser;
 use conmon::cli::{Cmd, Opts, determine_cmd};
+use conmon::commands::create::Create;
 use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
-use conmon::commands::run::Run;
 use conmon::commands::version::Version;
 use conmon::error::ConmonResult;
 use conmon::logging::plugin::initialize_log_plugin;
@@ -13,9 +13,9 @@ fn run_conmon() -> ConmonResult<()> {
     let _log_plugin = initialize_log_plugin("none", &opts);
 
     match determine_cmd(opts)? {
-        Cmd::Run(cfg) => Run {}.exec(cfg)?,
-        Cmd::Exec(cfg) => Exec {}.exec(cfg)?,
-        Cmd::Restore(cfg) => Restore {}.exec(cfg)?,
+        Cmd::Create(cfg) => Create::new(cfg).exec()?,
+        Cmd::Exec(cfg) => Exec::new(cfg).exec()?,
+        Cmd::Restore(cfg) => Restore::new(cfg).exec()?,
         Cmd::Version => Version {}.exec()?,
     }
     Ok(())
