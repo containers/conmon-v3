@@ -1,5 +1,7 @@
 use std::fmt;
 
+use nix::errno::Errno;
+
 pub type ConmonResult<T> = Result<T, ConmonError>;
 
 #[derive(Debug)]
@@ -26,5 +28,17 @@ impl fmt::Display for ConmonError {
 impl From<std::io::Error> for ConmonError {
     fn from(err: std::io::Error) -> Self {
         ConmonError::new(format!("IO error: {}", err), 1)
+    }
+}
+
+impl From<std::ffi::NulError> for ConmonError {
+    fn from(err: std::ffi::NulError) -> Self {
+        ConmonError::new(format!("CString error: {}", err), 1)
+    }
+}
+
+impl From<Errno> for ConmonError {
+    fn from(err: Errno) -> Self {
+        ConmonError::new(format!("Errno error: {}", err), 1)
     }
 }
