@@ -28,3 +28,9 @@ impl From<std::io::Error> for ConmonError {
         ConmonError::new(format!("IO error: {}", err), 1)
     }
 }
+
+impl From<std::ffi::NulError> for ConmonError {
+    fn from(err: std::ffi::NulError) -> Self {
+        ConmonError::new(format!("CString error: {}", err), 1)
+    }
+}
