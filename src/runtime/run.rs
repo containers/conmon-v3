@@ -1,10 +1,13 @@
 use crate::error::{ConmonError, ConmonResult};
 
+use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
+use nix::sys::stat::Mode;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, fork, setsid};
+use nix::unistd::{ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
 
 use std::io::{Error, Result as IoResult};
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt; // for pre_exec
 use std::process::{Command, Stdio, exit};
 
@@ -28,14 +31,35 @@ fn block_signals() -> ConmonResult<SigSet> {
     Ok(oldmask)
 }
 
+/// Helper function to redirect stdio to /dev/null.
+fn redirect_self_to_devnull() -> ConmonResult<()> {
+    // stdin -> /dev/null (read side)
+    let fd_in = open("/dev/null", OFlag::O_RDONLY, Mode::empty())?;
+    dup2_stdin(fd_in.as_fd())?;
+
+    // stdout/stderr -> /dev/null (write side)
+    let fd_out = open("/dev/null", OFlag::O_WRONLY, Mode::empty())?;
+    dup2_stdout(fd_out.as_fd())?;
+    dup2_stderr(fd_out.as_fd())?;
+
+    Ok(())
+}
+
 /// Run the runtime binary defined by `args`.
-pub fn run_runtime(args: &[String]) -> ConmonResult<i32> {
+pub fn run_runtime(
+    args: &[String],
+    workerfd_stdin: Stdio,
+    workerfd_stdout: Stdio,
+    workerfd_stderr: Stdio,
+) -> ConmonResult<i32> {
     if args.is_empty() {
         return Err(ConmonError::new(
             "Failed to execute runtime binary: empty args",
             1,
         ));
     }
+
+    redirect_self_to_devnull()?;
 
     unsafe {
         match fork() {
@@ -72,9 +96,9 @@ pub fn run_runtime(args: &[String]) -> ConmonResult<i32> {
     let argv = &args[1..];
     let mut cmd = Command::new(program);
     cmd.args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(workerfd_stdin)
+        .stdout(workerfd_stdout)
+        .stderr(workerfd_stderr);
 
     unsafe {
         cmd.pre_exec(move || child_setup(&oldmask));

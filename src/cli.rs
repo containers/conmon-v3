@@ -1,4 +1,5 @@
 use crate::error::{ConmonError, ConmonResult};
+use crate::logging::plugin::LogPluginCfg;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -233,6 +234,7 @@ pub struct CreateCfg {
     pub bundle: PathBuf,
     pub container_pidfile: PathBuf,
     pub systemd_cgroup: bool,
+    pub conmon_pidfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -365,8 +367,44 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             bundle,
             container_pidfile,
             systemd_cgroup: opts.systemd_cgroup,
+            conmon_pidfile: opts.conmon_pidfile,
         }))
     }
+}
+
+// Handles the logging related options from `opts` and returns the name of the log plugin
+// and the LogPluginCfg struct.
+pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)> {
+    let mut plugin: String = "file".into();
+    let mut log_plugin_cfg = LogPluginCfg::default();
+
+    // Collect paths, and possibly the plugin name from "plugin:path" entries.
+    // TODO: Support multiple log plugins at the same time.
+    for p in &opts.log_path {
+        let s = p.to_string_lossy();
+
+        if let Some((plug, path)) = s.split_once(':') {
+            let path = path.trim();
+            if !path.is_empty() {
+                log_plugin_cfg.path = path.into();
+            }
+
+            let plug = plug.trim();
+            if plug.is_empty() {
+                continue;
+            }
+            // Plugin names on filesystem cannot contain dash.
+            plugin = plug.into();
+            plugin = plugin.replace("-", "_");
+        } else {
+            // No "plugin:" prefix; treat as a path.
+            if !s.is_empty() {
+                log_plugin_cfg.path = s.to_string().into();
+            }
+        }
+    }
+
+    Ok((plugin, log_plugin_cfg))
 }
 
 #[cfg(test)]
@@ -594,6 +632,76 @@ mod tests {
 
         let nonexec = make_temp_file_with_mode(0o600);
         assert!(!is_executable(nonexec.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_when_no_paths() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file");
+        assert!(
+            cfg.path.as_os_str().is_empty(),
+            "default path should be empty"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plain_path_without_plugin_prefix() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file");
+        assert_eq!(cfg.path, PathBuf::from("/var/log/my.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_and_path_with_whitespace_are_trimmed() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("  file  :  /var/log/app.log  ")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file");
+        assert_eq!(cfg.path, PathBuf::from("/var/log/app.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_dash_is_normalized_to_underscore() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("k8s-file:/var/log/k8s.log")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "k8s_file");
+        assert_eq!(cfg.path, PathBuf::from("/var/log/k8s.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_plugin_part_does_not_change_plugin_but_sets_path() -> ConmonResult<()> {
+        // Starts with default "file" plugin, but entry has empty plugin name.
+        // Should still set the path from the right side of the colon.
+        let o = Opts {
+            log_path: vec![PathBuf::from(":/tmp/only-path.log")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file"); // unchanged
+        assert_eq!(cfg.path, PathBuf::from("/tmp/only-path.log"));
         Ok(())
     }
 }
