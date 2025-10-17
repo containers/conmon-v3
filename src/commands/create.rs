@@ -1,24 +1,27 @@
-use crate::cli::RestoreCfg;
+use crate::cli::CreateCfg;
 use crate::error::ConmonResult;
 use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
+use crate::runtime::run::{run_runtime, wait_for_runtime};
 
-pub struct Restore {
-    cfg: RestoreCfg,
+pub struct Create {
+    cfg: CreateCfg,
 }
 
-impl Restore {
-    pub fn new(cfg: RestoreCfg) -> Self {
+impl Create {
+    pub fn new(cfg: CreateCfg) -> Self {
         Self { cfg }
     }
 
     pub fn exec(&self) -> ConmonResult<()> {
-        let _runtime_args = generate_runtime_args(&self.cfg.common, self);
-
+        let runtime_args = generate_runtime_args(&self.cfg.common, self)?;
+        let runtime_pid = run_runtime(&runtime_args)?;
+        let runtime_status = wait_for_runtime(runtime_pid)?;
+        eprintln!("Runtime exited with status: {}", runtime_status);
         Ok(())
     }
 }
 
-impl RuntimeArgsGenerator for Restore {
+impl RuntimeArgsGenerator for Create {
     fn add_global_args(&self, argv: &mut Vec<String>) -> ConmonResult<()> {
         if self.cfg.systemd_cgroup {
             argv.push("--systemd-cgroup".into());
@@ -42,7 +45,6 @@ impl RuntimeArgsGenerator for Restore {
 mod tests {
     use super::*;
     use crate::cli::CommonCfg;
-    use crate::runtime::args::generate_runtime_args;
     use std::path::PathBuf;
 
     fn mk_common(
@@ -63,23 +65,22 @@ mod tests {
         }
     }
 
-    fn mk_restore_cfg(
+    fn mk_create_cfg(
         systemd_cgroup: bool,
         bundle: &str,
         pidfile: &str,
         common: CommonCfg,
-    ) -> RestoreCfg {
-        RestoreCfg {
+    ) -> CreateCfg {
+        CreateCfg {
             systemd_cgroup,
             bundle: PathBuf::from(bundle),
             container_pidfile: PathBuf::from(pidfile),
             common,
-            ..Default::default()
         }
     }
 
     #[test]
-    fn generate_args_with_systemd_cgroup() {
+    fn generate_args_create_with_systemd_cgroup() {
         let common = mk_common(
             "cid123",
             vec!["--root", "/var/lib/runc"],
@@ -87,10 +88,11 @@ mod tests {
             false,
             false,
         );
-        let cfg = mk_restore_cfg(true, "/tmp/bundle-A", "/tmp/pid-A", common);
-        let restore = Restore::new(cfg);
+        let cfg = mk_create_cfg(true, "/tmp/bundle-A", "/tmp/pid-A", common);
+        let create = Create::new(cfg);
 
-        let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
+        let argv =
+            crate::runtime::args::generate_runtime_args(&create.cfg.common, &create).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
@@ -110,17 +112,16 @@ mod tests {
     }
 
     #[test]
-    fn generate_args_without_systemd_cgroup() {
+    fn generate_args_create_without_systemd_cgroup_with_generic_flags() {
         let common = mk_common("cid456", vec![], vec!["--optB"], true, true);
-        let cfg = mk_restore_cfg(false, "/tmp/bundle-B", "/tmp/pid-B", common);
-        let restore = Restore::new(cfg);
+        let cfg = mk_create_cfg(false, "/tmp/bundle-B", "/tmp/pid-B", common);
+        let create = Create::new(cfg);
 
-        let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
+        let argv =
+            crate::runtime::args::generate_runtime_args(&create.cfg.common, &create).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
-            // (no --systemd-cgroup)
-            // runtime_args empty
             "create".into(),
             "--bundle".into(),
             "/tmp/bundle-B".into(),
