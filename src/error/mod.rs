@@ -42,3 +42,9 @@ impl From<Errno> for ConmonError {
         ConmonError::new(format!("Errno error: {}", err), 1)
     }
 }
+
+impl From<serde_json::Error> for ConmonError {
+    fn from(err: serde_json::Error) -> Self {
+        ConmonError::new(format!("JSON parse error: {}", err), 1)
+    }
+}
