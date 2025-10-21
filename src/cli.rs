@@ -1,4 +1,5 @@
 use crate::error::{ConmonError, ConmonResult};
+use crate::logging::plugin::LogPluginCfg;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -210,37 +211,47 @@ pub struct Opts {
 #[derive(Debug)]
 pub enum Cmd {
     Version,
-    Run(RunCfg),
+    Create(CreateCfg),
     Exec(ExecCfg),
     Restore(RestoreCfg),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CommonCfg {
     pub api_version: i32,
     pub cid: String,
     pub cuuid: Option<String>,
     pub runtime: PathBuf,
+    pub runtime_args: Vec<String>,
+    pub runtime_opts: Vec<String>,
+    pub no_pivot: bool,
+    pub no_new_keyring: bool,
 }
 
-#[derive(Debug)]
-pub struct RunCfg {
+#[derive(Debug, Default)]
+pub struct CreateCfg {
     pub common: CommonCfg,
-    pub bundle: Option<PathBuf>,
+    pub bundle: PathBuf,
     pub container_pidfile: PathBuf,
+    pub systemd_cgroup: bool,
+    pub conmon_pidfile: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ExecCfg {
     pub common: CommonCfg,
     pub exec_process_spec: PathBuf,
     pub attach: bool,
+    pub container_pidfile: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RestoreCfg {
     pub common: CommonCfg,
     pub restore_path: PathBuf,
+    pub systemd_cgroup: bool,
+    pub container_pidfile: PathBuf,
+    pub bundle: PathBuf,
 }
 
 /// Try to detect "executable" bit.
@@ -310,13 +321,32 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         cid,
         cuuid: opts.cuuid.take(),
         runtime,
+        runtime_args: opts.runtime_args,
+        runtime_opts: opts.runtime_opts,
+        no_pivot: opts.no_pivot,
+        no_new_keyring: opts.no_new_keyring,
     };
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| ConmonError::new(format!("Failed to get working directory: {e}"), 1))?;
+
+    // bundle defaults to "$cwd" if none provided
+    let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
+
+    // container-pidfile defaults to "$cwd/pidfile-$cid" if none provided
+    let container_pidfile = opts
+        .container_pidfile
+        .take()
+        .unwrap_or_else(|| cwd.join(format!("pidfile-{}", common.cid)));
 
     // decide which subcommand this flag combination means
     if let Some(restore_path) = opts.restore.take() {
         Ok(Cmd::Restore(RestoreCfg {
             common,
             restore_path,
+            systemd_cgroup: opts.systemd_cgroup,
+            container_pidfile,
+            bundle,
         }))
     } else if opts.exec {
         let exec_process_spec = opts.exec_process_spec.take().ok_or_else(|| {
@@ -329,26 +359,52 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             common,
             exec_process_spec,
             attach: opts.attach,
+            container_pidfile,
         }))
     } else {
-        let cwd = std::env::current_dir()
-            .map_err(|e| ConmonError::new(format!("Failed to get working directory: {e}"), 1))?;
-
-        // bundle defaults to "$cwd" if none provided
-        let bundle = opts.bundle.take().or_else(|| Some(cwd.clone()));
-
-        // container-pidfile defaults to "$cwd/pidfile-$cid" if none provided
-        let container_pidfile = opts
-            .container_pidfile
-            .take()
-            .unwrap_or_else(|| cwd.join(format!("pidfile-{}", common.cid)));
-
-        Ok(Cmd::Run(RunCfg {
+        Ok(Cmd::Create(CreateCfg {
             common,
             bundle,
             container_pidfile,
+            systemd_cgroup: opts.systemd_cgroup,
+            conmon_pidfile: opts.conmon_pidfile,
         }))
     }
+}
+
+// Handles the logging related options from `opts` and returns the name of the log plugin
+// and the LogPluginCfg struct.
+pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)> {
+    let mut plugin: String = "file".into();
+    let mut log_plugin_cfg = LogPluginCfg::default();
+
+    // Collect paths, and possibly the plugin name from "plugin:path" entries.
+    // TODO: Support multiple log plugins at the same time.
+    for p in &opts.log_path {
+        let s = p.to_string_lossy();
+
+        if let Some((plug, path)) = s.split_once(':') {
+            let path = path.trim();
+            if !path.is_empty() {
+                log_plugin_cfg.path = path.into();
+            }
+
+            let plug = plug.trim();
+            if plug.is_empty() {
+                continue;
+            }
+            // Plugin names on filesystem cannot contain dash.
+            plugin = plug.into();
+            plugin = plugin.replace("-", "_");
+        } else {
+            // No "plugin:" prefix; treat as a path.
+            if !s.is_empty() {
+                log_plugin_cfg.path = s.to_string().into();
+            }
+        }
+    }
+
+    Ok((plugin, log_plugin_cfg))
 }
 
 #[cfg(test)]
@@ -558,9 +614,9 @@ mod tests {
         let cwd = std::env::current_dir()?;
         let cmd = determine_cmd(o).expect("ok");
         match cmd {
-            Cmd::Run(cfg) => {
+            Cmd::Create(cfg) => {
                 // bundle defaults to cwd
-                assert_eq!(cfg.bundle.unwrap(), cwd);
+                assert_eq!(cfg.bundle, cwd);
                 // container-pidfile defaults to "$cwd/pidfile-$cid"
                 assert_eq!(cfg.container_pidfile, cwd.join("pidfile-abc"));
             }
@@ -576,6 +632,76 @@ mod tests {
 
         let nonexec = make_temp_file_with_mode(0o600);
         assert!(!is_executable(nonexec.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_when_no_paths() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file");
+        assert!(
+            cfg.path.as_os_str().is_empty(),
+            "default path should be empty"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plain_path_without_plugin_prefix() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file");
+        assert_eq!(cfg.path, PathBuf::from("/var/log/my.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_and_path_with_whitespace_are_trimmed() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("  file  :  /var/log/app.log  ")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file");
+        assert_eq!(cfg.path, PathBuf::from("/var/log/app.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_dash_is_normalized_to_underscore() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("k8s-file:/var/log/k8s.log")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "k8s_file");
+        assert_eq!(cfg.path, PathBuf::from("/var/log/k8s.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_plugin_part_does_not_change_plugin_but_sets_path() -> ConmonResult<()> {
+        // Starts with default "file" plugin, but entry has empty plugin name.
+        // Should still set the path from the right side of the colon.
+        let o = Opts {
+            log_path: vec![PathBuf::from(":/tmp/only-path.log")],
+            ..Default::default()
+        };
+
+        let (plugin, cfg) = determine_log_plugin(&o)?;
+        assert_eq!(plugin, "file"); // unchanged
+        assert_eq!(cfg.path, PathBuf::from("/tmp/only-path.log"));
         Ok(())
     }
 }
