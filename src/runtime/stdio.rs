@@ -58,8 +58,8 @@ pub fn read_pipe(fd: &OwnedFd) -> ConmonResult<String> {
 // and forwarding it to log plugin.
 pub fn handle_stdio(
     log_plugin: &dyn LogPlugin,
-    mainfd_stdout: OwnedFd,
-    mainfd_stderr: OwnedFd,
+    mainfd_stdout: &OwnedFd,
+    mainfd_stderr: &OwnedFd,
 ) -> ConmonResult<()> {
     let mut fds = [
         PollFd::new(mainfd_stdout.as_fd(), PollFlags::POLLIN),
@@ -156,7 +156,7 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mock, r_out, r_err)?;
+        handle_stdio(&mock, &r_out, &r_err)?;
         Ok(())
     }
 
@@ -182,7 +182,7 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mock, r_out, r_err)?;
+        handle_stdio(&mock, &r_out, &r_err)?;
         Ok(())
     }
 }
