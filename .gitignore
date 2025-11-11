@@ -10,3 +10,6 @@ latest-*.txt
 .vscode
 /conmon-v2
 *.code-workspace
+*.rej
+*.orig
+*.patch

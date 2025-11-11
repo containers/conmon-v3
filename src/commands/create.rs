@@ -1,57 +1,65 @@
 use std::process::ExitCode;
 
-use crate::cli::ExecCfg;
+use crate::cli::CreateCfg;
 use crate::error::ConmonResult;
 use crate::logging::plugin::LogPlugin;
 use crate::runtime::args::RuntimeArgsGenerator;
 
-pub struct Exec {
-    cfg: ExecCfg,
+pub struct Create {
+    cfg: CreateCfg,
 }
 
-impl Exec {
-    pub fn new(cfg: ExecCfg) -> Self {
+impl Create {
+    pub fn new(cfg: CreateCfg) -> Self {
         Self { cfg }
     }
 
     pub fn exec(&self, log_plugin: &dyn LogPlugin) -> ConmonResult<ExitCode> {
+        // Start the `runtime create` session.
         let mut runtime_session = crate::runtime::session::RuntimeSession::new();
-        runtime_session.launch(&self.cfg.common, self, self.cfg.attach)?;
+        runtime_session.launch(&self.cfg.common, self, false)?;
 
         // ===
-        // Now, after the `launch`, we are in the child process of our original process
+        // Now, after the `launch()`, we are in the child process of our original process,
+        // because we double-fork in the RuntimeProcess::spawn.
         // (See `RuntimeProcess::spawn` code and description for more information).
+        // ===
+
+        // Wait until the `runtime create` finishes and return an error in case it fails.
+        runtime_session.wait_for_success(self.cfg.common.api_version)?;
+        runtime_session.write_container_pid_file(&self.cfg.common)?;
+
+        // ===
+        // Now we wait for an external application like podman to really start the container.
+        // and handle the containers stdio or its termination.
         // ===
 
         // Run the eventloop to forward log messages to log plugin.
         runtime_session.run_event_loop(log_plugin)?;
 
-        // Wait for the `runtime exec` to finish and write its exit code.
-        runtime_session.wait()?;
-        runtime_session.write_container_pid_file(&self.cfg.common)?;
-        runtime_session.write_exit_code(self.cfg.common.api_version)?;
-
-        Ok(ExitCode::from(runtime_session.exit_code() as u8))
+        Ok(ExitCode::SUCCESS)
     }
 }
 
-impl RuntimeArgsGenerator for Exec {
-    fn add_global_args(&self, _argv: &mut Vec<String>) -> ConmonResult<()> {
+impl RuntimeArgsGenerator for Create {
+    fn add_global_args(&self, argv: &mut Vec<String>) -> ConmonResult<()> {
+        if self.cfg.systemd_cgroup {
+            argv.push("--systemd-cgroup".into());
+        }
         Ok(())
     }
 
     fn add_subcommand_args(&self, argv: &mut Vec<String>) -> ConmonResult<()> {
         argv.extend([
-            "exec".to_string(),
+            "create".to_string(),
+            "--bundle".to_string(),
+            self.cfg.common.bundle.to_string_lossy().into_owned(),
             "--pid-file".to_string(),
             self.cfg
                 .common
                 .container_pidfile
                 .to_string_lossy()
                 .into_owned(),
-            "--process".to_string(),
-            self.cfg.exec_process_spec.to_string_lossy().into_owned(),
-            "--detach".to_string(),
         ]);
         Ok(())
     }
@@ -70,6 +78,7 @@ mod tests {
         no_pivot: bool,
         no_new_keyring: bool,
         pidfile: &str,
+        bundle: &str,
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
@@ -79,44 +88,45 @@ mod tests {
             no_pivot,
             no_new_keyring,
             container_pidfile: PathBuf::from(pidfile),
+            bundle: PathBuf::from(bundle),
             ..Default::default()
         }
     }
 
-    fn mk_exec_cfg(proc_spec: &str, common: CommonCfg) -> ExecCfg {
-        ExecCfg {
-            exec_process_spec: PathBuf::from(proc_spec),
+    fn mk_create_cfg(systemd_cgroup: bool, common: CommonCfg) -> CreateCfg {
+        CreateCfg {
+            systemd_cgroup,
             common,
-            ..Default::default()
         }
     }
 
     #[test]
-    fn generate_args_exec_basic_ordering() {
+    fn generate_args_create_with_systemd_cgroup() {
         let common = mk_common(
             "cid123",
             vec!["--root", "/var/lib/runc"],
             vec!["--optA", "X"],
             false,
             false,
-            "/tmp/pidfile",
+            "/tmp/pid-A",
+            "/tmp/bundle-A",
         );
-        let cfg = mk_exec_cfg("/tmp/process.json", common);
-        let exec = Exec::new(cfg);
+        let cfg = mk_create_cfg(true, common);
+        let create = Create::new(cfg);
 
         let argv =
-            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec).expect("ok");
+            crate::runtime::args::generate_runtime_args(&create.cfg.common, &create).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
+            "--systemd-cgroup".into(),
             "--root".into(),
             "/var/lib/runc".into(),
-            "exec".into(),
+            "create".into(),
+            "--bundle".into(),
+            "/tmp/bundle-A".into(),
             "--pid-file".into(),
-            "/tmp/pidfile".into(),
-            "--process".into(),
-            "/tmp/process.json".into(),
-            "--detach".into(),
+            "/tmp/pid-A".into(),
             "--optA".into(),
             "X".into(),
             "cid123".into(),
@@ -125,22 +135,21 @@ mod tests {
     }
 
     #[test]
-    fn generate_args_exec_with_generic_flags() {
-        let common = mk_common("cid456", vec![], vec!["--optB"], true, true, "/run/pid");
-        let cfg = mk_exec_cfg("/cfg/proc.json", common);
-        let exec = Exec::new(cfg);
+    fn generate_args_create_without_systemd_cgroup_with_generic_flags() {
+        let common = mk_common("cid456", vec![], vec!["--optB"], true, true, "/tmp/pid-B", "/tmp/bundle-B");
+        let cfg = mk_create_cfg(false, common);
+        let create = Create::new(cfg);
 
         let argv =
-            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec).expect("ok");
+            crate::runtime::args::generate_runtime_args(&create.cfg.common, &create).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
-            "exec".into(),
+            "create".into(),
+            "--bundle".into(),
+            "/tmp/bundle-B".into(),
             "--pid-file".into(),
-            "/run/pid".into(),
-            "--process".into(),
-            "/cfg/proc.json".into(),
-            "--detach".into(),
+            "/tmp/pid-B".into(),
             "--no-pivot".into(),
             "--no-new-keyring".into(),
             "--optB".into(),
