@@ -24,7 +24,7 @@ While the container runs, conmon does two things:
 Finally, upon the containers death, conmon will record its exit time and
 code to be read by the managing programs.
 
-Written in C and designed to have a low memory footprint, conmon is
+Written in Rust and designed to have a low memory footprint, conmon is
 intended to be run by a container managing library. Essentially, conmon
 is the smallest daemon a container can have.
 
