@@ -11,10 +11,10 @@ use std::process::ExitCode;
 fn run_conmon() -> ConmonResult<()> {
     let opts = Opts::parse();
     let (plugin_name, plugin_cfg) = determine_log_plugin(&opts)?;
-    let log_plugin = initialize_log_plugin(&plugin_name, &plugin_cfg)?;
+    let mut log_plugin = initialize_log_plugin(&plugin_name, &plugin_cfg)?;
 
     match determine_cmd(opts)? {
-        Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_ref())?,
+        Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut())?,
         Cmd::Exec(cfg) => Exec::new(cfg).exec()?,
         Cmd::Restore(cfg) => Restore::new(cfg).exec()?,
         Cmd::Version => Version {}.exec()?,

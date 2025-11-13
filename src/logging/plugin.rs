@@ -6,7 +6,7 @@ use crate::{
 };
 
 pub trait LogPlugin {
-    fn write(&self, is_stdout: bool, data: &str) -> ConmonResult<()>;
+    fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()>;
 }
 
 #[derive(Default)]

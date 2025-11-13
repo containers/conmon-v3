@@ -11,7 +11,6 @@ use nix::{
 };
 
 use std::{
-    cmp::Ordering,
     io,
     os::fd::{AsFd, AsRawFd, OwnedFd},
 };
@@ -33,31 +32,27 @@ pub fn create_pipe() -> ConmonResult<(OwnedFd, OwnedFd)> {
 }
 
 // Reads data from fd and returns it.
-pub fn read_pipe(fd: &OwnedFd) -> ConmonResult<String> {
+pub fn read_pipe(fd: &OwnedFd) -> ConmonResult<Vec<u8>> {
     let mut buf = [0u8; 8192];
 
     let n = loop {
         match read(fd, &mut buf) {
-            Ok(0) => return Ok(String::new()), // EOF immediately
+            Ok(0) => return Ok(Vec::new()), // EOF
             Ok(n) => break n,
-            Err(Errno::EINTR) | Err(Errno::EAGAIN) => continue, // retry
+            Err(Errno::EINTR) | Err(Errno::EAGAIN) => continue,
             Err(_) => {
                 return Err(ConmonError::new("read() failed while reading pipe", 1));
             }
         }
     };
 
-    // Convert to UTF-8 safely
-    match String::from_utf8(buf[..n].to_vec()) {
-        Ok(s) => Ok(s),
-        Err(_) => Err(ConmonError::new("pipe did not contain valid UTF-8", 1)),
-    }
+    Ok(buf[..n].to_vec())
 }
 
 // Handles the writes to `mainfd_stdout` and `mainfd_stderr` by reading the data
 // and forwarding it to log plugin.
 pub fn handle_stdio(
-    log_plugin: &dyn LogPlugin,
+    log_plugin: &mut dyn LogPlugin,
     mainfd_stdout: OwnedFd,
     mainfd_stderr: OwnedFd,
 ) -> ConmonResult<()> {
@@ -87,32 +82,27 @@ pub fn handle_stdio(
         for pfd in &fds {
             if let Some(revents) = pfd.revents() {
                 if revents.contains(PollFlags::POLLIN) {
-                    match read(pfd.as_fd(), &mut buf) {
-                        Ok(bytes) => match bytes.cmp(&0) {
-                            Ordering::Greater => {
-                                let s = String::from_utf8_lossy(&buf[..bytes]);
-                                let is_stdout =
-                                    pfd.as_fd().as_raw_fd() == mainfd_stdout.as_raw_fd();
-                                let _ = log_plugin.write(is_stdout, &s);
-                            }
-                            Ordering::Equal => {
-                                // EOF
-                                return Ok(());
-                            }
-                            Ordering::Less => unreachable!(), // read() never returns negative sizes
-                        },
-                        Err(err) => {
-                            if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
-                                break;
-                            }
+                    let n = match read(pfd.as_fd(), &mut buf) {
+                        Ok(n) => n,
+
+                        Err(Errno::EINTR) | Err(Errno::EAGAIN) => break,
+
+                        Err(e) => {
                             return Err(ConmonError::new(
                                 format!(
                                     "handle_stdio read() failed: {}",
-                                    io::Error::from_raw_os_error(err as i32)
+                                    io::Error::from_raw_os_error(e as i32)
                                 ),
                                 1,
                             ));
                         }
+                    };
+                    if n > 0 {
+                        let is_stdout = pfd.as_fd().as_raw_fd() == mainfd_stdout.as_raw_fd();
+                        let _ = log_plugin.write(is_stdout, &buf);
+                    } else {
+                        // EOF
+                        return Ok(());
                     }
                 } else if revents.contains(PollFlags::POLLHUP) {
                     return Ok(());
@@ -134,7 +124,7 @@ mod tests {
     mock! {
         pub LogPlugin {}
         impl crate::logging::plugin::LogPlugin for LogPlugin {
-            fn write(&self, is_stdout: bool, data: &str) -> ConmonResult<()>;
+            fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()>;
         }
     }
 
@@ -142,10 +132,16 @@ mod tests {
     fn handle_stdio_calls_write_for_stdout_and_stderr() -> ConmonResult<()> {
         let mut mock = MockLogPlugin::new();
         mock.expect_write()
-            .with(eq(true), predicate::str::contains("OUT"))
+            .with(
+                eq(true),
+                predicate::function(|bytes: &[u8]| bytes.windows(3).any(|w| w == b"OUT")),
+            )
             .returning(|_, _| Ok(()));
         mock.expect_write()
-            .with(eq(false), predicate::str::contains("ERR"))
+            .with(
+                eq(false),
+                predicate::function(|bytes: &[u8]| bytes.windows(3).any(|w| w == b"ERR")),
+            )
             .returning(|_, _| Ok(()));
 
         let (r_out, w_out) = create_pipe()?;
@@ -156,7 +152,7 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mock, r_out, r_err)?;
+        handle_stdio(&mut mock, r_out, r_err)?;
         Ok(())
     }
 
@@ -164,13 +160,22 @@ mod tests {
     fn handle_stdio_write_error_ignored() -> ConmonResult<()> {
         let mut mock = MockLogPlugin::new();
         mock.expect_write()
-            .with(eq(true), predicate::str::contains("OUT1"))
+            .with(
+                eq(true),
+                predicate::function(|bytes: &[u8]| bytes.windows(4).any(|w| w == b"OUT1")),
+            )
             .returning(|_, _| Ok(()));
         mock.expect_write()
-            .with(eq(false), predicate::str::contains("ERR"))
+            .with(
+                eq(false),
+                predicate::function(|bytes: &[u8]| bytes.windows(3).any(|w| w == b"ERR")),
+            )
             .returning(|_, _| Err(ConmonError::new("err write fail", 1)));
         mock.expect_write()
-            .with(eq(true), predicate::str::contains("OUT2"))
+            .with(
+                eq(true),
+                predicate::function(|bytes: &[u8]| bytes.windows(4).any(|w| w == b"OUT2")),
+            )
             .returning(|_, _| Ok(()));
 
         let (r_out, w_out) = create_pipe()?;
@@ -182,7 +187,7 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mock, r_out, r_err)?;
+        handle_stdio(&mut mock, r_out, r_err)?;
         Ok(())
     }
 }

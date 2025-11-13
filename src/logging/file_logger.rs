@@ -5,14 +5,13 @@ use crate::{
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    sync::{Arc, Mutex},
 };
 
 /// A simple file-based logging plugin.
 ///
 /// Writes all log data to the configured file path.
 pub struct FileLogger {
-    file: Arc<Mutex<File>>,
+    file: File,
 }
 
 impl FileLogger {
@@ -28,20 +27,15 @@ impl FileLogger {
                 )
             })?;
 
-        Ok(Self {
-            file: Arc::new(Mutex::new(file)),
-        })
+        Ok(Self { file })
     }
 }
 
 impl LogPlugin for FileLogger {
-    fn write(&self, _is_stdout: bool, data: &str) -> ConmonResult<()> {
-        let mut file = self.file.lock().unwrap();
-        file.write_all(data.as_bytes())
+    fn write(&mut self, _is_stdout: bool, data: &[u8]) -> ConmonResult<()> {
+        self.file
+            .write_all(data)
             .map_err(|e| ConmonError::new(format!("Failed to write log data: {}", e), 1))?;
-
-        file.flush()
-            .map_err(|e| ConmonError::new(format!("Failed to flush log file: {}", e), 1))?;
 
         Ok(())
     }

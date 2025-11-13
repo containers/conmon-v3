@@ -33,7 +33,7 @@ impl Create {
         Ok(pid)
     }
 
-    pub fn exec(&self, log_plugin: &dyn LogPlugin) -> ConmonResult<()> {
+    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<()> {
         // Generate the list of arguments for runtime.
         let runtime_args = generate_runtime_args(&self.cfg.common, self)?;
 

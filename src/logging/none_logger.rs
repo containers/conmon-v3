@@ -16,7 +16,7 @@ impl NoneLogger {
 }
 
 impl LogPlugin for NoneLogger {
-    fn write(&self, _is_stdout: bool, _data: &str) -> ConmonResult<()> {
+    fn write(&mut self, _is_stdout: bool, _data: &[u8]) -> ConmonResult<()> {
         Ok(())
     }
 }
