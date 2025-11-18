@@ -1,9 +1,10 @@
 use crate::cli::CreateCfg;
 use crate::error::{ConmonError, ConmonResult};
 use crate::logging::plugin::LogPlugin;
+use crate::parent_pipe::{get_pipe_fd_from_env, write_or_close_sync_fd};
 use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
 use crate::runtime::run::{run_runtime, wait_for_runtime};
-use crate::runtime::stdio::{create_pipe, handle_stdio};
+use crate::runtime::stdio::{create_pipe, handle_stdio, read_pipe};
 use std::fs;
 use std::process::Stdio;
 
@@ -34,6 +35,10 @@ impl Create {
     }
 
     pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<()> {
+        // Get the sync_pipe FD. It is used by the conmon caller to obtain the container_pid
+        // or the runtime error message later.
+        let sync_pipe_fd = get_pipe_fd_from_env("_OCI_SYNCPIPE")?;
+
         // Generate the list of arguments for runtime.
         let runtime_args = generate_runtime_args(&self.cfg.common, self)?;
 
@@ -60,15 +65,23 @@ impl Create {
         // Wait until the `runtime create` finishes.
         let runtime_status = wait_for_runtime(runtime_pid)?;
         if runtime_status != 0 {
+            // Pass the error to sync_pipe if there is one.
+            if let Some(fd) = sync_pipe_fd {
+                let err_bytes = read_pipe(&mainfd_stderr)?;
+                let err_str = String::from_utf8(err_bytes)?;
+                write_or_close_sync_fd(fd, -1, Some(&err_str), self.cfg.common.api_version, false)?;
+            }
             return Err(ConmonError::new(
                 format!("Runtime exited with status: {runtime_status}"),
                 1,
             ));
         }
 
-        // Read the container PID so we can wait for it later.
-        let container_pid = self.read_container_pid()?;
-        dbg!(container_pid);
+        // Pass the container_pid to sync_pipe if there is one.
+        if let Some(fd) = sync_pipe_fd {
+            let container_pid = self.read_container_pid()?;
+            write_or_close_sync_fd(fd, container_pid, None, self.cfg.common.api_version, false)?;
+        }
 
         // ===
         // Now we wait for an external application like podman to really start the container.
