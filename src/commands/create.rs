@@ -53,7 +53,7 @@ impl RuntimeArgsGenerator for Create {
         argv.extend([
             "create".to_string(),
             "--bundle".to_string(),
-            self.cfg.bundle.to_string_lossy().into_owned(),
+            self.cfg.common.bundle.to_string_lossy().into_owned(),
             "--pid-file".to_string(),
             self.cfg
                 .common
@@ -78,6 +78,7 @@ mod tests {
         no_pivot: bool,
         no_new_keyring: bool,
         pidfile: &str,
+        bundle: &str,
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
@@ -87,14 +88,14 @@ mod tests {
             no_pivot,
             no_new_keyring,
             container_pidfile: PathBuf::from(pidfile),
+            bundle: PathBuf::from(bundle),
             ..Default::default()
         }
     }
 
-    fn mk_create_cfg(systemd_cgroup: bool, bundle: &str, common: CommonCfg) -> CreateCfg {
+    fn mk_create_cfg(systemd_cgroup: bool, common: CommonCfg) -> CreateCfg {
         CreateCfg {
             systemd_cgroup,
-            bundle: PathBuf::from(bundle),
             common,
         }
     }
@@ -108,8 +109,9 @@ mod tests {
             false,
             false,
             "/tmp/pid-A",
+            "/tmp/bundle-A",
         );
-        let cfg = mk_create_cfg(true, "/tmp/bundle-A", common);
+        let cfg = mk_create_cfg(true, common);
         let create = Create::new(cfg);
 
         let argv =
@@ -134,8 +136,16 @@ mod tests {
 
     #[test]
     fn generate_args_create_without_systemd_cgroup_with_generic_flags() {
-        let common = mk_common("cid456", vec![], vec!["--optB"], true, true, "/tmp/pid-B");
-        let cfg = mk_create_cfg(false, "/tmp/bundle-B", common);
+        let common = mk_common(
+            "cid456",
+            vec![],
+            vec!["--optB"],
+            true,
+            true,
+            "/tmp/pid-B",
+            "/tmp/bundle-B",
+        );
+        let cfg = mk_create_cfg(false, common);
         let create = Create::new(cfg);
 
         let argv =

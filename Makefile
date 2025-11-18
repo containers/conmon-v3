@@ -108,7 +108,7 @@ conmon-v2: ## Fetch the conmon-v2 into "conmon-v2" directory.
 		echo "Adding worktree at $(CONMON_V2_DIR) -> $(CONMON_V2_REMOTE)/$(CONMON_V2_BRANCH)"; \
 		git worktree add --force "$(CONMON_V2_DIR)" "$(CONMON_V2_REMOTE)/$(CONMON_V2_BRANCH)"; \
 	fi; \
-	# Re-create the CONMONV_V2_DIR in case it has been removed.
+	# Re-create the CONMON_V2_DIR in case it has been removed.
 	if [ ! -d "$(CONMON_V2_DIR)" ]; then \
 		git worktree add --force "$(CONMON_V2_DIR)" "$(CONMON_V2_REMOTE)/$(CONMON_V2_BRANCH)"; \
 	fi; \

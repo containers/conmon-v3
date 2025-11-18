@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 use clap::Parser;
 use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin};
 use conmon::commands::create::Create;
