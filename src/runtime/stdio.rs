@@ -13,6 +13,7 @@ use nix::{
 };
 
 use std::{
+    cmp::Ordering,
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
 };
