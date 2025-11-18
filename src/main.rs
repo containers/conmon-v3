@@ -1,5 +1,5 @@
 use clap::Parser;
-use conmon::cli::{Cmd, Opts, determine_cmd};
+use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin};
 use conmon::commands::create::Create;
 use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
@@ -10,10 +10,11 @@ use std::process::ExitCode;
 
 fn run_conmon() -> ConmonResult<()> {
     let opts = Opts::parse();
-    let _log_plugin = initialize_log_plugin("none", &opts);
+    let (plugin_name, plugin_cfg) = determine_log_plugin(&opts)?;
+    let mut log_plugin = initialize_log_plugin(&plugin_name, &plugin_cfg)?;
 
     match determine_cmd(opts)? {
-        Cmd::Create(cfg) => Create::new(cfg).exec()?,
+        Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut())?,
         Cmd::Exec(cfg) => Exec::new(cfg).exec()?,
         Cmd::Restore(cfg) => Restore::new(cfg).exec()?,
         Cmd::Version => Version {}.exec()?,

@@ -1,7 +1,11 @@
 use crate::cli::CreateCfg;
-use crate::error::ConmonResult;
+use crate::error::{ConmonError, ConmonResult};
+use crate::logging::plugin::LogPlugin;
 use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
 use crate::runtime::run::{run_runtime, wait_for_runtime};
+use crate::runtime::stdio::{create_pipe, handle_stdio};
+use std::fs;
+use std::process::Stdio;
 
 pub struct Create {
     cfg: CreateCfg,
@@ -12,11 +16,68 @@ impl Create {
         Self { cfg }
     }
 
-    pub fn exec(&self) -> ConmonResult<()> {
+    // Helper function to read and return the container pid.
+    fn read_container_pid(&self) -> ConmonResult<i32> {
+        let contents = fs::read_to_string(self.cfg.container_pidfile.as_path())?;
+        let pid = contents.trim().parse::<i32>().map_err(|e| {
+            ConmonError::new(
+                format!(
+                    "Invalid PID contents in {}: {} ({})",
+                    self.cfg.container_pidfile.display(),
+                    contents.trim(),
+                    e
+                ),
+                1,
+            )
+        })?;
+        Ok(pid)
+    }
+
+    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<()> {
+        // Generate the list of arguments for runtime.
         let runtime_args = generate_runtime_args(&self.cfg.common, self)?;
-        let runtime_pid = run_runtime(&runtime_args)?;
+
+        // Generate pipes to handle stdio.
+        let (mainfd_stdout, workerfd_stdout) = create_pipe()?;
+        let (mainfd_stderr, workerfd_stderr) = create_pipe()?;
+
+        // Run the `runtime create` and store our PID after first fork to `conmon_pidfile.
+        let runtime_pid = run_runtime(
+            &runtime_args,
+            Stdio::null(), // TODO
+            Stdio::from(workerfd_stdout),
+            Stdio::from(workerfd_stderr),
+        )?;
+        if let Some(pidfile) = &self.cfg.conmon_pidfile {
+            std::fs::write(pidfile, runtime_pid.to_string())?;
+        }
+
+        // ===
+        // Now, after the `run_runtime`, we are in the child process of our original process
+        // (See `run_runtime` code and description for more information).
+        // ===
+
+        // Wait until the `runtime create` finishes.
         let runtime_status = wait_for_runtime(runtime_pid)?;
-        eprintln!("Runtime exited with status: {}", runtime_status);
+        if runtime_status != 0 {
+            return Err(ConmonError::new(
+                format!("Runtime exited with status: {runtime_status}"),
+                1,
+            ));
+        }
+
+        // Read the container PID so we can wait for it later.
+        let container_pid = self.read_container_pid()?;
+        dbg!(container_pid);
+
+        // ===
+        // Now we wait for an external application like podman to really start the container.
+        // and handle the containers stdio or its termination.
+        // ===
+
+        // Handle the stdio.
+        handle_stdio(log_plugin, mainfd_stdout, mainfd_stderr)?;
+
         Ok(())
     }
 }
@@ -76,6 +137,7 @@ mod tests {
             bundle: PathBuf::from(bundle),
             container_pidfile: PathBuf::from(pidfile),
             common,
+            ..Default::default()
         }
     }
 

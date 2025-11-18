@@ -1,4 +1,7 @@
-use crate::{cli::Opts, error::ConmonResult, logging::plugin::LogPlugin};
+use crate::{
+    error::ConmonResult,
+    logging::plugin::{LogPlugin, LogPluginCfg},
+};
 
 /// A no-op logging plugin that discards all data.
 ///
@@ -7,13 +10,13 @@ use crate::{cli::Opts, error::ConmonResult, logging::plugin::LogPlugin};
 pub struct NoneLogger;
 
 impl NoneLogger {
-    pub fn new(_opts: &Opts) -> Self {
-        Self
+    pub fn new(_cfg: &LogPluginCfg) -> ConmonResult<Self> {
+        Ok(Self)
     }
 }
 
 impl LogPlugin for NoneLogger {
-    fn write(&self, _is_stdout: bool, _data: &str) -> ConmonResult<()> {
+    fn write(&mut self, _is_stdout: bool, _data: &[u8]) -> ConmonResult<()> {
         Ok(())
     }
 }
