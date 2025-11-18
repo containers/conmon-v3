@@ -9,7 +9,7 @@ pub trait LogPlugin {
     fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()>;
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct LogPluginCfg {
     pub path: PathBuf,
 }
