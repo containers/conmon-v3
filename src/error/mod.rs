@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, string::FromUtf8Error};
 
 use nix::errno::Errno;
 
@@ -40,5 +40,17 @@ impl From<std::ffi::NulError> for ConmonError {
 impl From<Errno> for ConmonError {
     fn from(err: Errno) -> Self {
         ConmonError::new(format!("Errno error: {}", err), 1)
+    }
+}
+
+impl From<serde_json::Error> for ConmonError {
+    fn from(err: serde_json::Error) -> Self {
+        ConmonError::new(format!("JSON parse error: {}", err), 1)
+    }
+}
+
+impl From<FromUtf8Error> for ConmonError {
+    fn from(err: FromUtf8Error) -> Self {
+        ConmonError::new(format!("UTF-8 error: {}", err), 1)
     }
 }
