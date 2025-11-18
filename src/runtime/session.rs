@@ -1,4 +1,9 @@
-use std::{fs, os::fd::OwnedFd, process::Stdio};
+use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
+
+use nix::sys::{
+    socket::{SockFlag, SockType},
+    stat::Mode,
+};
 
 use crate::{
     cli::CommonCfg,
@@ -10,6 +15,7 @@ use crate::{
         process::RuntimeProcess,
         stdio::{create_pipe, handle_stdio, read_pipe},
     },
+    unix_socket::{SocketType, UnixSocket},
 };
 
 /// Represents Runtime session.
@@ -20,9 +26,11 @@ use crate::{
 pub struct RuntimeSession {
     process: RuntimeProcess,
     sync_pipe_fd: Option<OwnedFd>,
+    workerfd_stdin: Option<OwnedFd>,
     mainfd_stdout: Option<OwnedFd>,
     mainfd_stderr: Option<OwnedFd>,
     exit_code: i32,
+    attach_socket: Option<UnixSocket>,
 }
 
 impl RuntimeSession {
@@ -81,7 +89,22 @@ impl RuntimeSession {
             }
         }
 
-        // TODO: Create the attach socket here.
+        // Create the `attach` socket which is used to send data to container's stdin.
+        let mut attach_socket = UnixSocket::new(
+            SocketType::Console,
+            common.full_attach,
+            common.bundle.clone(),
+            common.socket_dir_path.clone(),
+            common.cuuid.clone(),
+        );
+        attach_socket.listen(
+            Some(PathBuf::from("attach")),
+            SockType::SeqPacket,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+            Mode::from_bits_truncate(0o700),
+        )?;
+        self.attach_socket = Some(attach_socket);
+
         // Inform the parent that the attach socket is ready.
         if let Some(fd) = attach_pipe_fd.take() {
             write_or_close_sync_fd(fd, 0, None, common.api_version, true)?;
@@ -106,15 +129,22 @@ impl RuntimeSession {
         let runtime_args = generate_runtime_args(common, args_gen)?;
 
         // Generate pipes to handle stdio.
+        let (workerfd_stdin, mainfd_stdin_stdio) = if common.stdin {
+            let (fd_out, fd_in) = create_pipe()?;
+            (Some(fd_in), Stdio::from(fd_out))
+        } else {
+            (None, Stdio::null())
+        };
         let (mainfd_stdout, workerfd_stdout) = create_pipe()?;
         let (mainfd_stderr, workerfd_stderr) = create_pipe()?;
+        self.workerfd_stdin = workerfd_stdin;
         self.mainfd_stdout = Some(mainfd_stdout);
         self.mainfd_stderr = Some(mainfd_stderr);
 
         // Run the `runtime create` and store our PID after first fork to `conmon_pidfile.
         self.process.spawn(
             &runtime_args,
-            Stdio::null(), // TODO
+            mainfd_stdin_stdio,
             Stdio::from(workerfd_stdout),
             Stdio::from(workerfd_stderr),
             start_pipe_fd,
@@ -176,9 +206,15 @@ impl RuntimeSession {
     /// Runs the event loop handling the container Runtime stdio.
     pub fn run_event_loop(&mut self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<()> {
         #[allow(clippy::collapsible_if)]
-        if let Some(mainfd_out) = self.mainfd_stdout.take() {
-            if let Some(mainfd_err) = self.mainfd_stderr.take() {
-                handle_stdio(log_plugin, mainfd_out, mainfd_err)?;
+        if let Some(mainfd_out) = &self.mainfd_stdout {
+            if let Some(mainfd_err) = &self.mainfd_stderr {
+                handle_stdio(
+                    log_plugin,
+                    mainfd_out,
+                    mainfd_err,
+                    self.workerfd_stdin.take(),
+                    self.attach_socket.as_ref(),
+                )?;
                 return Ok(());
             }
         }

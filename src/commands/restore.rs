@@ -32,7 +32,7 @@ impl RuntimeArgsGenerator for Restore {
         argv.extend([
             "restore".to_string(),
             "--bundle".to_string(),
-            self.cfg.bundle.to_string_lossy().into_owned(),
+            self.cfg.common.bundle.to_string_lossy().into_owned(),
             "--pid-file".to_string(),
             self.cfg
                 .common
@@ -58,6 +58,7 @@ mod tests {
         no_pivot: bool,
         no_new_keyring: bool,
         pidfile: &str,
+        bundle: &str,
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
@@ -67,14 +68,14 @@ mod tests {
             no_pivot,
             no_new_keyring,
             container_pidfile: PathBuf::from(pidfile),
+            bundle: PathBuf::from(bundle),
             ..Default::default()
         }
     }
 
-    fn mk_restore_cfg(systemd_cgroup: bool, bundle: &str, common: CommonCfg) -> RestoreCfg {
+    fn mk_restore_cfg(systemd_cgroup: bool, common: CommonCfg) -> RestoreCfg {
         RestoreCfg {
             systemd_cgroup,
-            bundle: PathBuf::from(bundle),
             common,
             ..Default::default()
         }
@@ -89,8 +90,9 @@ mod tests {
             false,
             false,
             "/tmp/pid-A",
+            "/tmp/bundle-A",
         );
-        let cfg = mk_restore_cfg(true, "/tmp/bundle-A", common);
+        let cfg = mk_restore_cfg(true, common);
         let restore = Restore::new(cfg);
 
         let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
@@ -114,8 +116,16 @@ mod tests {
 
     #[test]
     fn generate_args_without_systemd_cgroup() {
-        let common = mk_common("cid456", vec![], vec!["--optB"], true, true, "/tmp/pid-B");
-        let cfg = mk_restore_cfg(false, "/tmp/bundle-B", common);
+        let common = mk_common(
+            "cid456",
+            vec![],
+            vec!["--optB"],
+            true,
+            true,
+            "/tmp/pid-B",
+            "/tmp/bundle-B",
+        );
+        let cfg = mk_restore_cfg(false, common);
         let restore = Restore::new(cfg);
 
         let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");

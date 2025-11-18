@@ -228,12 +228,15 @@ pub struct CommonCfg {
     pub no_new_keyring: bool,
     pub conmon_pidfile: Option<PathBuf>,
     pub container_pidfile: PathBuf,
+    pub bundle: PathBuf,
+    pub full_attach: bool,
+    pub socket_dir_path: Option<PathBuf>,
+    pub stdin: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct CreateCfg {
     pub common: CommonCfg,
-    pub bundle: PathBuf,
     pub systemd_cgroup: bool,
 }
 
@@ -249,7 +252,6 @@ pub struct RestoreCfg {
     pub common: CommonCfg,
     pub restore_path: PathBuf,
     pub systemd_cgroup: bool,
-    pub bundle: PathBuf,
 }
 
 /// Try to detect "executable" bit.
@@ -323,6 +325,9 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         .take()
         .unwrap_or_else(|| cwd.join(format!("pidfile-{}", cid)));
 
+    // bundle defaults to "$cwd" if none provided
+    let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
+
     let common = CommonCfg {
         api_version,
         cid,
@@ -334,10 +339,11 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         no_new_keyring: opts.no_new_keyring,
         conmon_pidfile: opts.conmon_pidfile,
         container_pidfile,
+        bundle,
+        full_attach: opts.full_attach,
+        socket_dir_path: opts.socket_dir_path,
+        stdin: opts.stdin,
     };
-
-    // bundle defaults to "$cwd" if none provided
-    let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
 
     // decide which subcommand this flag combination means
     if let Some(restore_path) = opts.restore.take() {
@@ -345,7 +351,6 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             common,
             restore_path,
             systemd_cgroup: opts.systemd_cgroup,
-            bundle,
         }))
     } else if opts.exec {
         let exec_process_spec = opts.exec_process_spec.take().ok_or_else(|| {
@@ -362,7 +367,6 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
     } else {
         Ok(Cmd::Create(CreateCfg {
             common,
-            bundle,
             systemd_cgroup: opts.systemd_cgroup,
         }))
     }
@@ -612,7 +616,7 @@ mod tests {
         match cmd {
             Cmd::Create(cfg) => {
                 // bundle defaults to cwd
-                assert_eq!(cfg.bundle, cwd);
+                assert_eq!(cfg.common.bundle, cwd);
                 // container-pidfile defaults to "$cwd/pidfile-$cid"
                 assert_eq!(cfg.common.container_pidfile, cwd.join("pidfile-abc"));
             }
