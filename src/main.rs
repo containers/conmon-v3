@@ -11,7 +11,11 @@ use conmon::commands::version::Version;
 use conmon::error::ConmonResult;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugin;
+use ::log::LevelFilter;
 use std::process::ExitCode;
+use conmon::log;
+use ::log::info;
+use ::log::debug;
 
 fn run_conmon() -> ConmonResult<ExitCode> {
     let opts = Opts::parse();
