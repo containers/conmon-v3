@@ -62,10 +62,45 @@ impl RuntimeSession {
         &mut self,
         common: &CommonCfg,
         args_gen: &impl RuntimeArgsGenerator,
+        attach: bool,
     ) -> ConmonResult<()> {
         // Get the sync_pipe FD. It is used by the conmon caller to obtain the container_pid
         // or the runtime error message later.
         self.sync_pipe_fd = get_pipe_fd_from_env("_OCI_SYNCPIPE")?;
+
+        // Get the attach pipe FD. We use it later to inform parent that attach
+        // socket is ready.
+        let mut attach_pipe_fd: Option<OwnedFd> = None;
+        if attach {
+            attach_pipe_fd = get_pipe_fd_from_env("_OCI_ATTACHPIPE")?;
+            if attach_pipe_fd.is_none() {
+                return Err(ConmonError::new(
+                    "--attach specified but _OCI_ATTACHPIPE was not set",
+                    1,
+                ));
+            }
+        }
+
+        // TODO: Create the attach socket here.
+        // Inform the parent that the attach socket is ready.
+        if let Some(fd) = attach_pipe_fd.take() {
+            write_or_close_sync_fd(fd, 0, None, common.api_version, true)?;
+        }
+
+        // Get the start pipe FD. We wait for the parent to write some data into it
+        // before continuing with the runtime process execution. This is a simple
+        // sync mechanism between parent and us.
+        let mut start_pipe_fd = get_pipe_fd_from_env("_OCI_STARTPIPE")?;
+        if let Some(fd) = start_pipe_fd.take() {
+            read_pipe(&fd)?;
+            // If we are using attach, we want to keep the start_pipe_fd valid,
+            // so it can be passed to `process.spawn()` and block the runtime
+            // execution for the second time. Parent use that to inform us that
+            // it is attached to container.
+            if attach {
+                start_pipe_fd = Some(fd);
+            }
+        }
 
         // Generate the list of arguments for runtime.
         let runtime_args = generate_runtime_args(common, args_gen)?;
@@ -82,6 +117,7 @@ impl RuntimeSession {
             Stdio::null(), // TODO
             Stdio::from(workerfd_stdout),
             Stdio::from(workerfd_stderr),
+            start_pipe_fd,
         )?;
 
         // Store the RuntimeProcess::pid in the `conmon_pidfile`.
