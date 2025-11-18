@@ -24,6 +24,8 @@ use nix::{
     unistd::{mkstemp, symlinkat, unlink},
 };
 
+use ::log::info;
+
 // Type of the UnixSocket and RemoteSocket.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum SocketType {
@@ -149,6 +151,7 @@ impl UnixSocket {
 
         self.bind_relative_to_dir(&fd, dir_fd.as_ref(), &full_path, perms)?;
         listen(&fd, Backlog::MAXCONN)?;
+        info!("Listening on {full_path:?}");
         self.fd = Some(fd);
         self.path = Some(full_path);
 
@@ -263,6 +266,10 @@ impl UnixSocket {
 
         match accept(self.fd.as_ref().unwrap().as_raw_fd()) {
             Ok(new_fd) => {
+                info!(
+                    "Accepted new remote connection on socket {:?}: {}",
+                    self.path, new_fd
+                );
                 let remote =
                     RemoteSocket::new(self.socket_type, unsafe { OwnedFd::from_raw_fd(new_fd) });
                 Ok(Some(remote))

@@ -13,7 +13,7 @@ use clap::{ArgAction, Parser};
     override_usage = "conmon [OPTIONS] -c <CID> --runtime <PATH>",
     disable_version_flag = true
 )]
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Opts {
     /// Conmon API version to use
     #[arg(long = "api-version", value_parser = clap::value_parser!(i32))]
