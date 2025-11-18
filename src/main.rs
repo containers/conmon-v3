@@ -8,18 +8,18 @@ use conmon::error::ConmonResult;
 use conmon::logging::plugin::initialize_log_plugin;
 use std::process::ExitCode;
 
-fn run_conmon() -> ConmonResult<()> {
+fn run_conmon() -> ConmonResult<ExitCode> {
     let opts = Opts::parse();
     let (plugin_name, plugin_cfg) = determine_log_plugin(&opts)?;
     let mut log_plugin = initialize_log_plugin(&plugin_name, &plugin_cfg)?;
 
-    match determine_cmd(opts)? {
+    let exit_code = match determine_cmd(opts)? {
         Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut())?,
-        Cmd::Exec(cfg) => Exec::new(cfg).exec()?,
+        Cmd::Exec(cfg) => Exec::new(cfg).exec(log_plugin.as_mut())?,
         Cmd::Restore(cfg) => Restore::new(cfg).exec()?,
         Cmd::Version => Version {}.exec()?,
-    }
-    Ok(())
+    };
+    Ok(exit_code)
 }
 
 fn main() -> ExitCode {
