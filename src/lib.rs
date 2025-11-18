@@ -7,4 +7,3 @@ pub mod logging;
 pub mod parent_pipe;
 pub mod runtime;
 pub mod unix_socket;
-pub mod log;

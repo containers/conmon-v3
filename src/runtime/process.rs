@@ -96,7 +96,10 @@ impl RuntimeProcess {
         // Wait with the `spawn()` until parent tells us to start the runtime
         // using the start_pipe_fd (if defined).
         if let Some(fd) = start_pipe_fd.take() {
-            read_pipe(&fd)?;
+            // It is OK to just once from the pipe here. The pipe is used as a sync
+            // mechanism. We do not care about the read data at all.
+            let mut buf = [0u8; 8192];
+            read_pipe(&fd, &mut buf)?;
         }
 
         // Block signals in the parent so none are delivered between fork and exec.
