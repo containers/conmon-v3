@@ -1,4 +1,5 @@
 use crate::error::{ConmonError, ConmonResult};
+use crate::runtime::stdio::read_pipe;
 
 use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
@@ -7,7 +8,7 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
 
 use std::io::{Error, Result as IoResult};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt; // for pre_exec
 use std::process::{Command, Stdio, exit};
 
@@ -67,6 +68,7 @@ impl RuntimeProcess {
         workerfd_stdin: Stdio,
         workerfd_stdout: Stdio,
         workerfd_stderr: Stdio,
+        mut start_pipe_fd: Option<OwnedFd>,
     ) -> ConmonResult<i32> {
         if args.is_empty() {
             return Err(ConmonError::new(
@@ -89,6 +91,12 @@ impl RuntimeProcess {
                     return Err(ConmonError::new(format!("Failed to fork: {e}"), 1));
                 }
             }
+        }
+
+        // Wait with the `spawn()` until parent tells us to start the runtime
+        // using the start_pipe_fd (if defined).
+        if let Some(fd) = start_pipe_fd.take() {
+            read_pipe(&fd)?;
         }
 
         // Block signals in the parent so none are delivered between fork and exec.

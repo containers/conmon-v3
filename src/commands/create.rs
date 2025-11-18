@@ -17,7 +17,7 @@ impl Create {
     pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<ExitCode> {
         // Start the `runtime create` session.
         let mut runtime_session = crate::runtime::session::RuntimeSession::new();
-        runtime_session.launch(&self.cfg.common, self)?;
+        runtime_session.launch(&self.cfg.common, self, false)?;
 
         // ===
         // Now, after the `launch()`, we are in the child process of our original process,
