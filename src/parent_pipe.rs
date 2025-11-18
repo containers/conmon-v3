@@ -181,11 +181,11 @@ mod tests {
     fn write_writes_exit_code_and_message() -> ConmonResult<()> {
         let (r, w) = create_pipe()?;
         write_or_close_sync_fd(w, 7, Some("ok"), 0, true)?;
-        let s = read_pipe(&r)?;
+        let mut buf = [0u8; 8192];
+        let n = read_pipe(&r, &mut buf)?;
         drop(r);
-
-        let output = String::from_utf8(s)?;
-        let v: Value = serde_json::from_str(&output)?;
+        let output = std::str::from_utf8(&buf[..n])?;
+        let v: Value = serde_json::from_str(output)?;
         assert_eq!(v.get("exit_code").unwrap(), 7);
         assert_eq!(v.get("message").unwrap(), "ok");
         Ok(())
@@ -195,11 +195,11 @@ mod tests {
     fn write_writes_pid_without_message() -> ConmonResult<()> {
         let (r, w) = create_pipe()?;
         write_or_close_sync_fd(w, 123, None, 0, false)?;
-        let s = read_pipe(&r)?;
+        let mut buf = [0u8; 8192];
+        let n = read_pipe(&r, &mut buf)?;
         drop(r);
-
-        let output = String::from_utf8(s)?;
-        let v: Value = serde_json::from_str(&output)?;
+        let output = std::str::from_utf8(&buf[..n])?;
+        let v: Value = serde_json::from_str(output)?;
         assert_eq!(v.get("pid").unwrap(), 123);
         assert!(v.get("message").is_none());
         Ok(())
@@ -209,11 +209,11 @@ mod tests {
     fn write_writes_data_for_api_v1() -> ConmonResult<()> {
         let (r, w) = create_pipe()?;
         write_or_close_sync_fd(w, 42, Some("hi"), 1, false)?;
-        let s = read_pipe(&r)?;
+        let mut buf = [0u8; 8192];
+        let n = read_pipe(&r, &mut buf)?;
         drop(r);
-
-        let output = String::from_utf8(s)?;
-        let v: Value = serde_json::from_str(&output)?;
+        let output = std::str::from_utf8(&buf[..n])?;
+        let v: Value = serde_json::from_str(output)?;
         assert_eq!(v.get("data").unwrap(), 42);
         assert_eq!(v.get("message").unwrap(), "hi");
         Ok(())

@@ -115,7 +115,10 @@ impl RuntimeSession {
         // sync mechanism between parent and us.
         let mut start_pipe_fd = get_pipe_fd_from_env("_OCI_STARTPIPE")?;
         if let Some(fd) = start_pipe_fd.take() {
-            read_pipe(&fd)?;
+            // It is OK to just once from the pipe here. The pipe is used as a sync
+            // mechanism. We do not care about the read data at all.
+            let mut buf = [0u8; 8192];
+            read_pipe(&fd, &mut buf)?;
             // If we are using attach, we want to keep the start_pipe_fd valid,
             // so it can be passed to `process.spawn()` and block the runtime
             // execution for the second time. Parent use that to inform us that
@@ -174,10 +177,14 @@ impl RuntimeSession {
         #[allow(clippy::collapsible_if)]
         if let Some(fd) = self.sync_pipe_fd.take() {
             if let Some(mainfd_stderr) = &self.mainfd_stderr {
-                let err_bytes = read_pipe(mainfd_stderr)?;
-                let err_str = String::from_utf8(err_bytes)?;
+                // TODO: We are reading just once here and if container prints more than
+                // a buffer sizeto stderr, we ignore whatever does not fid into the buffer.
+                // This might be a problem, but the original conmon-v2 code behaves the same way.
+                let mut err_bytes = [0u8; 8192];
+                let n = read_pipe(mainfd_stderr, &mut err_bytes)?;
+                let err_str = std::str::from_utf8(&err_bytes[..n])?;
                 self.sync_pipe_fd =
-                    write_or_close_sync_fd(fd, self.exit_code, Some(&err_str), api_version, true)?;
+                    write_or_close_sync_fd(fd, self.exit_code, Some(err_str), api_version, true)?;
             }
         }
         Ok(())

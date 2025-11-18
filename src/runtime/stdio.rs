@@ -13,7 +13,6 @@ use nix::{
 };
 
 use std::{
-    cmp::Ordering,
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
 };
@@ -34,22 +33,21 @@ pub fn create_pipe() -> ConmonResult<(OwnedFd, OwnedFd)> {
     Ok((rfd, wfd))
 }
 
-// Reads data from fd and returns it.
-pub fn read_pipe(fd: &OwnedFd) -> ConmonResult<Vec<u8>> {
-    let mut buf = [0u8; 8192];
-
-    let n = loop {
-        match read(fd, &mut buf) {
-            Ok(0) => return Ok(Vec::new()), // EOF
-            Ok(n) => break n,
+/// Reads data from fd and stores them in the buffer.
+/// Returns the number of bytes read.
+pub fn read_pipe(fd: &OwnedFd, buf: &mut [u8]) -> ConmonResult<usize> {
+    loop {
+        match read(fd, buf) {
+            Ok(n) => return Ok(n),
             Err(Errno::EINTR) | Err(Errno::EAGAIN) => continue,
-            Err(_) => {
-                return Err(ConmonError::new("read() failed while reading pipe", 1));
+            Err(e) => {
+                return Err(ConmonError::new(
+                    format!("read() failed while reading pipe: {e}"),
+                    1,
+                ));
             }
         }
-    };
-
-    Ok(buf[..n].to_vec())
+    }
 }
 
 /// Handles incomming data on fds and forwards them to right destination.
@@ -132,17 +130,15 @@ pub fn handle_stdio(
                     // 2) stdout / stderr ready: read the data and forward to logs.
                     if fd == stdout_fd || fd == stderr_fd {
                         match read(pfd.as_fd(), &mut buf) {
-                            Ok(bytes) => match bytes.cmp(&0) {
-                                Ordering::Greater => {
+                            Ok(n) => {
+                                if n > 0 {
                                     let is_stdout = fd == stdout_fd;
-                                    let _ = log_plugin.write(is_stdout, &buf);
-                                }
-                                Ordering::Equal => {
+                                    let _ = log_plugin.write(is_stdout, &buf[..n]);
+                                } else {
                                     // EOF
                                     return Ok(());
                                 }
-                                Ordering::Less => unreachable!(),
-                            },
+                            }
                             Err(err) => {
                                 if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
                                     // nothing more to read right now, jump to next fd
@@ -166,14 +162,13 @@ pub fn handle_stdio(
                     if i >= remote_base {
                         let remote_idx = i - remote_base; // index in remote_sockets
                         match recvfrom::<SockaddrStorage>(pfd.as_fd().as_raw_fd(), &mut buf) {
-                            Ok((bytes, _sockaddr)) => match bytes.cmp(&0) {
-                                Ordering::Greater => {
-                                    let s = String::from_utf8_lossy(&buf[..bytes]);
+                            Ok((n, _sockaddr)) => {
+                                if n > 0 {
                                     match remote_sockets[remote_idx].socket_type {
                                         SocketType::Console => {
                                             // Console socket: forward data to container's stdin.
                                             if let Some(workerfd_stdin) = workerfd_stdin.as_ref() {
-                                                write(workerfd_stdin, s.as_bytes())?;
+                                                write(workerfd_stdin, &buf[..n])?;
                                             }
                                         }
                                         SocketType::Notify => {
@@ -182,8 +177,7 @@ pub fn handle_stdio(
                                     }
                                     // Go to next fd.
                                     i += 1;
-                                }
-                                Ordering::Equal => {
+                                } else {
                                     // EOF: drop this remote socket
                                     let remote = remote_sockets.swap_remove(remote_idx);
                                     fds.swap_remove(i);
@@ -195,8 +189,7 @@ pub fn handle_stdio(
                                     }
                                     // do NOT increment i: we need to process the fd that got swapped in
                                 }
-                                Ordering::Less => unreachable!(),
-                            },
+                            }
                             Err(err) => {
                                 if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
                                     i += 1;
