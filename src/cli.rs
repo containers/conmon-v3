@@ -232,6 +232,7 @@ pub struct CommonCfg {
     pub full_attach: bool,
     pub socket_dir_path: Option<PathBuf>,
     pub stdin: bool,
+    pub leave_stdin_open: bool,
 }
 
 #[derive(Debug, Default)]
@@ -343,6 +344,7 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         full_attach: opts.full_attach,
         socket_dir_path: opts.socket_dir_path,
         stdin: opts.stdin,
+        leave_stdin_open: opts.leave_stdin_open,
     };
 
     // decide which subcommand this flag combination means

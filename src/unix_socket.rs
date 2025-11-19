@@ -52,6 +52,12 @@ impl RemoteSocket {
     }
 }
 
+impl Drop for RemoteSocket {
+    fn drop(&mut self) {
+        info!("Dropping RemoteSocket {:?}", self.fd)
+    }
+}
+
 /// Represents single UnixSocket.
 #[derive(Default)]
 pub struct UnixSocket {

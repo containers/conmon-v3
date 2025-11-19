@@ -211,7 +211,11 @@ impl RuntimeSession {
     }
 
     /// Runs the event loop handling the container Runtime stdio.
-    pub fn run_event_loop(&mut self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<()> {
+    pub fn run_event_loop(
+        &mut self,
+        log_plugin: &mut dyn LogPlugin,
+        leave_stdin_open: bool,
+    ) -> ConmonResult<()> {
         #[allow(clippy::collapsible_if)]
         if let Some(mainfd_out) = &self.mainfd_stdout {
             if let Some(mainfd_err) = &self.mainfd_stderr {
@@ -221,6 +225,7 @@ impl RuntimeSession {
                     mainfd_err,
                     self.workerfd_stdin.take(),
                     self.attach_socket.as_ref(),
+                    leave_stdin_open,
                 )?;
                 return Ok(());
             }
@@ -294,7 +299,7 @@ mod tests {
         }
 
         let mut sess = RuntimeSession::new();
-        let err = sess.run_event_loop(&mut NoopLog).unwrap_err();
+        let err = sess.run_event_loop(&mut NoopLog, false).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("RuntimeSession called without stdio"),

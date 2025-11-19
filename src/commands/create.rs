@@ -35,7 +35,7 @@ impl Create {
         // ===
 
         // Run the eventloop to forward log messages to log plugin.
-        runtime_session.run_event_loop(log_plugin)?;
+        runtime_session.run_event_loop(log_plugin, self.cfg.common.leave_stdin_open)?;
 
         Ok(ExitCode::SUCCESS)
     }
