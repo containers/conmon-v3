@@ -58,6 +58,7 @@ pub fn handle_stdio(
     mainfd_stderr: &OwnedFd,
     mut workerfd_stdin: Option<OwnedFd>,
     attach_socket: Option<&UnixSocket>,
+    leave_stdin_open: bool,
 ) -> ConmonResult<()> {
     let mut buf = [0u8; 8192];
     let mut remote_sockets: Vec<RemoteSocket> = Vec::new();
@@ -181,11 +182,11 @@ pub fn handle_stdio(
                                     // EOF: drop this remote socket
                                     let remote = remote_sockets.swap_remove(remote_idx);
                                     fds.swap_remove(i);
-                                    #[allow(clippy::collapsible_if)]
-                                    if remote.socket_type == SocketType::Console {
-                                        if let Some(workerfd_stdin) = workerfd_stdin.take() {
-                                            drop(workerfd_stdin);
-                                        }
+                                    if remote.socket_type == SocketType::Console
+                                        && !leave_stdin_open
+                                    {
+                                        // This closes the socket, since moves out of scope.
+                                        workerfd_stdin.take();
                                     }
                                     // do NOT increment i: we need to process the fd that got swapped in
                                 }
@@ -197,11 +198,11 @@ pub fn handle_stdio(
                                     // treat as fatal for this remote: remove it
                                     let remote = remote_sockets.swap_remove(remote_idx);
                                     fds.swap_remove(i);
-                                    #[allow(clippy::collapsible_if)]
-                                    if remote.socket_type == SocketType::Console {
-                                        if let Some(workerfd_stdin) = workerfd_stdin.take() {
-                                            drop(workerfd_stdin);
-                                        }
+                                    if remote.socket_type == SocketType::Console
+                                        && !leave_stdin_open
+                                    {
+                                        // This closes the socket, since moves out of scope.
+                                        workerfd_stdin.take();
                                     }
                                 }
                             }
@@ -226,6 +227,17 @@ mod tests {
         predicate::{self, *},
     };
     use nix::unistd::write as nix_write;
+
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    use std::{io::Write as _, path::PathBuf};
+
+    use nix::sys::{
+        socket::{SockFlag, SockType},
+        stat::Mode,
+    };
+
+    use tempfile::TempDir;
 
     mock! {
         pub LogPlugin {}
@@ -258,7 +270,7 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mut mock, &r_out, &r_err, None, None)?;
+        handle_stdio(&mut mock, &r_out, &r_err, None, None, false)?;
         Ok(())
     }
 
@@ -293,7 +305,138 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mut mock, &r_out, &r_err, None, None)?;
+        handle_stdio(&mut mock, &r_out, &r_err, None, None, false)?;
+        Ok(())
+    }
+
+    struct TestLog;
+
+    impl crate::logging::plugin::LogPlugin for TestLog {
+        fn write(&mut self, _is_stdout: bool, _data: &[u8]) -> ConmonResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Helper that drives handle_stdio with an attach socket and two console clients.
+    ///
+    /// If `leave_open` is true, data from both clients should reach container stdin.
+    /// If false, only data from the first client should be forwarded (stdin closed on first EOF).
+    fn run_leave_stdin_open_scenario(leave_open: bool) -> ConmonResult<Vec<u8>> {
+        // Container stdout/stderr pipes.
+        let (r_out, w_out) = create_pipe()?;
+        let (r_err, w_err) = create_pipe()?;
+
+        // Container stdin pipe: w_in is what handle_stdio writes to.
+        let (r_in, w_in) = create_pipe()?;
+
+        // Prepare attach Unix socket.
+        let tmpdir = TempDir::new()?;
+        let socket_path = tmpdir.path().join("attach.sock");
+
+        let mut attach = UnixSocket::new(
+            SocketType::Console,
+            true,
+            PathBuf::from(tmpdir.path()),
+            None,
+            None,
+        );
+        attach
+            .listen(
+                Some(socket_path.clone()),
+                SockType::Stream,
+                SockFlag::SOCK_NONBLOCK,
+                Mode::from_bits_truncate(0o600),
+            )
+            .expect("listen failed");
+
+        // Spawn a thread to simulate attach clients and send stdout/stderr data.
+        let socket_path_for_thread = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            // First console client – should always be forwarded.
+            let mut c1 =
+                UnixStream::connect(&socket_path_for_thread).expect("failed to connect client1");
+            c1.write_all(b"CLIENT1\n").expect("write client1 failed");
+            drop(c1); // EOF
+
+            // Allow time for server to process EOF and, if !leave_open, close stdin.
+            std::thread::sleep(Duration::from_millis(100));
+
+            // Second console client – only forwarded if leave_stdin_open == true.
+            let mut c2 =
+                UnixStream::connect(&socket_path_for_thread).expect("failed to connect client2");
+            c2.write_all(b"CLIENT2\n").expect("write client2 failed");
+            drop(c2); // EOF
+
+            // Allow time for server to process the second EOF.
+            std::thread::sleep(Duration::from_millis(100));
+
+            // Also send something to stdout/stderr so handle_stdio can eventually exit.
+            nix_write(w_out.as_fd(), b"OUT\n").ok();
+            nix_write(w_err.as_fd(), b"ERR\n").ok();
+
+            // Close writers to produce EOF on stdout/stderr.
+            drop(w_out);
+            drop(w_err);
+        });
+
+        // Run handle_stdio in the main thread.
+        let mut logger = TestLog;
+        handle_stdio(
+            &mut logger,
+            &r_out,
+            &r_err,
+            Some(w_in),
+            Some(&attach),
+            leave_open,
+        )?;
+
+        // Wait for client thread to finish.
+        client_thread.join().expect("client thread panicked");
+
+        // Read everything that reached "container stdin" (r_in).
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match read(r_in.as_fd(), &mut buf) {
+                Ok(0) => break,
+                Ok(n) => collected.extend_from_slice(&buf[..n]),
+                Err(Errno::EINTR) | Err(Errno::EAGAIN) => continue,
+                Err(e) => panic!("read from container stdin failed: {e}"),
+            }
+        }
+
+        Ok(collected)
+    }
+
+    #[test]
+    fn handle_stdio_leave_stdin_open_true() -> ConmonResult<()> {
+        let data = run_leave_stdin_open_scenario(true)?;
+
+        let s = String::from_utf8_lossy(&data);
+        assert!(
+            s.contains("CLIENT1"),
+            "stdin data did not contain CLIENT1: {s:?}"
+        );
+        assert!(
+            s.contains("CLIENT2"),
+            "stdin data did not contain CLIENT2 even though leave_stdin_open=true: {s:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handle_stdio_leave_stdin_open_false() -> ConmonResult<()> {
+        let data = run_leave_stdin_open_scenario(false)?;
+
+        let s = String::from_utf8_lossy(&data);
+        assert!(
+            s.contains("CLIENT1"),
+            "stdin data did not contain CLIENT1: {s:?}"
+        );
+        assert!(
+            !s.contains("CLIENT2"),
+            "stdin data unexpectedly contained CLIENT2 even though leave_stdin_open=false: {s:?}"
+        );
         Ok(())
     }
 }
