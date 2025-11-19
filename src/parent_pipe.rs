@@ -77,7 +77,7 @@ pub fn write_or_close_sync_fd(
     str_data: Option<&str>,
     opt_api_version: i32,
     opt_exec: bool,
-) -> ConmonResult<()> {
+) -> ConmonResult<Option<OwnedFd>> {
     let data_key = if opt_api_version >= 1 {
         "data"
     } else if opt_exec {
@@ -100,10 +100,10 @@ pub fn write_or_close_sync_fd(
     let mut json = Value::Object(obj).to_string();
     json.push('\n');
 
-    // Write all; on EPIPE just return Ok(()). OwnedFd will close on drop.
+    // Write all; on EPIPE just return Ok(()), OwnedFd will close on drop.
     match write_all_fd(&fd, json.as_bytes()) {
-        Ok(_) => Ok(()),
-        Err(Errno::EPIPE) => Ok(()),
+        Ok(_) => Ok(Some(fd)),
+        Err(Errno::EPIPE) => Ok(None),
         Err(_) => Err(ConmonError::new(
             "Unable to send container stderr message to parent",
             1,
