@@ -226,15 +226,18 @@ pub struct CommonCfg {
     pub runtime_opts: Vec<String>,
     pub no_pivot: bool,
     pub no_new_keyring: bool,
+    pub conmon_pidfile: Option<PathBuf>,
+    pub container_pidfile: PathBuf,
+    pub bundle: PathBuf,
+    pub full_attach: bool,
+    pub socket_dir_path: Option<PathBuf>,
+    pub stdin: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct CreateCfg {
     pub common: CommonCfg,
-    pub bundle: PathBuf,
-    pub container_pidfile: PathBuf,
     pub systemd_cgroup: bool,
-    pub conmon_pidfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -242,7 +245,6 @@ pub struct ExecCfg {
     pub common: CommonCfg,
     pub exec_process_spec: PathBuf,
     pub attach: bool,
-    pub container_pidfile: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -250,8 +252,6 @@ pub struct RestoreCfg {
     pub common: CommonCfg,
     pub restore_path: PathBuf,
     pub systemd_cgroup: bool,
-    pub container_pidfile: PathBuf,
-    pub bundle: PathBuf,
 }
 
 /// Try to detect "executable" bit.
@@ -316,6 +316,18 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         ));
     }
 
+    let cwd = std::env::current_dir()
+        .map_err(|e| ConmonError::new(format!("Failed to get working directory: {e}"), 1))?;
+
+    // container-pidfile defaults to "$cwd/pidfile-$cid" if none provided
+    let container_pidfile = opts
+        .container_pidfile
+        .take()
+        .unwrap_or_else(|| cwd.join(format!("pidfile-{}", cid)));
+
+    // bundle defaults to "$cwd" if none provided
+    let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
+
     let common = CommonCfg {
         api_version,
         cid,
@@ -325,19 +337,13 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         runtime_opts: opts.runtime_opts,
         no_pivot: opts.no_pivot,
         no_new_keyring: opts.no_new_keyring,
+        conmon_pidfile: opts.conmon_pidfile,
+        container_pidfile,
+        bundle,
+        full_attach: opts.full_attach,
+        socket_dir_path: opts.socket_dir_path,
+        stdin: opts.stdin,
     };
-
-    let cwd = std::env::current_dir()
-        .map_err(|e| ConmonError::new(format!("Failed to get working directory: {e}"), 1))?;
-
-    // bundle defaults to "$cwd" if none provided
-    let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
-
-    // container-pidfile defaults to "$cwd/pidfile-$cid" if none provided
-    let container_pidfile = opts
-        .container_pidfile
-        .take()
-        .unwrap_or_else(|| cwd.join(format!("pidfile-{}", common.cid)));
 
     // decide which subcommand this flag combination means
     if let Some(restore_path) = opts.restore.take() {
@@ -345,8 +351,6 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             common,
             restore_path,
             systemd_cgroup: opts.systemd_cgroup,
-            container_pidfile,
-            bundle,
         }))
     } else if opts.exec {
         let exec_process_spec = opts.exec_process_spec.take().ok_or_else(|| {
@@ -359,15 +363,11 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             common,
             exec_process_spec,
             attach: opts.attach,
-            container_pidfile,
         }))
     } else {
         Ok(Cmd::Create(CreateCfg {
             common,
-            bundle,
-            container_pidfile,
             systemd_cgroup: opts.systemd_cgroup,
-            conmon_pidfile: opts.conmon_pidfile,
         }))
     }
 }
@@ -616,9 +616,9 @@ mod tests {
         match cmd {
             Cmd::Create(cfg) => {
                 // bundle defaults to cwd
-                assert_eq!(cfg.bundle, cwd);
+                assert_eq!(cfg.common.bundle, cwd);
                 // container-pidfile defaults to "$cwd/pidfile-$cid"
-                assert_eq!(cfg.container_pidfile, cwd.join("pidfile-abc"));
+                assert_eq!(cfg.common.container_pidfile, cwd.join("pidfile-abc"));
             }
             _ => panic!("expected Run"),
         }
