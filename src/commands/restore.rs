@@ -1,3 +1,5 @@
+use std::process::ExitCode;
+
 use crate::cli::RestoreCfg;
 use crate::error::ConmonResult;
 use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
@@ -11,10 +13,10 @@ impl Restore {
         Self { cfg }
     }
 
-    pub fn exec(&self) -> ConmonResult<()> {
+    pub fn exec(&self) -> ConmonResult<ExitCode> {
         let _runtime_args = generate_runtime_args(&self.cfg.common, self);
 
-        Ok(())
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -30,9 +32,13 @@ impl RuntimeArgsGenerator for Restore {
         argv.extend([
             "restore".to_string(),
             "--bundle".to_string(),
-            self.cfg.bundle.to_string_lossy().into_owned(),
+            self.cfg.common.bundle.to_string_lossy().into_owned(),
             "--pid-file".to_string(),
-            self.cfg.container_pidfile.to_string_lossy().into_owned(),
+            self.cfg
+                .common
+                .container_pidfile
+                .to_string_lossy()
+                .into_owned(),
         ]);
         Ok(())
     }
@@ -51,6 +57,8 @@ mod tests {
         runtime_opts: Vec<&str>,
         no_pivot: bool,
         no_new_keyring: bool,
+        pidfile: &str,
+        bundle: &str,
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
@@ -59,20 +67,15 @@ mod tests {
             runtime_opts: runtime_opts.into_iter().map(|s| s.to_string()).collect(),
             no_pivot,
             no_new_keyring,
+            container_pidfile: PathBuf::from(pidfile),
+            bundle: PathBuf::from(bundle),
             ..Default::default()
         }
     }
 
-    fn mk_restore_cfg(
-        systemd_cgroup: bool,
-        bundle: &str,
-        pidfile: &str,
-        common: CommonCfg,
-    ) -> RestoreCfg {
+    fn mk_restore_cfg(systemd_cgroup: bool, common: CommonCfg) -> RestoreCfg {
         RestoreCfg {
             systemd_cgroup,
-            bundle: PathBuf::from(bundle),
-            container_pidfile: PathBuf::from(pidfile),
             common,
             ..Default::default()
         }
@@ -86,8 +89,10 @@ mod tests {
             vec!["--optA", "X"],
             false,
             false,
+            "/tmp/pid-A",
+            "/tmp/bundle-A",
         );
-        let cfg = mk_restore_cfg(true, "/tmp/bundle-A", "/tmp/pid-A", common);
+        let cfg = mk_restore_cfg(true, common);
         let restore = Restore::new(cfg);
 
         let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
@@ -111,8 +116,16 @@ mod tests {
 
     #[test]
     fn generate_args_without_systemd_cgroup() {
-        let common = mk_common("cid456", vec![], vec!["--optB"], true, true);
-        let cfg = mk_restore_cfg(false, "/tmp/bundle-B", "/tmp/pid-B", common);
+        let common = mk_common(
+            "cid456",
+            vec![],
+            vec!["--optB"],
+            true,
+            true,
+            "/tmp/pid-B",
+            "/tmp/bundle-B",
+        );
+        let cfg = mk_restore_cfg(false, common);
         let restore = Restore::new(cfg);
 
         let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");

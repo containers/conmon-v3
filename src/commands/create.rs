@@ -1,12 +1,9 @@
+use std::process::ExitCode;
+
 use crate::cli::CreateCfg;
-use crate::error::{ConmonError, ConmonResult};
+use crate::error::ConmonResult;
 use crate::logging::plugin::LogPlugin;
-use crate::parent_pipe::{get_pipe_fd_from_env, write_or_close_sync_fd};
-use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
-use crate::runtime::run::{run_runtime, wait_for_runtime};
-use crate::runtime::stdio::{create_pipe, handle_stdio, read_pipe};
-use std::fs;
-use std::process::Stdio;
+use crate::runtime::args::RuntimeArgsGenerator;
 
 pub struct Create {
     cfg: CreateCfg,
@@ -17,81 +14,30 @@ impl Create {
         Self { cfg }
     }
 
-    // Helper function to read and return the container pid.
-    fn read_container_pid(&self) -> ConmonResult<i32> {
-        let contents = fs::read_to_string(self.cfg.container_pidfile.as_path())?;
-        let pid = contents.trim().parse::<i32>().map_err(|e| {
-            ConmonError::new(
-                format!(
-                    "Invalid PID contents in {}: {} ({})",
-                    self.cfg.container_pidfile.display(),
-                    contents.trim(),
-                    e
-                ),
-                1,
-            )
-        })?;
-        Ok(pid)
-    }
-
-    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<()> {
-        // Get the sync_pipe FD. It is used by the conmon caller to obtain the container_pid
-        // or the runtime error message later.
-        let sync_pipe_fd = get_pipe_fd_from_env("_OCI_SYNCPIPE")?;
-
-        // Generate the list of arguments for runtime.
-        let runtime_args = generate_runtime_args(&self.cfg.common, self)?;
-
-        // Generate pipes to handle stdio.
-        let (mainfd_stdout, workerfd_stdout) = create_pipe()?;
-        let (mainfd_stderr, workerfd_stderr) = create_pipe()?;
-
-        // Run the `runtime create` and store our PID after first fork to `conmon_pidfile.
-        let runtime_pid = run_runtime(
-            &runtime_args,
-            Stdio::null(), // TODO
-            Stdio::from(workerfd_stdout),
-            Stdio::from(workerfd_stderr),
-        )?;
-        if let Some(pidfile) = &self.cfg.conmon_pidfile {
-            std::fs::write(pidfile, runtime_pid.to_string())?;
-        }
+    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<ExitCode> {
+        // Start the `runtime create` session.
+        let mut runtime_session = crate::runtime::session::RuntimeSession::new();
+        runtime_session.launch(&self.cfg.common, self, false)?;
 
         // ===
-        // Now, after the `run_runtime`, we are in the child process of our original process
-        // (See `run_runtime` code and description for more information).
+        // Now, after the `launch()`, we are in the child process of our original process,
+        // because we double-fork in the RuntimeProcess::spawn.
+        // (See `RuntimeProcess::spawn` code and description for more information).
         // ===
 
-        // Wait until the `runtime create` finishes.
-        let runtime_status = wait_for_runtime(runtime_pid)?;
-        if runtime_status != 0 {
-            // Pass the error to sync_pipe if there is one.
-            if let Some(fd) = sync_pipe_fd {
-                let err_bytes = read_pipe(&mainfd_stderr)?;
-                let err_str = String::from_utf8(err_bytes)?;
-                write_or_close_sync_fd(fd, -1, Some(&err_str), self.cfg.common.api_version, false)?;
-            }
-            return Err(ConmonError::new(
-                format!("Runtime exited with status: {runtime_status}"),
-                1,
-            ));
-        }
-
-        // Pass the container_pid to sync_pipe if there is one.
-        if let Some(fd) = sync_pipe_fd {
-            let container_pid = self.read_container_pid()?;
-            write_or_close_sync_fd(fd, container_pid, None, self.cfg.common.api_version, false)?;
-        }
+        // Wait until the `runtime create` finishes and return an error in case it fails.
+        runtime_session.wait_for_success(self.cfg.common.api_version)?;
+        runtime_session.write_container_pid_file(&self.cfg.common)?;
 
         // ===
         // Now we wait for an external application like podman to really start the container.
         // and handle the containers stdio or its termination.
         // ===
 
-        // Handle the stdio.
-        handle_stdio(log_plugin, mainfd_stdout, mainfd_stderr)?;
+        // Run the eventloop to forward log messages to log plugin.
+        runtime_session.run_event_loop(log_plugin)?;
 
-        Ok(())
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -107,9 +53,13 @@ impl RuntimeArgsGenerator for Create {
         argv.extend([
             "create".to_string(),
             "--bundle".to_string(),
-            self.cfg.bundle.to_string_lossy().into_owned(),
+            self.cfg.common.bundle.to_string_lossy().into_owned(),
             "--pid-file".to_string(),
-            self.cfg.container_pidfile.to_string_lossy().into_owned(),
+            self.cfg
+                .common
+                .container_pidfile
+                .to_string_lossy()
+                .into_owned(),
         ]);
         Ok(())
     }
@@ -127,6 +77,8 @@ mod tests {
         runtime_opts: Vec<&str>,
         no_pivot: bool,
         no_new_keyring: bool,
+        pidfile: &str,
+        bundle: &str,
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
@@ -135,22 +87,16 @@ mod tests {
             runtime_opts: runtime_opts.into_iter().map(|s| s.to_string()).collect(),
             no_pivot,
             no_new_keyring,
+            container_pidfile: PathBuf::from(pidfile),
+            bundle: PathBuf::from(bundle),
             ..Default::default()
         }
     }
 
-    fn mk_create_cfg(
-        systemd_cgroup: bool,
-        bundle: &str,
-        pidfile: &str,
-        common: CommonCfg,
-    ) -> CreateCfg {
+    fn mk_create_cfg(systemd_cgroup: bool, common: CommonCfg) -> CreateCfg {
         CreateCfg {
             systemd_cgroup,
-            bundle: PathBuf::from(bundle),
-            container_pidfile: PathBuf::from(pidfile),
             common,
-            ..Default::default()
         }
     }
 
@@ -162,8 +108,10 @@ mod tests {
             vec!["--optA", "X"],
             false,
             false,
+            "/tmp/pid-A",
+            "/tmp/bundle-A",
         );
-        let cfg = mk_create_cfg(true, "/tmp/bundle-A", "/tmp/pid-A", common);
+        let cfg = mk_create_cfg(true, common);
         let create = Create::new(cfg);
 
         let argv =
@@ -188,8 +136,16 @@ mod tests {
 
     #[test]
     fn generate_args_create_without_systemd_cgroup_with_generic_flags() {
-        let common = mk_common("cid456", vec![], vec!["--optB"], true, true);
-        let cfg = mk_create_cfg(false, "/tmp/bundle-B", "/tmp/pid-B", common);
+        let common = mk_common(
+            "cid456",
+            vec![],
+            vec!["--optB"],
+            true,
+            true,
+            "/tmp/pid-B",
+            "/tmp/bundle-B",
+        );
+        let cfg = mk_create_cfg(false, common);
         let create = Create::new(cfg);
 
         let argv =
