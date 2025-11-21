@@ -2,6 +2,7 @@
 use ::log::LevelFilter;
 use ::log::debug;
 use ::log::info;
+use ::log::error;
 use clap::Parser;
 use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin};
 use conmon::commands::create::Create;
@@ -43,8 +44,11 @@ fn run_conmon() -> ConmonResult<ExitCode> {
 
 fn main() -> ExitCode {
     if let Err(e) = run_conmon() {
+        error!("Exiting with error message: {}", e.msg);
         eprintln!("conmon: {}", e.msg);
+        info!("Exiting with status {}", e.code);
         return ExitCode::from(e.code);
     }
+    info!("Exiting with OK status");
     ExitCode::SUCCESS
 }

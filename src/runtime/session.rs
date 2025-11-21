@@ -1,5 +1,6 @@
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
 
+use log::error;
 use nix::sys::{
     socket::{SockFlag, SockType},
     stat::Mode,
@@ -183,6 +184,7 @@ impl RuntimeSession {
                 let mut err_bytes = [0u8; 8192];
                 let n = read_pipe(mainfd_stderr, &mut err_bytes)?;
                 let err_str = std::str::from_utf8(&err_bytes[..n])?;
+                error!("Runtime exited with error: {err_str}");
                 self.sync_pipe_fd =
                     write_or_close_sync_fd(fd, self.exit_code, Some(err_str), api_version, true)?;
             }

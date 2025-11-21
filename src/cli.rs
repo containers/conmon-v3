@@ -56,7 +56,7 @@ pub struct Opts {
     pub exit_command: Option<PathBuf>,
 
     /// Additional arg to pass to the exit command. Can be specified multiple times
-    #[arg(long = "exit-command-arg")]
+    #[arg(long = "exit-command-arg", allow_hyphen_values = true)]
     pub exit_args: Vec<String>,
 
     /// Delay before invoking the exit command (in seconds)
@@ -132,7 +132,7 @@ pub struct Opts {
     pub restore: Option<PathBuf>,
 
     /// Additional arg to pass to the restore command. (DEPRECATED)
-    #[arg(long = "restore-arg", hide = true)]
+    #[arg(long = "restore-arg", hide = true, allow_hyphen_values = true)]
     pub restore_args: Vec<String>,
 
     /// Path to store runtime data for the container
@@ -140,7 +140,7 @@ pub struct Opts {
     pub runtime: Option<PathBuf>,
 
     /// Additional arg to pass to the runtime. Can be specified multiple times
-    #[arg(long = "runtime-arg")]
+    #[arg(long = "runtime-arg", allow_hyphen_values = true)]
     pub runtime_args: Vec<String>,
 
     /// Additional opts to pass to the restore or exec command. Can be specified multiple times

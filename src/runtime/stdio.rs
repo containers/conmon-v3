@@ -11,6 +11,7 @@ use nix::{
     sys::socket::{SockaddrStorage, recvfrom},
     unistd::{pipe2, read, write},
 };
+use nix::sys::uio::writev;
 
 use std::{
     io,
@@ -133,8 +134,28 @@ pub fn handle_stdio(
                         match read(pfd.as_fd(), &mut buf) {
                             Ok(n) => {
                                 if n > 0 {
+                                    // Forward data to logs.
                                     let is_stdout = fd == stdout_fd;
                                     let _ = log_plugin.write(is_stdout, &buf[..n]);
+
+                                    // Forward data to remote sockets attached to `attach` socket.
+                                    // The data is prefixed with single byte indicating whether
+                                    // it is stdout or stderr.
+                                    let prefix_buf: &[u8];
+                                    if is_stdout {
+                                        prefix_buf = &[2];  // stdout
+                                    } else {
+                                        prefix_buf = &[3];  // stderr
+                                    }
+                                    for remote in &mut remote_sockets {
+                                        if remote.socket_type == SocketType::Console {
+                                            let iov = [
+                                                std::io::IoSlice::new(prefix_buf),
+                                                std::io::IoSlice::new(&buf[..n]),
+                                            ];
+                                            writev(remote.fd.as_fd(), &iov)?;
+                                        }
+                                    }
                                 } else {
                                     // EOF
                                     return Ok(());
