@@ -105,7 +105,7 @@ mod tests {
         let exec = Exec::new(cfg);
 
         let argv =
-            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec).expect("ok");
+            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
@@ -131,7 +131,7 @@ mod tests {
         let exec = Exec::new(cfg);
 
         let argv =
-            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec).expect("ok");
+            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),

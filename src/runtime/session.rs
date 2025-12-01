@@ -1,6 +1,6 @@
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
 
-use log::error;
+use log::{debug, error};
 use nix::sys::{
     socket::{SockFlag, SockType},
     stat::Mode,
@@ -14,9 +14,9 @@ use crate::{
     runtime::{
         args::{RuntimeArgsGenerator, generate_runtime_args},
         process::RuntimeProcess,
-        stdio::{create_pipe, handle_stdio, read_pipe},
+        stdio::{create_pipe, handle_stdio, read_pipe, receive_console_fd},
     },
-    unix_socket::{SocketType, UnixSocket},
+    unix_socket::{RemoteSocket, SocketType, UnixSocket},
 };
 
 /// Represents Runtime session.
@@ -25,13 +25,46 @@ use crate::{
 /// to log plugins.
 #[derive(Default)]
 pub struct RuntimeSession {
+    /// The low-level runtime process.
     process: RuntimeProcess,
+
+    /// File descriptor for synchronization pipe.
+    /// The process executing `conmon` uses this pipe to receive the container PID
+    /// or error message in case the runtime cannot be executed.
     sync_pipe_fd: Option<OwnedFd>,
+
+    /// Represents container's stdin.
+    /// Any data written here are sent to container's input.
     workerfd_stdin: Option<OwnedFd>,
+
+    /// Represents container's stdout.
+    /// Any data read from here should be treated as container's standard output.
     mainfd_stdout: Option<OwnedFd>,
+
+    /// Represents container's stderr.
+    /// Any data read from here should be treated as container's standard error.
     mainfd_stderr: Option<OwnedFd>,
+
+    /// Exit code of `process`.
     exit_code: i32,
+
+    /// UnixSocket for `attach`.
+    /// The process executing conmon uses it to attach to container. It opens new
+    /// connection to socket and any data read from it are forwarded to
+    /// container's stdin (`workerfd_stdin`). Any data read from `mainfd_stdout`
+    /// and `mainfd_stderr` are forwarded to that `attach` connection, so
+    /// the process executing conmon can handle them.
     attach_socket: Option<UnixSocket>,
+
+    /// UnixSocket for runtime `--console-socket`. The runtime connects to it
+    /// and sends a `terminal_socket` of terminal to that connection. This is used if
+    /// `--terminal` is used.
+    console_socket: Option<UnixSocket>,
+
+    /// Terminal created by runtime and received using `console_socket`. Anything written
+    /// to this socket is forwarded to container's stdin. Anything read from it is treated
+    /// as container's stdout.
+    terminal_socket: Option<RemoteSocket>,
 }
 
 impl RuntimeSession {
@@ -129,27 +162,73 @@ impl RuntimeSession {
             }
         }
 
-        // Generate the list of arguments for runtime.
-        let runtime_args = generate_runtime_args(common, args_gen)?;
+        // Create console socket if the --terminal option is used.
+        // We later pass the path to the socket to runtime and it sends a fd
+        // through it which will be used to communicate with the container.
+        if common.terminal {
+            let mut console_socket = UnixSocket::new(
+                SocketType::Terminal,
+                common.full_attach,
+                common.bundle.clone(),
+                None,
+                None,
+            );
+            // The path is None here - listen will use unique random name.
+            console_socket.listen(
+                None,
+                SockType::Stream,
+                SockFlag::SOCK_CLOEXEC,
+                Mode::from_bits_truncate(0o700),
+            )?;
+            self.console_socket = Some(console_socket);
+        }
 
-        // Generate pipes to handle stdio.
-        let (workerfd_stdin, mainfd_stdin_stdio) = if common.stdin {
-            let (fd_out, fd_in) = create_pipe()?;
-            (Some(fd_in), Stdio::from(fd_out))
+        // Generate the list of arguments for runtime.
+        let runtime_args = generate_runtime_args(common, args_gen, self.console_socket.as_ref())?;
+
+        // Generate the stdin and stdout.
+        let mainfd_stdin_stdio: Stdio;
+        let mainfd_stdout_stdio: Stdio;
+        if common.terminal {
+            // If we are using a terminal, we pass the console-socket to runtime
+            // and the communication will happen using that socket. So there is no
+            // need to create custom stdin/stdout pipes.
+            mainfd_stdin_stdio = Stdio::null();
+            mainfd_stdout_stdio = Stdio::null();
         } else {
-            (None, Stdio::null())
-        };
-        let (mainfd_stdout, workerfd_stdout) = create_pipe()?;
+            // Create the pipe to handle stdin in case the --stdin is used.
+            if common.stdin {
+                let (fd_out, fd_in) = create_pipe()?;
+                // We store the "in" part of the pipe to `self.workerfd_stdin`, so anything
+                // written to it can be sent to container's stdin.
+                self.workerfd_stdin = Some(fd_in);
+                // We pass the "out" part of the pipe to `self.process.spawn`, so the container
+                // can read from it.
+                mainfd_stdin_stdio = Stdio::from(fd_out)
+            } else {
+                // No stdin -> null.
+                mainfd_stdin_stdio = Stdio::null();
+            }
+
+            // Create the pipe to handle stdout.
+            let (fd_out, fd_in) = create_pipe()?;
+            // We pass the "in" part of the pipe to `self.process.spawn`, so the container
+            // can write to it.
+            mainfd_stdout_stdio = Stdio::from(fd_in);
+            // We store the "out" part of the pipe to `self.workerfd_stout`, so anything
+            // written to it can be treated as container's stdout.
+            self.mainfd_stdout = Some(fd_out);
+        }
+
+        // We create stderr every time, because we need to capture the runtime error log.
         let (mainfd_stderr, workerfd_stderr) = create_pipe()?;
-        self.workerfd_stdin = workerfd_stdin;
-        self.mainfd_stdout = Some(mainfd_stdout);
         self.mainfd_stderr = Some(mainfd_stderr);
 
         // Run the `runtime create` and store our PID after first fork to `conmon_pidfile.
         self.process.spawn(
             &runtime_args,
             mainfd_stdin_stdio,
-            Stdio::from(workerfd_stdout),
+            mainfd_stdout_stdio,
             Stdio::from(workerfd_stderr),
             start_pipe_fd,
         )?;
@@ -219,21 +298,30 @@ impl RuntimeSession {
         leave_stdin_open: bool,
     ) -> ConmonResult<()> {
         #[allow(clippy::collapsible_if)]
-        if let Some(mainfd_out) = &self.mainfd_stdout {
-            if let Some(mainfd_err) = &self.mainfd_stderr {
-                handle_stdio(
-                    log_plugin,
-                    mainfd_out,
-                    mainfd_err,
-                    self.workerfd_stdin.take(),
-                    self.attach_socket.as_ref(),
-                    leave_stdin_open,
-                )?;
-                return Ok(());
-            }
+        if let Some(mainfd_err) = self.mainfd_stderr.take() {
+            handle_stdio(
+                log_plugin,
+                self.mainfd_stdout.take(),
+                mainfd_err,
+                self.workerfd_stdin.take(),
+                self.attach_socket.take(),
+                self.terminal_socket.take(),
+                leave_stdin_open,
+            )?;
+            return Ok(());
         }
 
         Err(ConmonError::new("RuntimeSession called without stdio", 1))
+    }
+
+    /// Waits for the runtime to sent the terminal fd to conmon.
+    pub fn wait_for_terminal_creation(&mut self) -> ConmonResult<()> {
+        debug!("Waiting for terminal creation.");
+        if let Some(cs) = self.console_socket.take() {
+            self.terminal_socket = Some(receive_console_fd(cs)?);
+        }
+        debug!("Terminal created.");
+        Ok(())
     }
 }
 

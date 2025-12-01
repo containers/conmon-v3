@@ -25,8 +25,14 @@ impl Create {
         // (See `RuntimeProcess::spawn` code and description for more information).
         // ===
 
+        // In case of `--terminal`, wait until runtime creates the console socket.
+        if self.cfg.common.terminal {
+            runtime_session.wait_for_terminal_creation()?;
+        }
+
         // Wait until the `runtime create` finishes and return an error in case it fails.
         runtime_session.wait_for_success(self.cfg.common.api_version)?;
+
         runtime_session.write_container_pid_file(&self.cfg.common)?;
 
         // ===
@@ -114,8 +120,8 @@ mod tests {
         let cfg = mk_create_cfg(true, common);
         let create = Create::new(cfg);
 
-        let argv =
-            crate::runtime::args::generate_runtime_args(&create.cfg.common, &create).expect("ok");
+        let argv = crate::runtime::args::generate_runtime_args(&create.cfg.common, &create, None)
+            .expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
@@ -148,8 +154,8 @@ mod tests {
         let cfg = mk_create_cfg(false, common);
         let create = Create::new(cfg);
 
-        let argv =
-            crate::runtime::args::generate_runtime_args(&create.cfg.common, &create).expect("ok");
+        let argv = crate::runtime::args::generate_runtime_args(&create.cfg.common, &create, None)
+            .expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),

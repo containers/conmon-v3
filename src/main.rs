@@ -1,8 +1,8 @@
 #![allow(clippy::collapsible_if)]
 use ::log::LevelFilter;
 use ::log::debug;
-use ::log::info;
 use ::log::error;
+use ::log::info;
 use clap::Parser;
 use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin};
 use conmon::commands::create::Create;

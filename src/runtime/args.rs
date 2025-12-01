@@ -1,5 +1,6 @@
 use crate::cli::CommonCfg;
 use crate::error::ConmonResult;
+use crate::unix_socket::UnixSocket;
 
 /// Trait for constructing the runtime argv.
 /// Implementors append global/common flags and then subcommand-specificf,
@@ -17,6 +18,7 @@ pub trait RuntimeArgsGenerator {
 pub fn generate_runtime_args(
     o: &CommonCfg,
     args_gen: &impl RuntimeArgsGenerator,
+    console_socket: Option<&UnixSocket>,
 ) -> ConmonResult<Vec<String>> {
     let mut argv: Vec<String> = Vec::new();
 
@@ -43,10 +45,14 @@ pub fn generate_runtime_args(
     // Generic passthrough runtime opts (after subcommand-specific flags)
     argv.extend(o.runtime_opts.iter().map(|s| s.to_string()));
 
-    // TODO: Optional console socket
-    // if let Some(cs) = csname {
-    //     argv.extend(["--console-socket".to_string(), cs.to_string()]);
-    // }
+    if let Some(cs) = console_socket {
+        if let Some(cs_path) = cs.path() {
+            argv.extend([
+                "--console-socket".to_string(),
+                cs_path.to_string_lossy().into_owned(),
+            ]);
+        }
+    }
 
     // Container ID last
     argv.push(o.cid.to_string());
@@ -110,7 +116,7 @@ mod tests {
             subs: vec!["create".into(), "--bundle".into(), "/bundle".into()],
         };
 
-        let argv = generate_runtime_args(&common, &args_gen).expect("ok");
+        let argv = generate_runtime_args(&common, &args_gen, None).expect("ok");
 
         let expected = vec![
             "./runtime",
@@ -141,7 +147,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = generate_runtime_args(&common, &FailGlobal).unwrap_err();
+        let err = generate_runtime_args(&common, &FailGlobal, None).unwrap_err();
         assert!(err.to_string().contains("global failure"));
     }
 
@@ -157,7 +163,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = generate_runtime_args(&common, &FailSub).unwrap_err();
+        let err = generate_runtime_args(&common, &FailSub, None).unwrap_err();
         assert!(err.to_string().contains("subcommand failure"));
     }
 }
