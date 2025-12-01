@@ -1,22 +1,24 @@
 use crate::{
     error::{ConmonError, ConmonResult},
     logging::plugin::LogPlugin,
-    unix_socket::{RemoteSocket, SocketType, UnixSocket},
+    unix_socket::{RemoteSocket, Socket, SocketType, UnixSocket},
 };
 
 use nix::{
+    cmsg_space,
     errno::Errno,
     fcntl::OFlag,
     poll::{PollFd, PollFlags, PollTimeout, poll},
-    sys::socket::{SockaddrStorage, recvfrom},
-    unistd::{pipe2, read, write},
+    sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg},
+    unistd::{pipe2, read},
 };
-use nix::sys::uio::writev;
 
 use std::{
-    io,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    io::{self, IoSliceMut},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
 };
+
+use log::debug;
 
 // Creates new pipe and return read/write fds.
 pub fn create_pipe() -> ConmonResult<(OwnedFd, OwnedFd)> {
@@ -51,42 +53,137 @@ pub fn read_pipe(fd: &OwnedFd, buf: &mut [u8]) -> ConmonResult<usize> {
     }
 }
 
-/// Handles incomming data on fds and forwards them to right destination.
-/// This function blocks until the container is running.
-pub fn handle_stdio(
-    log_plugin: &mut dyn LogPlugin,
-    mainfd_stdout: &OwnedFd,
-    mainfd_stderr: &OwnedFd,
-    mut workerfd_stdin: Option<OwnedFd>,
-    attach_socket: Option<&UnixSocket>,
-    leave_stdin_open: bool,
-) -> ConmonResult<()> {
-    let mut buf = [0u8; 8192];
-    let mut remote_sockets: Vec<RemoteSocket> = Vec::new();
+pub struct RecvResult {
+    n: usize,
+    fds: Vec<RawFd>,
+}
 
-    // Container's stdout and stderr.
-    let mut fds: Vec<PollFd> = vec![
-        PollFd::new(mainfd_stdout.as_fd(), PollFlags::POLLIN), // index 0
-        PollFd::new(mainfd_stderr.as_fd(), PollFlags::POLLIN), // index 1
-    ];
-    let stdout_fd = mainfd_stdout.as_raw_fd();
-    let stderr_fd = mainfd_stderr.as_raw_fd();
+/// Helper function to receive data from `fd`, store them in `buf` and
+/// returns the the lentgh of data read as well as additional fds sent
+/// together with the data.
+fn recv_data_and_fds(fd: RawFd, buf: &mut [u8]) -> nix::Result<RecvResult> {
+    let mut iov = [IoSliceMut::new(buf)];
+    let mut cmsgspace = cmsg_space!([RawFd; 4]);
 
-    // Optional attach socket.
-    let mut attach_index: Option<usize> = None;
-    #[allow(clippy::collapsible_if)]
-    if let Some(attach) = attach_socket.as_ref() {
-        if let Some(fd) = attach.fd() {
-            let idx = fds.len();
-            fds.push(PollFd::new(fd.as_fd(), PollFlags::POLLIN));
-            attach_index = Some(idx);
+    let msg = recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsgspace), MsgFlags::empty())?;
+
+    let mut fds = Vec::new();
+    let rights = msg.cmsgs().unwrap().next();
+    if let Some(ControlMessageOwned::ScmRights(rights)) = rights {
+        fds.extend(rights);
+    }
+    Ok(RecvResult { n: msg.bytes, fds })
+}
+
+/// Helper function to accept `console_socket` connection and return the fd
+/// sent byt the connection.
+pub fn receive_console_fd(console_socket: UnixSocket) -> ConmonResult<RemoteSocket> {
+    let remote = console_socket.accept()?;
+    if let Some(r) = remote {
+        let mut buf = [0u8; 8192];
+        match recv_data_and_fds(r.fd.as_raw_fd(), &mut buf) {
+            Ok(res) => {
+                let n = res.n;
+                if n > 0 {
+                    let received_fd = res.fds.first();
+                    if let Some(rfd) = received_fd {
+                        debug!("Received fd {}", rfd);
+                        let owned_fd = unsafe { OwnedFd::from_raw_fd(*rfd) };
+                        let ret = RemoteSocket::new(SocketType::Terminal, owned_fd);
+                        return Ok(ret);
+                    }
+                } else {
+                    return Err(ConmonError::new(
+                        "No file descriptor received using console socket.",
+                        1,
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(ConmonError::new(
+                    format!(
+                        "Error receiving file descriptor using console socket: {}",
+                        e
+                    ),
+                    1,
+                ));
+            }
         }
     }
+    Err(ConmonError::new(
+        "Cannot receive console socket file descriptor without console socket.",
+        1,
+    ))
+}
 
-    // All RemoteSockets live at indices >= remote_base in `fds`
-    let remote_base = fds.len(); // constant for the lifetime of this function
+/// Handles incomming data on fds and forwards them to right destination.
+/// This function blocks until the container is running.
+/// # Arguments
+///
+/// * `log_plugin` - plugin to which the container logs are forwarded into.
+/// * `mainfd_stdout` - fd from which the container's stdout is read from.
+/// * `mainfd_stderr` - fd from which the container's stderr is read from.
+/// * `workerfd_stdin` - fd into which the container's stdin is written.
+/// * `attach_socket` - socket for `attach` connections.
+/// * `terminal_socket` - terminal socket create by runtime in case of `--terminal`.
+/// * `leave_stdin_open` - Whether to keep stdin open attach client disconnects.
+pub fn handle_stdio(
+    log_plugin: &mut dyn LogPlugin,
+    mut mainfd_stdout: Option<OwnedFd>,
+    mainfd_stderr: OwnedFd,
+    mut workerfd_stdin: Option<OwnedFd>,
+    attach_socket: Option<UnixSocket>,
+    terminal_socket: Option<RemoteSocket>,
+    leave_stdin_open: bool,
+) -> ConmonResult<()> {
+    debug!("Starting event loop");
+    let mut sockets: Vec<Socket> = Vec::new();
+    let mut new_sockets: Vec<RemoteSocket> = Vec::new();
+    let mut fds: Vec<PollFd> = vec![];
 
-    loop {
+    // Helpers containing fds for console and terminal, so we can easily
+    // forward data to them
+    let mut console_fds = Vec::new();
+    let mut terminal_fds = Vec::new();
+
+    // Container's stdout.
+    if let Some(stdout) = mainfd_stdout.take() {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(stdout.as_raw_fd()) };
+        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+        sockets.push(Socket::Remote(RemoteSocket::new(
+            SocketType::Stdout,
+            stdout,
+        )));
+    }
+
+    // Container's stderr.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(mainfd_stderr.as_raw_fd()) };
+    fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+    sockets.push(Socket::Remote(RemoteSocket::new(
+        SocketType::Stderr,
+        mainfd_stderr,
+    )));
+
+    // Optional attach socket.
+    if let Some(attach) = attach_socket {
+        if let Some(fd) = attach.fd() {
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+            fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+        }
+        sockets.push(Socket::Unix(attach));
+    }
+
+    // Optional terminal socket.
+    if let Some(terminal) = terminal_socket {
+        terminal_fds.push(terminal.fd.as_raw_fd());
+        let borrowed = unsafe { BorrowedFd::borrow_raw(terminal.fd.as_raw_fd()) };
+        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+        sockets.push(Socket::Remote(terminal));
+    }
+
+    // Main loop.
+    // Iterates as long as we have some RemoteSocket to read from.
+    while sockets.iter().any(|s| matches!(s, Socket::Remote(_))) {
         // Run poll to get informed about new fd events.
         let n = poll(&mut fds, PollTimeout::NONE).map_err(|e| {
             ConmonError::new(
@@ -108,136 +205,65 @@ pub fn handle_stdio(
         let mut i = 0;
         while i < fds.len() {
             let pfd = &fds[i];
+            let mut keep_socket = true;
 
             if let Some(revents) = pfd.revents() {
-                let fd = pfd.as_fd().as_raw_fd();
                 if revents.contains(PollFlags::POLLIN) {
-                    // 1) attach socket ready: accept new RemoteSocket, extend vectors
-                    if Some(i) == attach_index {
-                        #[allow(clippy::collapsible_if)]
-                        if let Some(attach) = attach_socket.as_ref() {
-                            if let Some(remote) = attach.accept()? {
-                                // add RemoteSocket to `remote_sockets` and its fd to `fds`.
-                                let raw = remote.fd.as_raw_fd();
-                                remote_sockets.push(remote);
-                                let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+                    // Handle the received data.
+                    keep_socket = sockets[i].handle_data(
+                        log_plugin,
+                        &mut new_sockets,
+                        workerfd_stdin.as_ref(),
+                        &console_fds,
+                        &terminal_fds,
+                    )?;
+
+                    // Add new sockets to `sockets` and `fds`.
+                    // This happens when `attach` accepts new connection.
+                    if !new_sockets.is_empty() {
+                        while !new_sockets.is_empty() {
+                            let new_socket = new_sockets.pop();
+                            if let Some(n_s) = new_socket {
+                                if n_s.socket_type == SocketType::Console {
+                                    console_fds.push(n_s.fd.as_raw_fd());
+                                }
+                                let borrowed =
+                                    unsafe { BorrowedFd::borrow_raw(n_s.fd.as_raw_fd()) };
                                 fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+                                sockets.push(Socket::Remote(n_s));
                             }
                         }
-                        // Go to next fd.
-                        i += 1;
-                        continue;
-                    }
-
-                    // 2) stdout / stderr ready: read the data and forward to logs.
-                    if fd == stdout_fd || fd == stderr_fd {
-                        match read(pfd.as_fd(), &mut buf) {
-                            Ok(n) => {
-                                if n > 0 {
-                                    // Forward data to logs.
-                                    let is_stdout = fd == stdout_fd;
-                                    let _ = log_plugin.write(is_stdout, &buf[..n]);
-
-                                    // Forward data to remote sockets attached to `attach` socket.
-                                    // The data is prefixed with single byte indicating whether
-                                    // it is stdout or stderr.
-                                    let prefix_buf: &[u8];
-                                    if is_stdout {
-                                        prefix_buf = &[2];  // stdout
-                                    } else {
-                                        prefix_buf = &[3];  // stderr
-                                    }
-                                    for remote in &mut remote_sockets {
-                                        if remote.socket_type == SocketType::Console {
-                                            let iov = [
-                                                std::io::IoSlice::new(prefix_buf),
-                                                std::io::IoSlice::new(&buf[..n]),
-                                            ];
-                                            writev(remote.fd.as_fd(), &iov)?;
-                                        }
-                                    }
-                                } else {
-                                    // EOF
-                                    return Ok(());
-                                }
-                            }
-                            Err(err) => {
-                                if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
-                                    // nothing more to read right now, jump to next fd
-                                    i += 1;
-                                    continue;
-                                }
-                                return Err(ConmonError::new(
-                                    format!(
-                                        "handle_stdio read() failed: {}",
-                                        io::Error::from_raw_os_error(err as i32)
-                                    ),
-                                    1,
-                                ));
-                            }
-                        }
-                        i += 1;
-                        continue;
-                    }
-
-                    // 3) RemoteSocket ready: read it and forward to the right destination.
-                    if i >= remote_base {
-                        let remote_idx = i - remote_base; // index in remote_sockets
-                        match recvfrom::<SockaddrStorage>(pfd.as_fd().as_raw_fd(), &mut buf) {
-                            Ok((n, _sockaddr)) => {
-                                if n > 0 {
-                                    match remote_sockets[remote_idx].socket_type {
-                                        SocketType::Console => {
-                                            // Console socket: forward data to container's stdin.
-                                            if let Some(workerfd_stdin) = workerfd_stdin.as_ref() {
-                                                write(workerfd_stdin, &buf[..n])?;
-                                            }
-                                        }
-                                        SocketType::Notify => {
-                                            // handle data coming from this remote
-                                        }
-                                    }
-                                    // Go to next fd.
-                                    i += 1;
-                                } else {
-                                    // EOF: drop this remote socket
-                                    let remote = remote_sockets.swap_remove(remote_idx);
-                                    fds.swap_remove(i);
-                                    if remote.socket_type == SocketType::Console
-                                        && !leave_stdin_open
-                                    {
-                                        // This closes the socket, since moves out of scope.
-                                        workerfd_stdin.take();
-                                    }
-                                    // do NOT increment i: we need to process the fd that got swapped in
-                                }
-                            }
-                            Err(err) => {
-                                if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
-                                    i += 1;
-                                } else {
-                                    // treat as fatal for this remote: remove it
-                                    let remote = remote_sockets.swap_remove(remote_idx);
-                                    fds.swap_remove(i);
-                                    if remote.socket_type == SocketType::Console
-                                        && !leave_stdin_open
-                                    {
-                                        // This closes the socket, since moves out of scope.
-                                        workerfd_stdin.take();
-                                    }
-                                }
-                            }
-                        }
-                        continue;
+                        new_sockets.clear();
                     }
                 } else if revents.contains(PollFlags::POLLHUP) {
-                    return Ok(());
+                    // One HUP, close the socket.
+                    keep_socket = false;
                 }
             }
 
-            i += 1;
+            if keep_socket {
+                // Go to next socket in case we want to keep this one.
+                i += 1;
+            } else {
+                // Remove the socket.
+                let socket = sockets.swap_remove(i);
+                fds.swap_remove(i);
+                if let Socket::Remote(r) = socket {
+                    if r.socket_type == SocketType::Console {
+                        console_fds.retain(|&x| x != r.fd.as_raw_fd());
+                        if !leave_stdin_open {
+                            // This closes the socket, since moves out of scope.
+                            workerfd_stdin.take();
+                        }
+                    } else if r.socket_type == SocketType::Terminal {
+                        terminal_fds.retain(|&x| x != r.fd.as_raw_fd());
+                    }
+                }
+                // Do NOT increment the `i`, since it now points to swapped socket.
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -249,7 +275,7 @@ mod tests {
     };
     use nix::unistd::write as nix_write;
 
-    use std::os::unix::net::UnixStream;
+    use std::os::{fd::AsFd, unix::net::UnixStream};
     use std::time::Duration;
     use std::{io::Write as _, path::PathBuf};
 
@@ -291,7 +317,7 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mut mock, &r_out, &r_err, None, None, false)?;
+        handle_stdio(&mut mock, Some(r_out), r_err, None, None, None, false)?;
         Ok(())
     }
 
@@ -326,7 +352,7 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mut mock, &r_out, &r_err, None, None, false)?;
+        handle_stdio(&mut mock, Some(r_out), r_err, None, None, None, false)?;
         Ok(())
     }
 
@@ -404,10 +430,11 @@ mod tests {
         let mut logger = TestLog;
         handle_stdio(
             &mut logger,
-            &r_out,
-            &r_err,
+            Some(r_out),
+            r_err,
             Some(w_in),
-            Some(&attach),
+            Some(attach),
+            None,
             leave_open,
         )?;
 

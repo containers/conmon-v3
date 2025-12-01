@@ -14,7 +14,7 @@ impl Restore {
     }
 
     pub fn exec(&self) -> ConmonResult<ExitCode> {
-        let _runtime_args = generate_runtime_args(&self.cfg.common, self);
+        let _runtime_args = generate_runtime_args(&self.cfg.common, self, None);
 
         Ok(ExitCode::SUCCESS)
     }
@@ -95,7 +95,7 @@ mod tests {
         let cfg = mk_restore_cfg(true, common);
         let restore = Restore::new(cfg);
 
-        let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
+        let argv = generate_runtime_args(&restore.cfg.common, &restore, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
@@ -128,7 +128,7 @@ mod tests {
         let cfg = mk_restore_cfg(false, common);
         let restore = Restore::new(cfg);
 
-        let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
+        let argv = generate_runtime_args(&restore.cfg.common, &restore, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),

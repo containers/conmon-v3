@@ -1,9 +1,23 @@
 use std::{
-    os::fd::OwnedFd,
+    os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
 
-use crate::error::{ConmonError, ConmonResult};
+use log::debug;
+use nix::{
+    errno::Errno,
+    fcntl::OFlag,
+    sys::{
+        socket::{SockaddrStorage, recvfrom},
+        uio::writev,
+    },
+    unistd::{read, write},
+};
+
+use crate::{
+    error::{ConmonError, ConmonResult},
+    logging::plugin::LogPlugin,
+};
 use std::{
     ffi::OsStr,
     io,
@@ -13,8 +27,7 @@ use std::{
 
 use nix::{
     NixPath,
-    errno::Errno,
-    fcntl::{AT_FDCWD, OFlag, open},
+    fcntl::{AT_FDCWD, open},
     sys::{
         socket::{
             AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket,
@@ -31,7 +44,11 @@ use ::log::info;
 pub enum SocketType {
     #[default]
     Console, // Socket for container's stdin ("console").
-    Notify, // Socket for sd-notify.
+    Notify,   // Socket for sd-notify.
+    Terminal, // Terminal socket received using --console-socket.
+    Stdout,   // Socket for container's stdout.
+    Stderr,   // Socket for container's stdin.
+    Attach,   // Attach Unix socket.
 }
 
 /// Remote side (attach client or sd-notify FD inside container).
@@ -50,6 +67,48 @@ impl RemoteSocket {
             buf: [0u8; 8192],
         }
     }
+
+    pub fn read(&mut self) -> ConmonResult<usize> {
+        loop {
+            match self.socket_type {
+                SocketType::Stdout | SocketType::Stderr | SocketType::Terminal => {
+                    match read(self.fd.as_fd(), &mut self.buf) {
+                        Ok(n) => return Ok(n),
+                        Err(err) => {
+                            if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
+                                continue;
+                            }
+                            return Err(ConmonError::new(
+                                format!(
+                                    "read failed: {}",
+                                    io::Error::from_raw_os_error(err as i32)
+                                ),
+                                1,
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    match recvfrom::<SockaddrStorage>(self.fd.as_fd().as_raw_fd(), &mut self.buf) {
+                        Ok((n, _)) => return Ok(n),
+                        Err(err) => {
+                            if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
+                                continue;
+                            }
+                            return Err(ConmonError::new(
+                                format!(
+                                    "read failed: {}, {:?}",
+                                    io::Error::from_raw_os_error(err as i32),
+                                    self.fd
+                                ),
+                                1,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Drop for RemoteSocket {
@@ -57,9 +116,8 @@ impl Drop for RemoteSocket {
         info!("Dropping RemoteSocket {:?}", self.fd)
     }
 }
-
 /// Represents single UnixSocket.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct UnixSocket {
     use_full_attach_path: bool,
     bundle_path: PathBuf,
@@ -89,6 +147,10 @@ impl UnixSocket {
 
     pub fn fd(&self) -> Option<&OwnedFd> {
         self.fd.as_ref()
+    }
+
+    pub fn path(&self) -> Option<&PathBuf> {
+        self.path.as_ref()
     }
 
     /// Generates the socket path and starts listening for new client (remote) connections.
@@ -294,5 +356,77 @@ impl Drop for UnixSocket {
         if let Some(path) = self.path.take() {
             let _ = unlink(&path);
         }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum Socket {
+    Unix(UnixSocket),
+    Remote(RemoteSocket),
+}
+
+impl Socket {
+    pub fn handle_data(
+        &mut self,
+        log_plugin: &mut dyn LogPlugin,
+        new_sockets: &mut Vec<RemoteSocket>,
+        workerfd_stdin: Option<&OwnedFd>,
+        console_fds: &Vec<i32>,
+        terminal_fds: &Vec<i32>,
+    ) -> ConmonResult<bool> {
+        match self {
+            Socket::Unix(l) => {
+                if let Some(remote) = l.accept()? {
+                    new_sockets.push(remote);
+                }
+                return Ok(true);
+            }
+            Socket::Remote(r) => {
+                let bytes_read = r.read()?;
+                if bytes_read == 0 {
+                    return Ok(false);
+                }
+                match r.socket_type {
+                    SocketType::Stdout | SocketType::Stderr | SocketType::Terminal => {
+                        // Forward data to logs.
+                        let is_stderr = r.socket_type == SocketType::Stderr;
+                        let _ = log_plugin.write(!is_stderr, &r.buf[..bytes_read]);
+
+                        // Forward data to remote sockets attached to `attach` socket.
+                        // The data is prefixed with single byte indicating whether
+                        // it is stdout or stderr.
+                        let prefix_buf: &[u8] = if is_stderr {
+                            &[3] // stdout
+                        } else {
+                            &[2] // stderr
+                        };
+                        for &fd in console_fds {
+                            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                            let iov = [
+                                std::io::IoSlice::new(prefix_buf),
+                                std::io::IoSlice::new(&r.buf[..bytes_read]),
+                            ];
+                            writev(borrowed, &iov)?;
+                        }
+                    }
+                    SocketType::Console => {
+                        // Console socket: forward data to container's stdin.
+                        if let Some(workerfd_stdin) = workerfd_stdin.as_ref() {
+                            write(workerfd_stdin, &r.buf[..bytes_read])?;
+                        }
+                        // Forward data to terminal.
+                        for &fd in terminal_fds {
+                            debug!("Forwarding to terminal {}", fd);
+                            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                            write(borrowed, &r.buf[..bytes_read])?;
+                        }
+                    }
+                    SocketType::Notify => {}
+                    SocketType::Attach => {}
+                }
+            }
+        }
+        Ok(true)
     }
 }
