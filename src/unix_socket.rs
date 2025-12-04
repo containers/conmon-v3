@@ -1,9 +1,10 @@
 use std::{
+    fmt,
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
 
-use log::debug;
+use log::{debug, warn};
 use nix::{
     errno::Errno,
     fcntl::OFlag,
@@ -17,6 +18,7 @@ use nix::{
 use crate::{
     error::{ConmonError, ConmonResult},
     logging::plugin::LogPlugin,
+    runtime::ctl::{process_terminal_ctrl_line, process_winsz_ctrl_line},
 };
 use std::{
     ffi::OsStr,
@@ -44,19 +46,33 @@ use ::log::info;
 pub enum SocketType {
     #[default]
     Console, // Socket for container's stdin ("console").
-    Notify,   // Socket for sd-notify.
-    Terminal, // Terminal socket received using --console-socket.
-    Stdout,   // Socket for container's stdout.
-    Stderr,   // Socket for container's stdin.
-    Attach,   // Attach Unix socket.
+    Notify,       // Socket for sd-notify.
+    Terminal,     // Terminal socket received using --console-socket.
+    Stdout,       // Socket for container's stdout.
+    Stderr,       // Socket for container's stdin.
+    Attach,       // Attach Unix socket.
+    TerminalFifo, // Fifo for `ctl`.
+    ConsoleFifo,  // Fifo for `winsz`.
 }
 
 /// Remote side (attach client or sd-notify FD inside container).
-#[derive(Debug)]
 pub struct RemoteSocket {
     pub socket_type: SocketType,
     pub fd: OwnedFd,
     pub buf: [u8; 8192],
+    buf_start: usize, // index of first valid byte
+    buf_end: usize,   // one past last valid byte
+}
+
+impl fmt::Debug for RemoteSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteSocket")
+            .field("socket_type", &self.socket_type)
+            .field("fd", &self.fd)
+            // avoid dumping the whole 8K buffer
+            .field("buf_len", &self.buf.len())
+            .finish()
+    }
 }
 
 impl RemoteSocket {
@@ -65,49 +81,124 @@ impl RemoteSocket {
             socket_type,
             fd,
             buf: [0u8; 8192],
+            buf_start: 0,
+            buf_end: 0,
         }
     }
 
+    /// Compact the buffer so that valid data starts at index 0.
+    fn compact_buffer(&mut self) {
+        if self.buf_start == 0 {
+            // We are done already :-).
+            return;
+        }
+        if self.buf_start >= self.buf_end {
+            // No data, so just reset the values.
+            self.buf_start = 0;
+            self.buf_end = 0;
+            return;
+        }
+
+        let len = self.buf_end - self.buf_start;
+        // Move remaining data to beginning.
+        self.buf.copy_within(self.buf_start..self.buf_end, 0);
+        self.buf_start = 0;
+        self.buf_end = len;
+    }
+
+    /// Remove all data from the buffer.
+    pub fn clear_buffer(&mut self) {
+        self.buf_start = 0;
+        self.buf_end = 0;
+    }
+
+    /// Read some bytes into the rolling buffer, without dispatching yet.
     pub fn read(&mut self) -> ConmonResult<usize> {
-        loop {
-            match self.socket_type {
-                SocketType::Stdout | SocketType::Stderr | SocketType::Terminal => {
-                    match read(self.fd.as_fd(), &mut self.buf) {
-                        Ok(n) => return Ok(n),
-                        Err(err) => {
-                            if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
-                                continue;
-                            }
-                            return Err(ConmonError::new(
-                                format!(
-                                    "read failed: {}",
-                                    io::Error::from_raw_os_error(err as i32)
-                                ),
-                                1,
-                            ));
-                        }
-                    }
-                }
-                _ => {
-                    match recvfrom::<SockaddrStorage>(self.fd.as_fd().as_raw_fd(), &mut self.buf) {
-                        Ok((n, _)) => return Ok(n),
-                        Err(err) => {
-                            if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN {
-                                continue;
-                            }
-                            return Err(ConmonError::new(
-                                format!(
-                                    "read failed: {}, {:?}",
-                                    io::Error::from_raw_os_error(err as i32),
-                                    self.fd
-                                ),
-                                1,
-                            ));
-                        }
-                    }
-                }
+        // Ensure there is a space. If we are full, try compacting first.
+        if self.buf_end == self.buf.len() {
+            self.compact_buffer();
+            if self.buf_end == self.buf.len() {
+                // Still no room: line is longer than buffer.
+                return Err(ConmonError::new("line too long for buffer", 1));
             }
         }
+
+        let dst = &mut self.buf[self.buf_end..];
+        let n = loop {
+            match self.socket_type {
+                SocketType::Stdout
+                | SocketType::Stderr
+                | SocketType::Terminal
+                | SocketType::TerminalFifo
+                | SocketType::ConsoleFifo => match read(self.fd.as_fd(), dst) {
+                    Ok(n) => break n,
+                    Err(err) if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN => {
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(ConmonError::new(
+                            format!("read failed: {}", io::Error::from_raw_os_error(err as i32)),
+                            1,
+                        ));
+                    }
+                },
+                _ => match recvfrom::<SockaddrStorage>(self.fd.as_fd().as_raw_fd(), dst) {
+                    Ok((n, _addr)) => break n,
+                    Err(err) if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN => {
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(ConmonError::new(
+                            format!(
+                                "read failed: {}, {:?}",
+                                io::Error::from_raw_os_error(err as i32),
+                                self.fd
+                            ),
+                            1,
+                        ));
+                    }
+                },
+            }
+        };
+
+        // EOF or no data
+        if n == 0 {
+            return Ok(0);
+        }
+
+        self.buf_end += n;
+        Ok(n)
+    }
+
+    /// Returns a pointer + length to the next newline-terminated line.
+    /// After returning the line, it advances buf_start and compacts whatever remains.
+    /// Returns None if no complete line is available.
+    pub fn next_line(&mut self) -> Option<(*const u8, usize)> {
+        // Search for '\n'.
+        let rel = self.buf[self.buf_start..self.buf_end]
+            .iter()
+            .position(|&b| b == b'\n')?;
+
+        let line_start = self.buf_start;
+        let line_end = line_start + rel + 1; // include '\n'
+        let len = line_end - line_start;
+
+        // Get raw pointer to the data BEFORE altering the buffer.
+        let ptr = self.buf[line_start..line_end].as_ptr();
+
+        // Advance buffer start.
+        self.buf_start = line_end;
+
+        // If consumed everything, reset indices.
+        if self.buf_start == self.buf_end {
+            self.buf_start = 0;
+            self.buf_end = 0;
+        } else {
+            // Compact remaining data to the beginning.
+            self.compact_buffer();
+        }
+
+        Some((ptr, len))
     }
 }
 
@@ -116,6 +207,7 @@ impl Drop for RemoteSocket {
         info!("Dropping RemoteSocket {:?}", self.fd)
     }
 }
+
 /// Represents single UnixSocket.
 #[derive(Default, Debug)]
 pub struct UnixSocket {
@@ -374,6 +466,7 @@ impl Socket {
         workerfd_stdin: Option<&OwnedFd>,
         console_fds: &Vec<i32>,
         terminal_fds: &Vec<i32>,
+        stdout_fd: i32,
     ) -> ConmonResult<bool> {
         match self {
             Socket::Unix(l) => {
@@ -387,6 +480,8 @@ impl Socket {
                 if bytes_read == 0 {
                     return Ok(false);
                 }
+
+                debug!("{:?}: {:?}", r.fd.as_raw_fd(), &r.buf[..bytes_read]);
                 match r.socket_type {
                     SocketType::Stdout | SocketType::Stderr | SocketType::Terminal => {
                         // Forward data to logs.
@@ -409,6 +504,7 @@ impl Socket {
                             ];
                             writev(borrowed, &iov)?;
                         }
+                        r.clear_buffer();
                     }
                     SocketType::Console => {
                         // Console socket: forward data to container's stdin.
@@ -421,9 +517,24 @@ impl Socket {
                             let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
                             write(borrowed, &r.buf[..bytes_read])?;
                         }
+                        r.clear_buffer();
                     }
                     SocketType::Notify => {}
                     SocketType::Attach => {}
+                    SocketType::TerminalFifo | SocketType::ConsoleFifo => {
+                        // Handle all complete lines
+                        while let Some((ptr, len)) = r.next_line() {
+                            let line = unsafe { std::slice::from_raw_parts(ptr, len) };
+                            let line_str = String::from_utf8_lossy(line);
+                            if r.socket_type == SocketType::TerminalFifo {
+                                if let Err(err) = process_terminal_ctrl_line(stdout_fd, &line_str) {
+                                    warn!("failed to process terminal ctrl line: {}", err);
+                                }
+                            } else if let Err(err) = process_winsz_ctrl_line(stdout_fd, &line_str) {
+                                warn!("failed to process terminal winsz line: {}", err);
+                            }
+                        }
+                    }
                 }
             }
         }

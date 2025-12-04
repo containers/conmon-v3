@@ -8,7 +8,7 @@ use nix::{
     cmsg_space,
     errno::Errno,
     fcntl::OFlag,
-    poll::{PollFd, PollFlags, PollTimeout, poll},
+    poll::{PollFd, PollFlags, poll},
     sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg},
     unistd::{pipe2, read},
 };
@@ -126,16 +126,26 @@ pub fn receive_console_fd(console_socket: UnixSocket) -> ConmonResult<RemoteSock
 /// * `workerfd_stdin` - fd into which the container's stdin is written.
 /// * `attach_socket` - socket for `attach` connections.
 /// * `terminal_socket` - terminal socket create by runtime in case of `--terminal`.
+/// * `ctl_fifo` - Remote socket for `ctl` fifo.
+/// * `winsz_fifo` - Remote socket for `winsz` fifo.
 /// * `leave_stdin_open` - Whether to keep stdin open attach client disconnects.
-pub fn handle_stdio(
+/// * `idle_callback` - function executed periodically during the event-loop.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_stdio<F>(
     log_plugin: &mut dyn LogPlugin,
     mut mainfd_stdout: Option<OwnedFd>,
     mainfd_stderr: OwnedFd,
     mut workerfd_stdin: Option<OwnedFd>,
     attach_socket: Option<UnixSocket>,
     terminal_socket: Option<RemoteSocket>,
+    ctl_fifo: Option<RemoteSocket>,
+    winsz_fifo: Option<RemoteSocket>,
     leave_stdin_open: bool,
-) -> ConmonResult<()> {
+    mut idle_callback: F,
+) -> ConmonResult<()>
+where
+    F: FnMut() -> ConmonResult<bool>,
+{
     debug!("Starting event loop");
     let mut sockets: Vec<Socket> = Vec::new();
     let mut new_sockets: Vec<RemoteSocket> = Vec::new();
@@ -145,9 +155,11 @@ pub fn handle_stdio(
     // forward data to them
     let mut console_fds = Vec::new();
     let mut terminal_fds = Vec::new();
+    let mut stdout_fd: i32 = -1;
 
     // Container's stdout.
     if let Some(stdout) = mainfd_stdout.take() {
+        stdout_fd = stdout.as_raw_fd();
         let borrowed = unsafe { BorrowedFd::borrow_raw(stdout.as_raw_fd()) };
         fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(RemoteSocket::new(
@@ -175,17 +187,32 @@ pub fn handle_stdio(
 
     // Optional terminal socket.
     if let Some(terminal) = terminal_socket {
+        stdout_fd = terminal.fd.as_raw_fd();
         terminal_fds.push(terminal.fd.as_raw_fd());
         let borrowed = unsafe { BorrowedFd::borrow_raw(terminal.fd.as_raw_fd()) };
         fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(terminal));
     }
 
+    // Optional ctl fifo.
+    if let Some(ctl) = ctl_fifo {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(ctl.fd.as_raw_fd()) };
+        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+        sockets.push(Socket::Remote(ctl));
+    }
+
+    // Optional winsz fifo.
+    if let Some(winsz) = winsz_fifo {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(winsz.fd.as_raw_fd()) };
+        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+        sockets.push(Socket::Remote(winsz));
+    }
+
     // Main loop.
     // Iterates as long as we have some RemoteSocket to read from.
     while sockets.iter().any(|s| matches!(s, Socket::Remote(_))) {
         // Run poll to get informed about new fd events.
-        let n = poll(&mut fds, PollTimeout::NONE).map_err(|e| {
+        let n = poll(&mut fds, 100_u16).map_err(|e| {
             ConmonError::new(
                 format!(
                     "handle_stdio poll() failed: {}",
@@ -195,9 +222,12 @@ pub fn handle_stdio(
             )
         })?;
 
+        // Execute the idle function.
         if n == 0 {
-            // This should not happen, since we use PollTimeout::NONE, but
-            // be defensive.
+            let keep_running = idle_callback()?;
+            if !keep_running {
+                return Ok(());
+            }
             continue;
         }
 
@@ -216,6 +246,7 @@ pub fn handle_stdio(
                         workerfd_stdin.as_ref(),
                         &console_fds,
                         &terminal_fds,
+                        stdout_fd,
                     )?;
 
                     // Add new sockets to `sockets` and `fds`.
@@ -237,6 +268,7 @@ pub fn handle_stdio(
                     }
                 } else if revents.contains(PollFlags::POLLHUP) {
                     // One HUP, close the socket.
+                    debug!("HUP on {:?}", pfd);
                     keep_socket = false;
                 }
             }
@@ -293,6 +325,10 @@ mod tests {
         }
     }
 
+    fn dummy_idle_callback() -> ConmonResult<bool> {
+        Ok(true)
+    }
+
     #[test]
     fn handle_stdio_calls_write_for_stdout_and_stderr() -> ConmonResult<()> {
         let mut mock = MockLogPlugin::new();
@@ -317,7 +353,18 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mut mock, Some(r_out), r_err, None, None, None, false)?;
+        handle_stdio(
+            &mut mock,
+            Some(r_out),
+            r_err,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            dummy_idle_callback,
+        )?;
         Ok(())
     }
 
@@ -352,7 +399,18 @@ mod tests {
         drop(w_err);
 
         // Read from the other side of pipes.
-        handle_stdio(&mut mock, Some(r_out), r_err, None, None, None, false)?;
+        handle_stdio(
+            &mut mock,
+            Some(r_out),
+            r_err,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            dummy_idle_callback,
+        )?;
         Ok(())
     }
 
@@ -435,7 +493,10 @@ mod tests {
             Some(w_in),
             Some(attach),
             None,
+            None,
+            None,
             leave_open,
+            dummy_idle_callback,
         )?;
 
         // Wait for client thread to finish.

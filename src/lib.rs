@@ -1,4 +1,5 @@
 #![allow(clippy::collapsible_if)]
+#![feature(path_is_empty)]
 pub mod cli;
 pub mod commands;
 pub mod error;
