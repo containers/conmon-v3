@@ -1,9 +1,15 @@
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
 
-use log::{debug, error};
-use nix::sys::{
-    socket::{SockFlag, SockType},
-    stat::Mode,
+use log::{debug, error, info};
+use nix::unistd::Pid;
+use nix::{
+    errno::Errno,
+    libc,
+    sys::{
+        socket::{SockFlag, SockType},
+        stat::Mode,
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
 };
 
 use crate::{
@@ -13,6 +19,7 @@ use crate::{
     parent_pipe::{get_pipe_fd_from_env, write_or_close_sync_fd},
     runtime::{
         args::{RuntimeArgsGenerator, generate_runtime_args},
+        ctl::{setup_console_fifo, setup_terminal_control_fifo},
         process::RuntimeProcess,
         stdio::{create_pipe, handle_stdio, read_pipe, receive_console_fd},
     },
@@ -65,6 +72,18 @@ pub struct RuntimeSession {
     /// to this socket is forwarded to container's stdin. Anything read from it is treated
     /// as container's stdout.
     terminal_socket: Option<RemoteSocket>,
+
+    /// Fifo for `ctl` file used by parent to control conmon session.
+    ctl_fifo: Option<RemoteSocket>,
+
+    /// Fifo for `winsz` file used by parent to control terminal window size.
+    winsz_fifo: Option<RemoteSocket>,
+
+    /// The PID of container created by the runtime.
+    container_pid: i32,
+
+    /// The exit status of container.
+    container_status: i32,
 }
 
 impl RuntimeSession {
@@ -72,6 +91,8 @@ impl RuntimeSession {
         Self {
             process: RuntimeProcess::new(),
             exit_code: -1,
+            container_pid: -1,
+            container_status: -1,
             ..Default::default()
         }
     }
@@ -79,6 +100,11 @@ impl RuntimeSession {
     /// Returns the exit_code.
     pub fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+
+    /// Returns the container's exit_code.
+    pub fn container_exit_code(&self) -> i32 {
+        self.container_status
     }
 
     // Helper function to read and return the container pid.
@@ -138,6 +164,10 @@ impl RuntimeSession {
             Mode::from_bits_truncate(0o700),
         )?;
         self.attach_socket = Some(attach_socket);
+
+        // Create `ctl` fifo.
+        self.ctl_fifo = Some(setup_terminal_control_fifo(common)?);
+        self.winsz_fifo = Some(setup_console_fifo(common)?);
 
         // Inform the parent that the attach socket is ready.
         if let Some(fd) = attach_pipe_fd.take() {
@@ -245,9 +275,9 @@ impl RuntimeSession {
     pub fn write_container_pid_file(&mut self, common: &CommonCfg) -> ConmonResult<()> {
         // Pass the container_pid to sync_pipe if there is one.
         if let Some(fd) = self.sync_pipe_fd.take() {
-            let container_pid = self.read_container_pid(common)?;
+            self.container_pid = self.read_container_pid(common)?;
             self.sync_pipe_fd =
-                write_or_close_sync_fd(fd, container_pid, None, common.api_version, false)?;
+                write_or_close_sync_fd(fd, self.container_pid, None, common.api_version, false)?;
         }
         Ok(())
     }
@@ -291,6 +321,78 @@ impl RuntimeSession {
         Ok(())
     }
 
+    /// Function executed periodically during the event-loop execuction.
+    /// Returns true when event-loop should finish.
+    fn idle_callback(&mut self) -> ConmonResult<bool> {
+        // Wait for any child to finish (non-blocking).
+        let res = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
+
+        match res {
+            // Interrupted by signal - retry.
+            Err(Errno::EINTR) => Ok(true),
+
+            // no more child processes
+            Err(Errno::ECHILD) => {
+                // Before quitting, probe the container_pid.
+                // It might not be a direct child.
+                if self.container_pid > 0 {
+                    // Nix kill function does not support 0 signal, so we have to use libc one.
+                    let rc = unsafe { libc::kill(self.container_pid, 0) };
+                    if rc == 0 {
+                        info!(
+                            "Container process {} is still alive but not a direct child",
+                            self.container_pid
+                        );
+                        // Do not quit main loop yet...
+                        return Ok(true);
+                    } else if Errno::last() == Errno::ESRCH {
+                        // Process exited.
+                        info!(
+                            "Container process {} has exited (detected via kill probe)",
+                            self.container_pid
+                        );
+                        // We cannot get real exit status.
+                        self.container_status = 0;
+                        self.container_pid = -1;
+                        return Ok(false);
+                    }
+                }
+
+                Ok(false)
+            }
+
+            // some other waitpid error
+            Err(e) => Err(ConmonError::new(
+                format!("Failed to read child process status: {e}"),
+                1,
+            )),
+
+            // No child has changed state.
+            Ok(WaitStatus::StillAlive) => Ok(true),
+
+            // Child exiteed, store the exit code.
+            Ok(WaitStatus::Exited(p, code)) => {
+                if p == Pid::from_raw(self.container_pid) {
+                    self.container_status = code;
+                } else if p == Pid::from_raw(self.process.pid()) {
+                    self.exit_code = code;
+                }
+                Ok(false)
+            }
+
+            Ok(
+                WaitStatus::Signaled(_, _, _)
+                | WaitStatus::Stopped(_, _)
+                | WaitStatus::Continued(_)
+                | WaitStatus::PtraceEvent(_, _, _)
+                | WaitStatus::PtraceSyscall(_),
+            ) => {
+                // Just keep looping until StillAlive or ECHILD.
+                Ok(true)
+            }
+        }
+    }
+
     /// Runs the event loop handling the container Runtime stdio.
     pub fn run_event_loop(
         &mut self,
@@ -306,7 +408,10 @@ impl RuntimeSession {
                 self.workerfd_stdin.take(),
                 self.attach_socket.take(),
                 self.terminal_socket.take(),
+                self.ctl_fifo.take(),
+                self.winsz_fifo.take(),
                 leave_stdin_open,
+                || self.idle_callback(),
             )?;
             return Ok(());
         }

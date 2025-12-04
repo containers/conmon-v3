@@ -27,11 +27,10 @@ impl Exec {
         runtime_session.run_event_loop(log_plugin, self.cfg.common.leave_stdin_open)?;
 
         // Wait for the `runtime exec` to finish and write its exit code.
-        runtime_session.wait()?;
         runtime_session.write_container_pid_file(&self.cfg.common)?;
         runtime_session.write_exit_code(self.cfg.common.api_version)?;
 
-        Ok(ExitCode::from(runtime_session.exit_code() as u8))
+        Ok(ExitCode::from(runtime_session.container_exit_code() as u8))
     }
 }
 
