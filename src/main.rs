@@ -10,12 +10,16 @@ use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
 use conmon::commands::version::Version;
 use conmon::error::ConmonResult;
+use conmon::exit::run_exit_command;
+use conmon::exit::set_subreaper;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugin;
 use std::process::ExitCode;
 
-fn run_conmon() -> ConmonResult<ExitCode> {
-    let opts = Opts::parse();
+fn run_conmon(opts: Opts) -> ConmonResult<ExitCode> {
+    // Enable subreaper, so we can wait for container process.
+    set_subreaper(true)?;
+
     if let Some(ref bundle) = opts.bundle {
         log::init_logging(
             "CONMON_LOG_PATH",
@@ -43,12 +47,19 @@ fn run_conmon() -> ConmonResult<ExitCode> {
 }
 
 fn main() -> ExitCode {
-    if let Err(e) = run_conmon() {
+    let opts = Opts::parse();
+    let exit_command = opts.exit_command.clone();
+    let exit_command_args = opts.exit_args.clone();
+    let exit_command_delay = opts.exit_delay;
+    let mut exit_code = ExitCode::SUCCESS;
+    if let Err(e) = run_conmon(opts) {
         error!("Exiting with error message: {}", e.msg);
         eprintln!("conmon: {}", e.msg);
         info!("Exiting with status {}", e.code);
-        return ExitCode::from(e.code);
+        exit_code = ExitCode::from(e.code);
+    } else {
+        info!("Exiting with OK status");
     }
-    info!("Exiting with OK status");
-    ExitCode::SUCCESS
+    let _ = run_exit_command(exit_command, exit_command_args, exit_command_delay);
+    exit_code
 }
