@@ -1,4 +1,6 @@
-use std::{ffi::FromBytesUntilNulError, fmt, str::Utf8Error, string::FromUtf8Error};
+use std::{
+    ffi::FromBytesUntilNulError, fmt, str::Utf8Error, string::FromUtf8Error, time::SystemTimeError,
+};
 
 use nix::errno::Errno;
 
@@ -64,5 +66,11 @@ impl From<Utf8Error> for ConmonError {
 impl From<FromBytesUntilNulError> for ConmonError {
     fn from(err: FromBytesUntilNulError) -> Self {
         ConmonError::new(format!("UTF-8 error: {}", err), 1)
+    }
+}
+
+impl From<SystemTimeError> for ConmonError {
+    fn from(err: SystemTimeError) -> Self {
+        ConmonError::new(format!("System time error: {}", err), 1)
     }
 }

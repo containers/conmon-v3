@@ -1,7 +1,9 @@
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
 
 use log::{debug, error, info};
-use nix::unistd::Pid;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::{Pid, getpgid};
 use nix::{
     errno::Errno,
     libc,
@@ -84,6 +86,12 @@ pub struct RuntimeSession {
 
     /// The exit status of container.
     container_status: i32,
+
+    // Time (unix timestamp) after which the session should terminate
+    timeout: u64,
+
+    // True if timeout occured.
+    timed_out: bool,
 }
 
 impl RuntimeSession {
@@ -93,6 +101,7 @@ impl RuntimeSession {
             exit_code: -1,
             container_pid: -1,
             container_status: -1,
+            timed_out: false,
             ..Default::default()
         }
     }
@@ -213,6 +222,12 @@ impl RuntimeSession {
             self.console_socket = Some(console_socket);
         }
 
+        // Set the timeout if --timeout is used.
+        if let Some(t) = common.timeout {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            self.timeout = now.as_secs() + t as u64;
+        }
+
         // Generate the list of arguments for runtime.
         let runtime_args = generate_runtime_args(common, args_gen, self.console_socket.as_ref())?;
 
@@ -286,7 +301,11 @@ impl RuntimeSession {
     pub fn write_exit_code(&mut self, api_version: i32) -> ConmonResult<()> {
         #[allow(clippy::collapsible_if)]
         if let Some(fd) = self.sync_pipe_fd.take() {
-            if let Some(mainfd_stderr) = &self.mainfd_stderr {
+            if self.timed_out {
+                let err_str = "command timed out";
+                self.sync_pipe_fd =
+                    write_or_close_sync_fd(fd, self.exit_code, Some(err_str), api_version, true)?;
+            } else if let Some(mainfd_stderr) = &self.mainfd_stderr {
                 // TODO: We are reading just once here and if container prints more than
                 // a buffer sizeto stderr, we ignore whatever does not fid into the buffer.
                 // This might be a problem, but the original conmon-v2 code behaves the same way.
@@ -324,6 +343,31 @@ impl RuntimeSession {
     /// Function executed periodically during the event-loop execuction.
     /// Returns true when event-loop should finish.
     fn idle_callback(&mut self) -> ConmonResult<bool> {
+        // Stop the event-loop if we reach a timeout.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        if self.timeout > 0 && now.as_secs() > self.timeout {
+            info!("Timed out - exiting event-loop.");
+            // Kill the container in case it exists.
+            if self.container_pid > 0 {
+                let pid = Pid::from_raw(self.container_pid);
+                // Get the process group ID of the container
+                let pgid = getpgid(Some(pid))?;
+
+                // NOTE:
+                // If pgid is 1, calling kill(-1, SIGKILL) would kill everything we have permission for.
+                if pgid.as_raw() > 1 {
+                    // kill entire process group
+                    kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGKILL)?;
+                } else {
+                    // kill only the container process
+                    kill(pid, Signal::SIGKILL)?;
+                }
+            }
+            self.timed_out = true;
+            // Quite the event-loop.
+            return Ok(false);
+        }
+
         // Wait for any child to finish (non-blocking).
         let res = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
 
