@@ -235,6 +235,7 @@ pub struct CommonCfg {
     pub leave_stdin_open: bool,
     pub terminal: bool,
     pub timeout: Option<i32>,
+    pub replace_listen_pid: bool,
 }
 
 #[derive(Debug, Default)]
@@ -349,6 +350,7 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         leave_stdin_open: opts.leave_stdin_open,
         terminal: opts.terminal,
         timeout: opts.timeout,
+        replace_listen_pid: opts.replace_listen_pid,
     };
 
     // decide which subcommand this flag combination means

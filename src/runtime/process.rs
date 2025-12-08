@@ -1,12 +1,16 @@
 use crate::error::{ConmonError, ConmonResult};
 use crate::runtime::stdio::read_pipe;
 
+use log::warn;
 use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
+use nix::unistd::{
+    ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, getpid, getppid, setsid,
+};
 
+use std::env;
 use std::io::{Error, Result as IoResult};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt; // for pre_exec
@@ -46,6 +50,30 @@ fn redirect_self_to_devnull() -> ConmonResult<()> {
     Ok(())
 }
 
+/// Helper function to replace LISTEN_PID with the proper afterk-fork PID.
+fn update_listen_pid(replace_listen_pid: bool) {
+    // If LISTEN_PID env is set, we may need to update it to the new child process
+    if let Ok(listenpid) = env::var("LISTEN_PID") {
+        // Try to parse LISTEN_PID as an integer
+        let lpid: i32 = match listenpid.parse() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                warn!("Invalid LISTEN_PID {}", listenpid);
+                return;
+            }
+        };
+
+        let parent_pid = getppid().as_raw();
+
+        // If we should replace it, or it matches the parent PID, set it to our PID
+        if replace_listen_pid || lpid == parent_pid {
+            let pid = getpid().as_raw();
+            let pidstr = pid.to_string();
+            unsafe { env::set_var("LISTEN_PID", &pidstr) };
+        }
+    }
+}
+
 /// Represents single RuntimeProcess.
 /// For is low-level implementation. Use RuntimeSession for more convenient
 /// way to work with Runtime.
@@ -69,6 +97,7 @@ impl RuntimeProcess {
         workerfd_stdout: Stdio,
         workerfd_stderr: Stdio,
         mut start_pipe_fd: Option<OwnedFd>,
+        replace_listen_pid: bool,
     ) -> ConmonResult<i32> {
         if args.is_empty() {
             return Err(ConmonError::new(
@@ -106,7 +135,7 @@ impl RuntimeProcess {
         let oldmask = block_signals()?;
 
         // Child setup performed between fork and exec.
-        fn child_setup(oldmask: &SigSet) -> IoResult<()> {
+        fn child_setup(oldmask: &SigSet, replace_listen_pid: bool) -> IoResult<()> {
             // Detach from controlling terminal: new session.
             setsid().map_err(io_err)?;
 
@@ -115,6 +144,8 @@ impl RuntimeProcess {
 
             // Set conservative umask.
             nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+
+            update_listen_pid(replace_listen_pid);
             Ok(())
         }
 
@@ -128,7 +159,7 @@ impl RuntimeProcess {
             .stderr(workerfd_stderr);
 
         unsafe {
-            cmd.pre_exec(move || child_setup(&oldmask));
+            cmd.pre_exec(move || child_setup(&oldmask, replace_listen_pid));
         }
 
         let child = cmd

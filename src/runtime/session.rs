@@ -276,6 +276,7 @@ impl RuntimeSession {
             mainfd_stdout_stdio,
             Stdio::from(workerfd_stderr),
             start_pipe_fd,
+            common.replace_listen_pid,
         )?;
 
         // Store the RuntimeProcess::pid in the `conmon_pidfile`.
