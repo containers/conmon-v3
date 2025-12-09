@@ -236,6 +236,8 @@ pub struct CommonCfg {
     pub terminal: bool,
     pub timeout: Option<i32>,
     pub replace_listen_pid: bool,
+    pub persist_dir: Option<PathBuf>,
+    pub exit_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -351,6 +353,8 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         terminal: opts.terminal,
         timeout: opts.timeout,
         replace_listen_pid: opts.replace_listen_pid,
+        persist_dir: opts.persist_dir,
+        exit_dir: opts.exit_dir,
     };
 
     // decide which subcommand this flag combination means

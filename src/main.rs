@@ -1,4 +1,5 @@
 #![allow(clippy::collapsible_if)]
+use conmon::exit::write_exit_files;
 use ::log::LevelFilter;
 use ::log::debug;
 use ::log::error;
@@ -16,7 +17,7 @@ use conmon::log;
 use conmon::logging::plugin::initialize_log_plugin;
 use std::process::ExitCode;
 
-fn run_conmon(opts: Opts) -> ConmonResult<ExitCode> {
+fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     // Enable subreaper, so we can wait for container process.
     set_subreaper(true)?;
 
@@ -51,15 +52,22 @@ fn main() -> ExitCode {
     let exit_command = opts.exit_command.clone();
     let exit_command_args = opts.exit_args.clone();
     let exit_command_delay = opts.exit_delay;
-    let mut exit_code = ExitCode::SUCCESS;
-    if let Err(e) = run_conmon(opts) {
-        error!("Exiting with error message: {}", e.msg);
-        eprintln!("conmon: {}", e.msg);
-        info!("Exiting with status {}", e.code);
-        exit_code = ExitCode::from(e.code);
-    } else {
-        info!("Exiting with OK status");
-    }
+    let exit_dir = opts.exit_dir.clone();
+    let persist_dir = opts.persist_dir.clone();
+    let cid = opts.cid.clone();
+    let raw_code = match run_conmon(opts) {
+        Ok(code) => {
+            code
+        }
+        Err(e) => {
+            error!("Exiting with error message: {}", e.msg);
+            eprintln!("conmon: {}", e.msg);
+            info!("Exiting with status {}", e.code);
+            e.code as i32
+        }
+    };
+
+    write_exit_files(raw_code, persist_dir.as_ref(), exit_dir.as_ref(), cid.as_ref());
     let _ = run_exit_command(exit_command, exit_command_args, exit_command_delay);
-    exit_code
+    return ExitCode::from(raw_code as u8);
 }

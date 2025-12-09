@@ -53,7 +53,12 @@ pub enum SocketType {
     Attach,       // Attach Unix socket.
     TerminalFifo, // Fifo for `ctl`.
     ConsoleFifo,  // Fifo for `winsz`.
+    Inotify,
+    EventFd,
+
 }
+
+type RemoteSocketHandler = Box<dyn FnMut(&[u8]) -> bool + Send + 'static>;
 
 /// Remote side (attach client or sd-notify FD inside container).
 pub struct RemoteSocket {
@@ -62,6 +67,7 @@ pub struct RemoteSocket {
     pub buf: [u8; 8192],
     buf_start: usize, // index of first valid byte
     buf_end: usize,   // one past last valid byte
+    handler: Option<RemoteSocketHandler>,
 }
 
 impl fmt::Debug for RemoteSocket {
@@ -83,7 +89,16 @@ impl RemoteSocket {
             buf: [0u8; 8192],
             buf_start: 0,
             buf_end: 0,
+            handler: None,
         }
+    }
+
+    /// Attach a handler to this socket. The handler can capture arbitrary custom data.
+    pub fn set_handler<F>(&mut self, handler: F)
+    where
+        F: FnMut(&[u8]) -> bool + Send + 'static,
+    {
+        self.handler = Some(Box::new(handler));
     }
 
     /// Compact the buffer so that valid data starts at index 0.
@@ -130,6 +145,8 @@ impl RemoteSocket {
                 | SocketType::Stderr
                 | SocketType::Terminal
                 | SocketType::TerminalFifo
+                | SocketType::EventFd
+                | SocketType::Inotify
                 | SocketType::ConsoleFifo => match read(self.fd.as_fd(), dst) {
                     Ok(n) => break n,
                     Err(err) if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN => {
@@ -482,6 +499,11 @@ impl Socket {
                 }
 
                 debug!("{:?}: {:?}", r.fd.as_raw_fd(), &r.buf[..bytes_read]);
+
+                if let Some(handler) = r.handler.as_mut() {
+                    return Ok(handler(&r.buf[..bytes_read]));
+                }
+
                 match r.socket_type {
                     SocketType::Stdout | SocketType::Stderr | SocketType::Terminal => {
                         // Forward data to logs.
@@ -534,6 +556,8 @@ impl Socket {
                                 warn!("failed to process terminal winsz line: {}", err);
                             }
                         }
+                    }
+                    SocketType::EventFd | SocketType::Inotify => {
                     }
                 }
             }

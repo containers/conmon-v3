@@ -1,5 +1,3 @@
-use std::process::ExitCode;
-
 use crate::cli::RestoreCfg;
 use crate::error::ConmonResult;
 use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
@@ -13,10 +11,10 @@ impl Restore {
         Self { cfg }
     }
 
-    pub fn exec(&self) -> ConmonResult<ExitCode> {
+    pub fn exec(&self) -> ConmonResult<i32> {
         let _runtime_args = generate_runtime_args(&self.cfg.common, self, None);
 
-        Ok(ExitCode::SUCCESS)
+        Ok(0)
     }
 }
 

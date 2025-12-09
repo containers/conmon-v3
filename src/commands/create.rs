@@ -1,5 +1,3 @@
-use std::process::ExitCode;
-
 use crate::cli::CreateCfg;
 use crate::error::ConmonResult;
 use crate::logging::plugin::LogPlugin;
@@ -14,7 +12,7 @@ impl Create {
         Self { cfg }
     }
 
-    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<ExitCode> {
+    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<i32> {
         // Start the `runtime create` session.
         let mut runtime_session = crate::runtime::session::RuntimeSession::new();
         runtime_session.launch(&self.cfg.common, self, false)?;
@@ -43,7 +41,7 @@ impl Create {
         // Run the eventloop to forward log messages to log plugin.
         runtime_session.run_event_loop(log_plugin, self.cfg.common.leave_stdin_open)?;
 
-        Ok(ExitCode::SUCCESS)
+        Ok(0)
     }
 }
 

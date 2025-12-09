@@ -14,6 +14,7 @@ use nix::{
     },
 };
 
+use crate::runtime::cgroup::setup_oom_handling;
 use crate::{
     cli::CommonCfg,
     error::{ConmonError, ConmonResult},
@@ -92,6 +93,9 @@ pub struct RuntimeSession {
 
     // True if timeout occured.
     timed_out: bool,
+
+    /// RemoteSocket for OOM handling.
+    oom_socket: Option<RemoteSocket>,
 }
 
 impl RuntimeSession {
@@ -228,6 +232,7 @@ impl RuntimeSession {
             self.timeout = now.as_secs() + t as u64;
         }
 
+
         // Generate the list of arguments for runtime.
         let runtime_args = generate_runtime_args(common, args_gen, self.console_socket.as_ref())?;
 
@@ -294,6 +299,7 @@ impl RuntimeSession {
             self.container_pid = self.read_container_pid(common)?;
             self.sync_pipe_fd =
                 write_or_close_sync_fd(fd, self.container_pid, None, common.api_version, false)?;
+            self.oom_socket = Some(setup_oom_handling(self.container_pid, &common.persist_dir, &common.bundle)?);
         }
         Ok(())
     }
@@ -455,6 +461,7 @@ impl RuntimeSession {
                 self.terminal_socket.take(),
                 self.ctl_fifo.take(),
                 self.winsz_fifo.take(),
+                self.oom_socket.take(),
                 leave_stdin_open,
                 || self.idle_callback(),
             )?;

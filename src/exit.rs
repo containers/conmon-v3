@@ -1,13 +1,13 @@
 use crate::error::{ConmonError, ConmonResult};
 
-use log::{info, warn};
+use log::{error, info, warn};
 use nix::errno::Errno;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::thread;
+use std::{fs, thread};
 use std::time::Duration;
 
 use nix::libc::{PR_SET_CHILD_SUBREAPER, prctl};
@@ -81,4 +81,43 @@ pub fn run_exit_command(
         info!("Exit command exited with: {exit_code}.");
     }
     Ok(())
+}
+
+/// Writes exit files into persisnte_path and exit_dir.
+pub fn write_exit_files(
+    exit_status: i32,
+    persist_path: Option<&PathBuf>,
+    exit_dir: Option<&PathBuf>,
+    cid: Option<&String>,
+) {
+    let status_str: String = exit_status.to_string();
+
+    // Write the exit file to container persistent directory if it is specified
+    if let Some(persist_path) = persist_path {
+        let ctr_exit_file_path: PathBuf = persist_path.join("exit");
+        if let Err(e) = fs::write(&ctr_exit_file_path, &status_str) {
+            error!(
+                "Failed to write {} to container exit file {}: {}",
+                status_str,
+                ctr_exit_file_path.display(),
+                e
+            );
+        }
+    }
+
+    // Writing to this directory helps if a daemon process wants to monitor
+    // all container exits using inotify.
+    if let Some(exit_dir) = exit_dir {
+        if let Some(cid) = cid {
+            let exit_file_path: PathBuf = exit_dir.join(cid);
+            if let Err(e) = fs::write(&exit_file_path, &status_str) {
+                error!(
+                    "Failed to write {} to exit file {}: {}",
+                    status_str,
+                    exit_file_path.display(),
+                    e
+                );
+            }
+        }
+    }
 }

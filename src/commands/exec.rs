@@ -1,5 +1,3 @@
-use std::process::ExitCode;
-
 use crate::cli::ExecCfg;
 use crate::error::ConmonResult;
 use crate::logging::plugin::LogPlugin;
@@ -14,7 +12,7 @@ impl Exec {
         Self { cfg }
     }
 
-    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<ExitCode> {
+    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<i32> {
         let mut runtime_session = crate::runtime::session::RuntimeSession::new();
         runtime_session.launch(&self.cfg.common, self, self.cfg.attach)?;
 
@@ -30,7 +28,7 @@ impl Exec {
         runtime_session.write_container_pid_file(&self.cfg.common)?;
         runtime_session.write_exit_code(self.cfg.common.api_version)?;
 
-        Ok(ExitCode::from(runtime_session.container_exit_code() as u8))
+        Ok(runtime_session.container_exit_code())
     }
 }
 

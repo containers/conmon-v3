@@ -140,6 +140,7 @@ pub fn handle_stdio<F>(
     terminal_socket: Option<RemoteSocket>,
     ctl_fifo: Option<RemoteSocket>,
     winsz_fifo: Option<RemoteSocket>,
+    oom_socket: Option<RemoteSocket>,
     leave_stdin_open: bool,
     mut idle_callback: F,
 ) -> ConmonResult<()>
@@ -206,6 +207,13 @@ where
         let borrowed = unsafe { BorrowedFd::borrow_raw(winsz.fd.as_raw_fd()) };
         fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(winsz));
+    }
+
+    // Optional OOM socket.
+    if let Some(oom) = oom_socket {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(oom.fd.as_raw_fd()) };
+        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
+        sockets.push(Socket::Remote(oom));
     }
 
     // Main loop.
@@ -362,6 +370,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             dummy_idle_callback,
         )?;
@@ -403,6 +412,7 @@ mod tests {
             &mut mock,
             Some(r_out),
             r_err,
+            None,
             None,
             None,
             None,
@@ -492,6 +502,7 @@ mod tests {
             r_err,
             Some(w_in),
             Some(attach),
+            None,
             None,
             None,
             None,
