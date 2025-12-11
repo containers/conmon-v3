@@ -167,7 +167,7 @@ impl RuntimeSession {
             SocketType::Console,
             common.full_attach,
             common.bundle.clone(),
-            common.socket_dir_path.clone(),
+            Some(common.socket_dir_path.clone()),
             common.cuuid.clone(),
         );
         attach_socket.listen(
@@ -231,7 +231,6 @@ impl RuntimeSession {
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
             self.timeout = now.as_secs() + t as u64;
         }
-
 
         // Generate the list of arguments for runtime.
         let runtime_args = generate_runtime_args(common, args_gen, self.console_socket.as_ref())?;
@@ -299,7 +298,11 @@ impl RuntimeSession {
             self.container_pid = self.read_container_pid(common)?;
             self.sync_pipe_fd =
                 write_or_close_sync_fd(fd, self.container_pid, None, common.api_version, false)?;
-            self.oom_socket = Some(setup_oom_handling(self.container_pid, &common.persist_dir, &common.bundle)?);
+            self.oom_socket = Some(setup_oom_handling(
+                self.container_pid,
+                &common.persist_dir,
+                &common.bundle,
+            )?);
         }
         Ok(())
     }

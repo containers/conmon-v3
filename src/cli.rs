@@ -6,6 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
+use log::warn;
 
 #[derive(Parser)]
 #[command(
@@ -230,7 +231,7 @@ pub struct CommonCfg {
     pub container_pidfile: PathBuf,
     pub bundle: PathBuf,
     pub full_attach: bool,
-    pub socket_dir_path: Option<PathBuf>,
+    pub socket_dir_path: PathBuf,
     pub stdin: bool,
     pub leave_stdin_open: bool,
     pub terminal: bool,
@@ -238,6 +239,7 @@ pub struct CommonCfg {
     pub replace_listen_pid: bool,
     pub persist_dir: Option<PathBuf>,
     pub exit_dir: Option<PathBuf>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -334,6 +336,11 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
     // bundle defaults to "$cwd" if none provided
     let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
 
+    let socket_dir_path = opts
+        .socket_dir_path
+        .take()
+        .unwrap_or_else(|| PathBuf::from("/var/run/crio"));
+
     let common = CommonCfg {
         api_version,
         cid,
@@ -347,7 +354,7 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         container_pidfile,
         bundle,
         full_attach: opts.full_attach,
-        socket_dir_path: opts.socket_dir_path,
+        socket_dir_path,
         stdin: opts.stdin,
         leave_stdin_open: opts.leave_stdin_open,
         terminal: opts.terminal,
@@ -355,6 +362,7 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         replace_listen_pid: opts.replace_listen_pid,
         persist_dir: opts.persist_dir,
         exit_dir: opts.exit_dir,
+        name: opts.name,
     };
 
     // decide which subcommand this flag combination means
@@ -390,6 +398,13 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
     let mut plugin: String = "file".into();
     let mut log_plugin_cfg = LogPluginCfg::default();
 
+    if opts.log_path.is_empty() {
+        return Err(ConmonError::new(
+            "Log driver not provided. Use --log-path",
+            1,
+        ));
+    }
+
     // Collect paths, and possibly the plugin name from "plugin:path" entries.
     // TODO: Support multiple log plugins at the same time.
     for p in &opts.log_path {
@@ -408,6 +423,8 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
             // Plugin names on filesystem cannot contain dash.
             plugin = plug.into();
             plugin = plugin.replace("-", "_");
+        } else if s == "journald" {
+            plugin = "journald".to_string();
         } else {
             // No "plugin:" prefix; treat as a path.
             if !s.is_empty() {
@@ -415,6 +432,17 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
             }
         }
     }
+
+    if opts.no_container_partial_message && plugin != "journald" {
+        warn!("--no-container-partial-message has no effect without journald log driver");
+    }
+
+    log_plugin_cfg.cid = opts.cid.clone();
+    log_plugin_cfg.cuuid = opts.cuuid.clone();
+    log_plugin_cfg.log_labels = opts.log_labels.clone();
+    log_plugin_cfg.log_tag = opts.log_tag.clone();
+    log_plugin_cfg.no_container_partial_message = opts.no_container_partial_message;
+    log_plugin_cfg.name = opts.name.clone();
 
     Ok((plugin, log_plugin_cfg))
 }

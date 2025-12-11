@@ -1,5 +1,5 @@
 use chrono::Utc;
-use log::{LevelFilter, Log, Metadata, Record};
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::fs::OpenOptions;
 use std::{fs::File, io::Write, path::PathBuf, sync::Mutex};
 
@@ -43,6 +43,11 @@ impl Log for FileLogger {
             record.target(),
             record.args()
         );
+
+        // The conmon-v2 prints warnings and errors also on stdout.
+        if record.level() == Level::Warn || record.level() == Level::Error {
+            println!("{}", record.args());
+        }
     }
 
     fn flush(&self) {

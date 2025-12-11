@@ -7,8 +7,8 @@ use nix::unistd::Pid;
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::{fs, thread};
 use std::time::Duration;
+use std::{fs, thread};
 
 use nix::libc::{PR_SET_CHILD_SUBREAPER, prctl};
 

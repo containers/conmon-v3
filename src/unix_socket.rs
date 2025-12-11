@@ -55,7 +55,6 @@ pub enum SocketType {
     ConsoleFifo,  // Fifo for `winsz`.
     Inotify,
     EventFd,
-
 }
 
 type RemoteSocketHandler = Box<dyn FnMut(&[u8]) -> bool + Send + 'static>;
@@ -425,12 +424,23 @@ impl UnixSocket {
             if e == nix::Error::ENOENT {
                 Ok(())
             } else {
-                Err(e)
+                Err(ConmonError::new(
+                    format!("Cannot unlink {:?}: {e}", new_base),
+                    1,
+                ))
             }
         })?;
 
         // symlink(bundle_path, base_path)
-        symlinkat(&self.bundle_path, AT_FDCWD, &new_base)?;
+        if let Err(e) = symlinkat(&self.bundle_path, AT_FDCWD, &new_base) {
+            return Err(ConmonError::new(
+                format!(
+                    "Cannot symlink {:?} to {:?}: {e}",
+                    self.bundle_path, new_base
+                ),
+                1,
+            ));
+        }
 
         Ok(new_base)
     }
@@ -498,8 +508,6 @@ impl Socket {
                     return Ok(false);
                 }
 
-                debug!("{:?}: {:?}", r.fd.as_raw_fd(), &r.buf[..bytes_read]);
-
                 if let Some(handler) = r.handler.as_mut() {
                     return Ok(handler(&r.buf[..bytes_read]));
                 }
@@ -557,8 +565,7 @@ impl Socket {
                             }
                         }
                     }
-                    SocketType::EventFd | SocketType::Inotify => {
-                    }
+                    SocketType::EventFd | SocketType::Inotify => {}
                 }
             }
         }

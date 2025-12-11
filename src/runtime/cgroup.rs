@@ -1,17 +1,17 @@
 // src/cgroup.rs
 
 use log::{debug, info, warn};
-use nix::fcntl::{open, OFlag};
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, open};
+use nix::libc;
 use nix::sys::stat::Mode;
+use nix::sys::statfs;
 use nix::unistd::close;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use nix::errno::Errno;
-use nix::libc;
-use nix::sys::statfs;
 
 use crate::error::{ConmonError, ConmonResult};
 use crate::unix_socket::{RemoteSocket, SocketType};
@@ -19,7 +19,11 @@ use crate::unix_socket::{RemoteSocket, SocketType};
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Sets up OOM (out-of-memory) handling for `pid` .
-pub fn setup_oom_handling(pid: i32, persist_dir:&Option<PathBuf>, bundle: &PathBuf) -> ConmonResult<RemoteSocket> {
+pub fn setup_oom_handling(
+    pid: i32,
+    persist_dir: &Option<PathBuf>,
+    bundle: &Path,
+) -> ConmonResult<RemoteSocket> {
     info!("Setting up OOM handler.");
     unsafe {
         let stat = statfs::statfs("/sys/fs/cgroup")?;
@@ -28,16 +32,13 @@ pub fn setup_oom_handling(pid: i32, persist_dir:&Option<PathBuf>, bundle: &PathB
             return Ok(s);
         }
 
-        return Err(ConmonError::new(
-            format!("Cgroups v1 is not supported."),
-            1
-        ));
+        Err(ConmonError::new("Cgroups v1 is not supported.", 1))
     }
 }
 
 /// Helper function that inspects /proc/[pid]/cgroup and returns the absolute
 /// filesystem path to the cgroup directory for a given `pid` and `subsystem`.
-fn process_cgroup_subsystem_path (
+fn process_cgroup_subsystem_path(
     pid: i32,
     cgroup2: bool,
     subsystem: &str,
@@ -49,7 +50,7 @@ fn process_cgroup_subsystem_path (
         Err(e) => {
             return Err(ConmonError::new(
                 format!("Failed to open cgroups file {}: {}", cgroups_file_path, e),
-                1
+                1,
             ));
         }
     };
@@ -69,14 +70,14 @@ fn process_cgroup_subsystem_path (
                 None => {
                     return Err(ConmonError::new(
                         format!("Error parsing cgroup, second ':' not found: {}", line),
-                        1
+                        1,
                     ));
                 }
             },
             None => {
                 return Err(ConmonError::new(
                     format!("Error parsing cgroup, ':' not found: {}", line),
-                    1
+                    1,
                 ));
             }
         };
@@ -112,14 +113,18 @@ fn process_cgroup_subsystem_path (
         }
     }
 
-    return Err(ConmonError::new(
+    Err(ConmonError::new(
         format!("Error finding subsystem '{}' in cgroup file", subsystem),
-        1
-    ));
+        1,
+    ))
 }
 
 /// Sets up OOM handling using cgroup v2 for `pid`.
-unsafe fn setup_oom_handling_cgroup_v2(pid: i32, persist_dir: &Option<PathBuf>, bundle: &PathBuf) -> ConmonResult<RemoteSocket> {
+unsafe fn setup_oom_handling_cgroup_v2(
+    pid: i32,
+    persist_dir: &Option<PathBuf>,
+    bundle: &Path,
+) -> ConmonResult<RemoteSocket> {
     let cgroup2_path = process_cgroup_subsystem_path(pid, true, "")?;
     let memory_events_file_path = cgroup2_path.join("memory.events");
 
@@ -127,7 +132,7 @@ unsafe fn setup_oom_handling_cgroup_v2(pid: i32, persist_dir: &Option<PathBuf>, 
     if ifd < 0 {
         return Err(ConmonError::new(
             format!("Failed to create inotify fd: {}", Errno::last()),
-            1
+            1,
         ));
     }
 
@@ -136,29 +141,39 @@ unsafe fn setup_oom_handling_cgroup_v2(pid: i32, persist_dir: &Option<PathBuf>, 
     let cstr = CString::new(memory_events_file_path.to_string_lossy().as_bytes()).unwrap();
     if unsafe { libc::inotify_add_watch(ifd, cstr.as_ptr(), libc::IN_MODIFY) } < 0 {
         return Err(ConmonError::new(
-            format!("Failed to add inotify watch for: {}", memory_events_file_path.to_string_lossy()),
-            1
+            format!(
+                "Failed to add inotify watch for: {}",
+                memory_events_file_path.to_string_lossy()
+            ),
+            1,
         ));
     }
 
     let persist_dir_clone = persist_dir.clone();
-    let bundle = bundle.clone();
-    info!("OOM inotify watch added for {}", memory_events_file_path.to_string_lossy());
+    let bundle = PathBuf::from(bundle);
+    info!(
+        "OOM inotify watch added for {}",
+        memory_events_file_path.to_string_lossy()
+    );
     let mut socket = RemoteSocket::new(SocketType::Inotify, ifd_owned);
     socket.set_handler(move |_data| {
         check_cgroup2_oom(&cgroup2_path, &persist_dir_clone, &bundle);
-        return true;
+        true
     });
 
     Ok(socket)
 }
 
-pub fn check_cgroup2_oom(cgroup2_path: &PathBuf, persist_dir: &Option<PathBuf>, bundle: &PathBuf) -> bool {
+pub fn check_cgroup2_oom(
+    cgroup2_path: &Path,
+    persist_dir: &Option<PathBuf>,
+    bundle: &Path,
+) -> bool {
     static mut LAST_OOM_COUNTER: i64 = 0;
     static mut LAST_OOM_KILL_COUNTER: i64 = 0;
 
     unsafe {
-        let base = cgroup2_path.clone();
+        let base = cgroup2_path;
 
         let memory_events_file_path = Path::new(&base).join("memory.events");
 
@@ -166,7 +181,8 @@ pub fn check_cgroup2_oom(cgroup2_path: &PathBuf, persist_dir: &Option<PathBuf>, 
             Ok(f) => f,
             Err(err) => {
                 warn!(
-                    "Failed to open cgroups file: {}", memory_events_file_path.to_string_lossy()
+                    "Failed to open cgroups file: {}",
+                    memory_events_file_path.to_string_lossy()
                 );
                 if err.raw_os_error() == Some(libc::ENOENT) {
                     debug!(
@@ -205,8 +221,7 @@ pub fn check_cgroup2_oom(cgroup2_path: &PathBuf, persist_dir: &Option<PathBuf>, 
                     warn!("Failed to parse '{}': {}", counter_str, e);
                     continue;
                 }
-                _ => {0}
-
+                _ => 0,
             };
 
             if counter == 0 {
@@ -236,17 +251,17 @@ pub fn check_cgroup2_oom(cgroup2_path: &PathBuf, persist_dir: &Option<PathBuf>, 
 // // Create OOM marker files (v1 and v2)
 // // -----------------------------------------------------------------------------
 
-fn create_oom_files(persist_dir:&Option<PathBuf>, bundle: &PathBuf) -> Result<(), ()> {
+fn create_oom_files(persist_dir: &Option<PathBuf>, bundle: &Path) -> Result<(), ()> {
     info!("OOM received");
     let mut r = 0;
 
     if let Some(p) = persist_dir {
-        if create_oom_file(&p).is_err() {
+        if create_oom_file(p).is_err() {
             r |= 1;
         }
     }
 
-    if create_oom_file(&bundle).is_err() {
+    if create_oom_file(bundle).is_err() {
         r |= 1;
     }
 

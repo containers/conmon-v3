@@ -1,5 +1,4 @@
 #![allow(clippy::collapsible_if)]
-use conmon::exit::write_exit_files;
 use ::log::LevelFilter;
 use ::log::debug;
 use ::log::error;
@@ -13,6 +12,7 @@ use conmon::commands::version::Version;
 use conmon::error::ConmonResult;
 use conmon::exit::run_exit_command;
 use conmon::exit::set_subreaper;
+use conmon::exit::write_exit_files;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugin;
 use std::process::ExitCode;
@@ -56,9 +56,7 @@ fn main() -> ExitCode {
     let persist_dir = opts.persist_dir.clone();
     let cid = opts.cid.clone();
     let raw_code = match run_conmon(opts) {
-        Ok(code) => {
-            code
-        }
+        Ok(code) => code,
         Err(e) => {
             error!("Exiting with error message: {}", e.msg);
             eprintln!("conmon: {}", e.msg);
@@ -67,7 +65,12 @@ fn main() -> ExitCode {
         }
     };
 
-    write_exit_files(raw_code, persist_dir.as_ref(), exit_dir.as_ref(), cid.as_ref());
+    write_exit_files(
+        raw_code,
+        persist_dir.as_ref(),
+        exit_dir.as_ref(),
+        cid.as_ref(),
+    );
     let _ = run_exit_command(exit_command, exit_command_args, exit_command_delay);
-    return ExitCode::from(raw_code as u8);
+    ExitCode::from(raw_code as u8)
 }
