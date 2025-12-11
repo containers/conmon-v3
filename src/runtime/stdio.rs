@@ -18,7 +18,7 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use log::debug;
+use log::{debug, info};
 
 // Creates new pipe and return read/write fds.
 pub fn create_pipe() -> ConmonResult<(OwnedFd, OwnedFd)> {
@@ -220,7 +220,7 @@ where
     // Iterates as long as we have some RemoteSocket to read from.
     while sockets.iter().any(|s| matches!(s, Socket::Remote(_))) {
         // Run poll to get informed about new fd events.
-        let n = poll(&mut fds, 100_u16).map_err(|e| {
+        let n = poll(&mut fds, 10_u16).map_err(|e| {
             ConmonError::new(
                 format!(
                     "handle_stdio poll() failed: {}",
@@ -234,6 +234,7 @@ where
         if n == 0 {
             let keep_running = idle_callback()?;
             if !keep_running {
+                info!("idle_callback stopped the event loop.");
                 return Ok(());
             }
             continue;

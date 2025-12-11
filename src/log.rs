@@ -72,6 +72,10 @@ pub fn init_logging(
         .ok()
         .unwrap_or(default_path.to_string_lossy().to_string());
 
+    if path.is_empty() {
+        return Ok(());
+    }
+
     let file = OpenOptions::new()
         .create(true)
         .append(true)

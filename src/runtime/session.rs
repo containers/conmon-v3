@@ -82,6 +82,9 @@ pub struct RuntimeSession {
     /// Fifo for `winsz` file used by parent to control terminal window size.
     winsz_fifo: Option<RemoteSocket>,
 
+    // True if container started.
+    container_started: bool,
+
     /// The PID of container created by the runtime.
     container_pid: i32,
 
@@ -106,6 +109,7 @@ impl RuntimeSession {
             container_pid: -1,
             container_status: -1,
             timed_out: false,
+            container_started: false,
             ..Default::default()
         }
     }
@@ -293,17 +297,19 @@ impl RuntimeSession {
 
     /// Write the container pid file to all the configured locations.
     pub fn write_container_pid_file(&mut self, common: &CommonCfg) -> ConmonResult<()> {
+        self.container_pid = self.read_container_pid(common)?;
+        self.container_started = true;
+        self.oom_socket = Some(setup_oom_handling(
+            self.container_pid,
+            &common.persist_dir,
+            &common.bundle,
+        )?);
         // Pass the container_pid to sync_pipe if there is one.
         if let Some(fd) = self.sync_pipe_fd.take() {
-            self.container_pid = self.read_container_pid(common)?;
             self.sync_pipe_fd =
                 write_or_close_sync_fd(fd, self.container_pid, None, common.api_version, false)?;
-            self.oom_socket = Some(setup_oom_handling(
-                self.container_pid,
-                &common.persist_dir,
-                &common.bundle,
-            )?);
         }
+
         Ok(())
     }
 
@@ -409,10 +415,14 @@ impl RuntimeSession {
                         self.container_status = 0;
                         self.container_pid = -1;
                         return Ok(false);
+                    } else {
+                        info!("No more child processes.");
+                        return Ok(false);
                     }
                 }
 
-                Ok(false)
+                // If container has not started yet, keep running.
+                Ok(!self.container_started)
             }
 
             // some other waitpid error
@@ -427,11 +437,15 @@ impl RuntimeSession {
             // Child exiteed, store the exit code.
             Ok(WaitStatus::Exited(p, code)) => {
                 if p == Pid::from_raw(self.container_pid) {
+                    info!("Container exited.");
                     self.container_status = code;
+                    return Ok(false);
                 } else if p == Pid::from_raw(self.process.pid()) {
                     self.exit_code = code;
+                    info!("Runtime exited.");
+                    return Ok(false);
                 }
-                Ok(false)
+                Ok(true)
             }
 
             Ok(

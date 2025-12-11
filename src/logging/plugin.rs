@@ -18,11 +18,12 @@ pub struct LogPluginCfg {
     pub log_labels: Vec<String>,
     pub no_container_partial_message: bool,
     pub name: Option<String>,
+    pub no_sync: bool,
 }
 
 pub fn initialize_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box<dyn LogPlugin>> {
     match name {
-        "none" => Ok(Box::new(NoneLogger::new(cfg)?)),
+        "none" | "passthrough" => Ok(Box::new(NoneLogger::new(cfg)?)),
         "file" | "k8s_file" => Ok(Box::new(FileLogger::new(cfg)?)),
         "journald" => Ok(Box::new(JournaldLogger::new(cfg)?)),
         _ => Err(ConmonError::new(format!("No such log driver {name}"), 1)),

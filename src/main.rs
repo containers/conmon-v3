@@ -15,20 +15,23 @@ use conmon::exit::set_subreaper;
 use conmon::exit::write_exit_files;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugin;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     // Enable subreaper, so we can wait for container process.
     set_subreaper(true)?;
 
+    let mut log_path = PathBuf::new();
     if let Some(ref bundle) = opts.bundle {
-        log::init_logging(
-            "CONMON_LOG_PATH",
-            bundle.join("conmon-debug.log"),
-            "CONMON_LOG_LEVEL",
-            LevelFilter::Debug,
-        )?;
+        log_path = bundle.join("conmon-debug.log");
     }
+    log::init_logging(
+        "CONMON_LOG_PATH",
+        log_path,
+        "CONMON_LOG_LEVEL",
+        LevelFilter::Debug,
+    )?;
 
     let git_commit = option_env!("GIT_COMMIT").unwrap_or("unknown");
     info!("Starting conmon version {git_commit}");
@@ -38,13 +41,26 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     info!("Using log plugin: {plugin_name:?} {plugin_cfg:?}");
     let mut log_plugin = initialize_log_plugin(&plugin_name, &plugin_cfg)?;
 
-    let exit_code = match determine_cmd(opts)? {
-        Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut())?,
-        Cmd::Exec(cfg) => Exec::new(cfg).exec(log_plugin.as_mut())?,
-        Cmd::Restore(cfg) => Restore::new(cfg).exec()?,
-        Cmd::Version => Version {}.exec()?,
+    let result = match determine_cmd(opts) {
+        Ok(cmd) => match cmd {
+            Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut()),
+            Cmd::Exec(cfg) => Exec::new(cfg).exec(log_plugin.as_mut()),
+            Cmd::Restore(cfg) => Restore::new(cfg).exec(),
+            Cmd::Version => Version {}.exec(),
+        },
+        Err(e) => Err(e),
     };
-    Ok(exit_code)
+
+    // Always call write(), even if result is Err(...)
+    let no_data: &[u8] = &[];
+    if let Err(e) = log_plugin.write(true, no_data) {
+        error!("failed to drain stdout log: {e}");
+    }
+    if let Err(e) = log_plugin.write(false, no_data) {
+        error!("failed to drain stderr log: {e}");
+    }
+
+    result
 }
 
 fn main() -> ExitCode {

@@ -240,6 +240,7 @@ pub struct CommonCfg {
     pub persist_dir: Option<PathBuf>,
     pub exit_dir: Option<PathBuf>,
     pub name: Option<String>,
+    pub no_sync_log: bool,
 }
 
 #[derive(Debug, Default)]
@@ -363,6 +364,7 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         persist_dir: opts.persist_dir,
         exit_dir: opts.exit_dir,
         name: opts.name,
+        no_sync_log: opts.no_sync_log,
     };
 
     // decide which subcommand this flag combination means
@@ -425,6 +427,8 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
             plugin = plugin.replace("-", "_");
         } else if s == "journald" {
             plugin = "journald".to_string();
+        } else if s == "passthrough" {
+            plugin = "passthrough".to_string();
         } else {
             // No "plugin:" prefix; treat as a path.
             if !s.is_empty() {
@@ -443,6 +447,7 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
     log_plugin_cfg.log_tag = opts.log_tag.clone();
     log_plugin_cfg.no_container_partial_message = opts.no_container_partial_message;
     log_plugin_cfg.name = opts.name.clone();
+    log_plugin_cfg.no_sync = opts.no_sync_log;
 
     Ok((plugin, log_plugin_cfg))
 }
