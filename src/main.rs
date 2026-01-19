@@ -11,17 +11,34 @@ use conmon::commands::restore::Restore;
 use conmon::commands::version::Version;
 use conmon::error::ConmonResult;
 use conmon::exit::run_exit_command;
-use conmon::exit::set_subreaper;
+use conmon::exit::snapshot_open_fds;
 use conmon::exit::write_exit_files;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugin;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// Runs the conmon and returns the exit code.
+///
+/// # Arguments
+///
+/// * `opts` - The parsed command line options.
+///
+/// # Returns
+///
+/// * Exit code the conmon executable should exit with.
 fn run_conmon(opts: Opts) -> ConmonResult<i32> {
-    // Enable subreaper, so we can wait for container process.
-    set_subreaper(true)?;
+    // Snapshot the open file descriptors.
+    // Podman injects multiple fds into conmon when executing it. It uses these
+    // fds to detect whether conmon still runs. We need to close these fds on
+    // exit, but we do not want to close any other fd too early, otherwise we
+    // could for example kill our own logging fd and stop logging completely
+    // too early.
+    // We therefore keep the track of fds opened on conmon start before we open
+    // anything else.
+    let open_files = snapshot_open_fds();
 
+    // Start logging.
     let mut log_path = PathBuf::new();
     if let Some(ref bundle) = opts.bundle {
         log_path = bundle.join("conmon-debug.log");
@@ -33,25 +50,35 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
         LevelFilter::Debug,
     )?;
 
+    // Show the basic information about conmon in the logs.
     let git_commit = option_env!("GIT_COMMIT").unwrap_or("unknown");
     info!("Starting conmon version {git_commit}");
     debug!("Command line options: {opts:?}");
 
+    // Handle the `--version` flag here, because we want to show the output
+    // even if the log_plugin cannot be initialized for whatever reason.
+    if opts.version_flag {
+        return Version {}.exec();
+    }
+
+    // Parse the log plugin to use and initialize it.
     let (plugin_name, plugin_cfg) = determine_log_plugin(&opts)?;
     info!("Using log plugin: {plugin_name:?} {plugin_cfg:?}");
     let mut log_plugin = initialize_log_plugin(&plugin_name, &plugin_cfg)?;
 
-    let result = match determine_cmd(opts) {
+    // Determine the conmon subcommand to run and execute it.
+    let result = match determine_cmd(opts, &plugin_name) {
         Ok(cmd) => match cmd {
-            Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut()),
-            Cmd::Exec(cfg) => Exec::new(cfg).exec(log_plugin.as_mut()),
+            Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut(), &open_files),
+            Cmd::Exec(cfg) => Exec::new(cfg).exec(log_plugin.as_mut(), &open_files),
             Cmd::Restore(cfg) => Restore::new(cfg).exec(),
             Cmd::Version => Version {}.exec(),
         },
         Err(e) => Err(e),
     };
 
-    // Always call write(), even if result is Err(...)
+    // Always call write with empty buffer to trigger write of any cached
+    // log lines into logs. Without that, we could loose some log messages.
     let no_data: &[u8] = &[];
     if let Err(e) = log_plugin.write(true, no_data) {
         error!("failed to drain stdout log: {e}");
@@ -60,10 +87,13 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
         error!("failed to drain stderr log: {e}");
     }
 
+    // Return the exit code from subcommand execution.
     result
 }
 
 fn main() -> ExitCode {
+    // Parse the command line arguments and clone the ones we need
+    // for the exit handling.
     let opts = Opts::parse();
     let exit_command = opts.exit_command.clone();
     let exit_command_args = opts.exit_args.clone();
@@ -71,6 +101,8 @@ fn main() -> ExitCode {
     let exit_dir = opts.exit_dir.clone();
     let persist_dir = opts.persist_dir.clone();
     let cid = opts.cid.clone();
+
+    // Run the conmon.
     let raw_code = match run_conmon(opts) {
         Ok(code) => code,
         Err(e) => {
@@ -81,12 +113,20 @@ fn main() -> ExitCode {
         }
     };
 
+    // Write the exit files into persistent path. The podman has inotify
+    // set for that directory and uses it to detect the conmon exit.
     write_exit_files(
         raw_code,
         persist_dir.as_ref(),
         exit_dir.as_ref(),
         cid.as_ref(),
     );
+
+    // Run the exit command if defined by podman. We do not care about the exit
+    // code here.
     let _ = run_exit_command(exit_command, exit_command_args, exit_command_delay);
+
+    // Return the exit code from the run_conmon function.
+    info!("Exiting with status {}", raw_code);
     ExitCode::from(raw_code as u8)
 }

@@ -145,7 +145,7 @@ pub struct Opts {
     pub runtime_args: Vec<String>,
 
     /// Additional opts to pass to the restore or exec command. Can be specified multiple times
-    #[arg(long = "runtime-opt")]
+    #[arg(long = "runtime-opt", allow_hyphen_values = true)]
     pub runtime_opts: Vec<String>,
 
     /// Path to the host's sd-notify socket to relay messages to
@@ -241,6 +241,9 @@ pub struct CommonCfg {
     pub exit_dir: Option<PathBuf>,
     pub name: Option<String>,
     pub no_sync_log: bool,
+    pub logging_passthrough: bool,
+    pub sync_flag: bool,
+    pub sdnotify_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -272,7 +275,7 @@ fn is_executable(p: &Path) -> bool {
     false
 }
 
-pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
+pub fn determine_cmd(mut opts: Opts, log_plugin: &String) -> ConmonResult<Cmd> {
     let api_version = opts.api_version.unwrap_or(0);
 
     if opts.version_flag {
@@ -365,6 +368,9 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         exit_dir: opts.exit_dir,
         name: opts.name,
         no_sync_log: opts.no_sync_log,
+        logging_passthrough: log_plugin == "passthrough",
+        sync_flag: opts.sync_flag,
+        sdnotify_socket: opts.sdnotify_socket,
     };
 
     // decide which subcommand this flag combination means
@@ -474,7 +480,8 @@ mod tests {
             ..Default::default()
         };
         // Even if other required fields are missing, version should short-circuit
-        let cmd = determine_cmd(o).expect("ok");
+        let log_plugin = String::from("file");
+        let cmd = determine_cmd(o, &log_plugin).expect("ok");
         match cmd {
             Cmd::Version => {}
             _ => panic!("expected Version"),
@@ -487,7 +494,8 @@ mod tests {
         let o = Opts {
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(err.to_string().contains("Container ID not provided"));
         Ok(())
     }
@@ -498,7 +506,8 @@ mod tests {
             cid: Some("abc".into()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(err.to_string().contains("Runtime path not provided"));
         Ok(())
     }
@@ -512,7 +521,8 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Attach can only be specified with exec")
@@ -531,7 +541,8 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(err.to_string().contains("non-legacy exec session"));
         Ok(())
     }
@@ -545,7 +556,8 @@ mod tests {
             ..Default::default()
         };
         // run path (no exec/restore) requires cuuid
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(err.to_string().contains("Container UUID not provided"));
         Ok(())
     }
@@ -561,7 +573,8 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(err.to_string().contains("Cannot use 'exec' and 'restore'"));
         Ok(())
     }
@@ -575,7 +588,8 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(err.to_string().contains("is not valid"));
         Ok(())
     }
@@ -593,7 +607,8 @@ mod tests {
             exec_process_spec: Some(PathBuf::from("proc.json")),
             ..Default::default()
         };
-        let cmd = determine_cmd(o).expect("ok");
+        let log_plugin = String::from("file");
+        let cmd = determine_cmd(o, &log_plugin).expect("ok");
         match cmd {
             Cmd::Exec(cfg) => {
                 assert_eq!(cfg.common.api_version, 1);
@@ -617,7 +632,8 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let log_plugin = String::from("file");
+        let err = determine_cmd(o, &log_plugin).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Exec process spec path not provided")
@@ -635,7 +651,8 @@ mod tests {
             restore: Some(PathBuf::from("checkpoint")),
             ..Default::default()
         };
-        let cmd = determine_cmd(o).expect("ok");
+        let log_plugin = String::from("file");
+        let cmd = determine_cmd(o, &log_plugin).expect("ok");
         match cmd {
             Cmd::Restore(cfg) => {
                 assert_eq!(cfg.common.cid, "abc");
@@ -657,7 +674,8 @@ mod tests {
         };
         // no bundle/container_pidfile specified -> defaults should kick in
         let cwd = std::env::current_dir()?;
-        let cmd = determine_cmd(o).expect("ok");
+        let log_plugin = String::from("file");
+        let cmd = determine_cmd(o, &log_plugin).expect("ok");
         match cmd {
             Cmd::Create(cfg) => {
                 // bundle defaults to cwd
@@ -677,22 +695,6 @@ mod tests {
 
         let nonexec = make_temp_file_with_mode(0o600);
         assert!(!is_executable(nonexec.path()));
-        Ok(())
-    }
-
-    #[test]
-    fn defaults_when_no_paths() -> ConmonResult<()> {
-        let o = Opts {
-            log_path: vec![],
-            ..Default::default()
-        };
-
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file");
-        assert!(
-            cfg.path.as_os_str().is_empty(),
-            "default path should be empty"
-        );
         Ok(())
     }
 

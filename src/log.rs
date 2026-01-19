@@ -1,5 +1,6 @@
 use chrono::Utc;
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use nix::unistd::getpid;
 use std::fs::OpenOptions;
 use std::{fs::File, io::Write, path::PathBuf, sync::Mutex};
 
@@ -37,7 +38,8 @@ impl Log for FileLogger {
 
         let _ = writeln!(
             &mut *file,
-            "[{}][{:>5}] {}: {}",
+            "[{}] [{}][{:>5}] {}: {}",
+            getpid().as_raw(),
             now.to_rfc3339(),
             record.level(),
             record.target(),

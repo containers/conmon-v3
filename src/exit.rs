@@ -5,15 +5,22 @@ use nix::errno::Errno;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use std::{fs, thread};
 
-use nix::libc::{PR_SET_CHILD_SUBREAPER, prctl};
+use nix::libc::{PR_SET_CHILD_SUBREAPER, close, prctl};
 
 /// Sets this process as subreaper.
+///
 /// A subreaper becomes the ancestor for orphaned descendants in its subtree.
+/// This is needed to read the exit status of all child processes.
+///
+/// # Argments
+///
+/// * `enabled` - When true, this process is a subreaper.
 pub fn set_subreaper(enabled: bool) -> ConmonResult<()> {
     let flag = if enabled { 1 } else { 0 };
 
@@ -30,11 +37,21 @@ pub fn set_subreaper(enabled: bool) -> ConmonResult<()> {
 }
 
 /// Cleanup function to execute at the end of conmon execution.
+///
+/// Cleanups all the child processes and calls the exit command.
+///
+/// # Arguments
+///
+/// * `exit_command` - The path to exit command.
+/// * `exit_command_args` - Vector of arguments for exit command.
+/// * `exit_command_delay` - Optional delay in seconnds to wit before
+///   executing the exit command.
 pub fn run_exit_command(
     exit_command: Option<PathBuf>,
     exit_command_args: Vec<String>,
     exit_command_delay: Option<i32>,
 ) -> ConmonResult<()> {
+    // Stop being a subreaper.
     let r = set_subreaper(false);
     if let Err(e) = r {
         warn!("{}", e);
@@ -57,14 +74,16 @@ pub fn run_exit_command(
     }
 
     if exit_command.is_none() {
+        // No exit-command, so return.
         return Ok(());
     }
 
+    // Wait for a delay if used.
     if let Some(delay) = exit_command_delay {
         thread::sleep(Duration::from_secs(delay as u64));
     }
 
-    // Build and spawn the child.
+    // Build and spawn the exit command.
     if let Some(program) = &exit_command {
         let mut cmd = Command::new(program);
         cmd.args(exit_command_args.clone());
@@ -83,7 +102,7 @@ pub fn run_exit_command(
     Ok(())
 }
 
-/// Writes exit files into persisnte_path and exit_dir.
+/// Writes exit files into persistent_path and exit_dir.
 pub fn write_exit_files(
     exit_status: i32,
     persist_path: Option<&PathBuf>,
@@ -118,6 +137,95 @@ pub fn write_exit_files(
                     e
                 );
             }
+        }
+    }
+}
+
+const OPEN_FILES_DIR: &str = "/proc/self/fd";
+
+#[derive(Default, Clone)]
+pub struct OpenFilesSnapshot {
+    max_fd: RawFd,
+    // List of file descriptors that existed at snapshot time.
+    // Kept sorted and unique.
+    open_fds: Vec<RawFd>,
+}
+
+impl OpenFilesSnapshot {
+    fn mark(&mut self, fd: RawFd) {
+        if fd < 0 {
+            return;
+        }
+
+        match self.open_fds.binary_search(&fd) {
+            Ok(_) => {
+                // already present
+            }
+            Err(pos) => {
+                self.open_fds.insert(pos, fd);
+            }
+        }
+
+        if fd > self.max_fd {
+            self.max_fd = fd;
+        }
+    }
+
+    fn has(&self, fd: RawFd) -> bool {
+        if fd < 0 {
+            return false;
+        }
+
+        self.open_fds.binary_search(&fd).is_ok()
+    }
+
+    pub fn remove(&mut self, fd: RawFd) {
+        if fd < 0 {
+            return;
+        }
+
+        if let Ok(pos) = self.open_fds.binary_search(&fd) {
+            self.open_fds.remove(pos);
+        }
+    }
+}
+
+pub fn snapshot_open_fds() -> OpenFilesSnapshot {
+    let mut snap = OpenFilesSnapshot::default();
+
+    // Best-effort: if we can't read the directory, do nothing.
+    let Ok(dir) = std::fs::read_dir(OPEN_FILES_DIR) else {
+        return snap;
+    };
+
+    // Read the number of open fds.
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(fd) = name.parse::<RawFd>() else {
+            continue;
+        };
+        snap.mark(fd);
+    }
+
+    snap
+}
+
+/// Close all file descriptors that were open at snapshot time, except:
+/// - stdin(0), stdout(1), stderr(2)
+pub fn close_all_except_stdio(snap: &OpenFilesSnapshot) {
+    if snap.open_fds.is_empty() {
+        return;
+    }
+
+    for fd in 3..=snap.max_fd {
+        if snap.has(fd) {
+            info!("Closing {}", fd);
+            // Best-effort: ignore EBADF and any other errors (common when racing / already closed).
+            let _ = unsafe { close(fd) };
         }
     }
 }

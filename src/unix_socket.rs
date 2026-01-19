@@ -4,12 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use log::{debug, warn};
+use log::{debug, error, warn};
 use nix::{
     errno::Errno,
     fcntl::OFlag,
     sys::{
-        socket::{SockaddrStorage, recvfrom},
+        socket::{MsgFlags, SockaddrStorage, recvfrom, sendto},
         uio::writev,
     },
     unistd::{read, write},
@@ -53,19 +53,40 @@ pub enum SocketType {
     Attach,       // Attach Unix socket.
     TerminalFifo, // Fifo for `ctl`.
     ConsoleFifo,  // Fifo for `winsz`.
-    Inotify,
-    EventFd,
+    Inotify,      // Inotify socket of OOM detection.
+    SignalFd,     // Signal fd to receive UNIX signals
 }
 
 type RemoteSocketHandler = Box<dyn FnMut(&[u8]) -> bool + Send + 'static>;
 
+// Do not change the buffer size. It is in sync with podman and other
+// parent apps. We use SOCK_SEQPACKET and if we cannot fit whole packet
+// received from parent in a single `recvfrom`, the remaining data is lost.
+const SOCKET_BUFFER_SIZE: usize = 32768;
+
+// The buffer size of podman or other parent app when receiving the data.
+// Again, this has to stay 8192, otherwise the podman wouldn't receive whole
+// package and some data would be lost. See SOCKET_BUFFER_SIZE.
+const CONMON_CLIENT_BUFFER_SIZE: usize = 8192;
+
 /// Remote side (attach client or sd-notify FD inside container).
 pub struct RemoteSocket {
+    /// Type of this socket.
     pub socket_type: SocketType,
+
+    /// The file descriptor representing the socket.
     pub fd: OwnedFd,
-    pub buf: [u8; 8192],
-    buf_start: usize, // index of first valid byte
-    buf_end: usize,   // one past last valid byte
+
+    /// The buffer for a data received from the socket.
+    pub buf: [u8; SOCKET_BUFFER_SIZE],
+
+    /// Index of the first valid byte.
+    buf_start: usize,
+
+    /// One past the last valid byte.
+    buf_end: usize,
+
+    /// Handler to call on new data.
     handler: Option<RemoteSocketHandler>,
 }
 
@@ -80,19 +101,26 @@ impl fmt::Debug for RemoteSocket {
     }
 }
 
+// Represents all the sockets/fds we can read from.
 impl RemoteSocket {
     pub fn new(socket_type: SocketType, fd: OwnedFd) -> Self {
         Self {
             socket_type,
             fd,
-            buf: [0u8; 8192],
+            buf: [0u8; SOCKET_BUFFER_SIZE],
             buf_start: 0,
             buf_end: 0,
             handler: None,
         }
     }
 
-    /// Attach a handler to this socket. The handler can capture arbitrary custom data.
+    /// Attach a handler to this socket.
+    ///
+    /// The handle is called when new data is received using socket.
+    ///
+    /// # Arguments
+    ///
+    /// * `handler` - The `RemoteSocketHandler` to call when data received.
     pub fn set_handler<F>(&mut self, handler: F)
     where
         F: FnMut(&[u8]) -> bool + Send + 'static,
@@ -100,7 +128,7 @@ impl RemoteSocket {
         self.handler = Some(Box::new(handler));
     }
 
-    /// Compact the buffer so that valid data starts at index 0.
+    /// Compacts the buffer so that valid data starts at index 0.
     fn compact_buffer(&mut self) {
         if self.buf_start == 0 {
             // We are done already :-).
@@ -120,13 +148,17 @@ impl RemoteSocket {
         self.buf_end = len;
     }
 
-    /// Remove all data from the buffer.
+    /// Removes all data from the buffer.
     pub fn clear_buffer(&mut self) {
         self.buf_start = 0;
         self.buf_end = 0;
     }
 
-    /// Read some bytes into the rolling buffer, without dispatching yet.
+    /// Reads some bytes into the rolling buffer, without dispatching yet.
+    ///
+    /// # Returns
+    ///
+    /// * The number of bytes read.
     pub fn read(&mut self) -> ConmonResult<usize> {
         // Ensure there is a space. If we are full, try compacting first.
         if self.buf_end == self.buf.len() {
@@ -137,6 +169,7 @@ impl RemoteSocket {
             }
         }
 
+        // Read the data using `read` or `recvfrom`.
         let dst = &mut self.buf[self.buf_end..];
         let n = loop {
             match self.socket_type {
@@ -144,7 +177,6 @@ impl RemoteSocket {
                 | SocketType::Stderr
                 | SocketType::Terminal
                 | SocketType::TerminalFifo
-                | SocketType::EventFd
                 | SocketType::Inotify
                 | SocketType::ConsoleFifo => match read(self.fd.as_fd(), dst) {
                     Ok(n) => break n,
@@ -187,40 +219,81 @@ impl RemoteSocket {
     }
 
     /// Returns a pointer + length to the next newline-terminated line.
+    ///
     /// After returning the line, it advances buf_start and compacts whatever remains.
-    /// Returns None if no complete line is available.
-    pub fn next_line(&mut self) -> Option<(*const u8, usize)> {
-        // Search for '\n'.
-        let rel = self.buf[self.buf_start..self.buf_end]
+    ///
+    /// # Returns
+    ///
+    /// * (pointer to line, length of the line)
+    /// * None if no complete line is available.
+    ///
+    /// # Arguments
+    ///
+    /// * `allow_partial` - If true, if returns the buffer content even if it does
+    ///   not end with a new-line character.
+    pub fn next_line(&mut self, allow_partial: bool) -> Option<(*const u8, usize)> {
+        // Search for '\n' in the available buffer slice.
+        if let Some(rel) = self.buf[self.buf_start..self.buf_end]
             .iter()
-            .position(|&b| b == b'\n')?;
+            .position(|&b| b == b'\n')
+        {
+            let line_start = self.buf_start;
+            let line_end = line_start + rel + 1; // include '\n'
+            let len = line_end - line_start;
 
-        let line_start = self.buf_start;
-        let line_end = line_start + rel + 1; // include '\n'
-        let len = line_end - line_start;
+            // Get raw pointer BEFORE altering the buffer.
+            let ptr = self.buf[line_start..line_end].as_ptr();
 
-        // Get raw pointer to the data BEFORE altering the buffer.
-        let ptr = self.buf[line_start..line_end].as_ptr();
+            // Advance buffer start.
+            self.buf_start = line_end;
 
-        // Advance buffer start.
-        self.buf_start = line_end;
+            // If consumed everything, reset indices.
+            if self.buf_start == self.buf_end {
+                self.buf_start = 0;
+                self.buf_end = 0;
+            } else {
+                self.compact_buffer();
+            }
 
-        // If consumed everything, reset indices.
-        if self.buf_start == self.buf_end {
-            self.buf_start = 0;
-            self.buf_end = 0;
-        } else {
-            // Compact remaining data to the beginning.
-            self.compact_buffer();
+            return Some((ptr, len));
         }
 
-        Some((ptr, len))
+        // No '\n' found
+        if allow_partial && self.buf_start < self.buf_end {
+            let line_start = self.buf_start;
+            let line_end = self.buf_end;
+            let len = line_end - line_start;
+
+            // Raw pointer to remaining data
+            let ptr = self.buf[line_start..line_end].as_ptr();
+
+            // Consume everything
+            self.buf_start = 0;
+            self.buf_end = 0;
+
+            return Some((ptr, len));
+        }
+
+        None
     }
 }
 
 impl Drop for RemoteSocket {
     fn drop(&mut self) {
         info!("Dropping RemoteSocket {:?}", self.fd)
+    }
+}
+
+impl From<UnixSocket> for RemoteSocket {
+    fn from(mut us: UnixSocket) -> Self {
+        RemoteSocket {
+            socket_type: us.socket_type,
+            fd: us.fd.take().unwrap(),
+            buf: [0u8; SOCKET_BUFFER_SIZE],
+            buf_start: 0,
+            buf_end: 0,
+            handler: None,
+        }
     }
 }
 
@@ -261,8 +334,16 @@ impl UnixSocket {
         self.path.as_ref()
     }
 
-    /// Generates the socket path and starts listening for new client (remote) connections.
-    pub fn listen(
+    /// Generates the socket path, creates new socket and binds to the path.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path for the unix socket. if relative, the `socket_parent_dir()`
+    ///   is used as a parent path. If None, socket is create in temporary directory.
+    /// * `sock_type` - The type of the socket passed to `socket()`.
+    /// * `sock_flags` - The socket flags passed to `socket()`.
+    /// * `perms` - Permissions to `fchmod()` socket with.
+    pub fn bind(
         &mut self,
         path: Option<PathBuf>,
         sock_type: SockType,
@@ -273,17 +354,18 @@ impl UnixSocket {
         let mut dir_fd: Option<OwnedFd> = None;
 
         if let Some(path) = path {
-            // We have some path, but we need a full-path.
-            // If the path is a full-path, use it.
-            // If it's not, generate the full-path using socket_parent_dir() and
+            // We have some path, but we need an absolute path.
+            // If the path is an aboslute path, use it.
+            // If it's not, generate the absolute path using socket_parent_dir() and
             // prefix the path with it.
             full_path = path.to_owned();
-            let fallback;
+            let mut fallback;
             let dir = if let Some(parent) = path.parent() {
-                if !parent.is_empty() {
+                if parent.is_absolute() {
                     parent
                 } else {
                     fallback = self.socket_parent_dir()?;
+                    fallback = fallback.join(parent);
                     let fallback_path = fallback.as_path();
                     full_path = fallback_path.join(path);
                     fallback_path
@@ -295,9 +377,11 @@ impl UnixSocket {
                 fallback_path
             };
 
-            // Create the parent-directory of full-path.
+            // Create the parent-directory of aboslute path.
             let flags = OFlag::O_CREAT | OFlag::O_CLOEXEC | OFlag::O_PATH;
-            let dfd = open(dir, flags, Mode::from_bits_truncate(0o600))?;
+            let dfd = open(dir, flags, Mode::from_bits_truncate(0o600)).map_err(|e| {
+                ConmonError::new(format!("Failed to open directory {dir:?}: {e:?}"), 1)
+            })?;
 
             // Store the dir_fd, because we will be creating the socket in this dir.
             dir_fd = Some(dfd);
@@ -322,20 +406,34 @@ impl UnixSocket {
             }
         })?;
 
-        // Now bind & listen on the console socket path.
+        // Now create a socket and bind to it.
         let fd = socket(AddressFamily::Unix, sock_type, sock_flags, None)?;
-
         self.bind_relative_to_dir(&fd, dir_fd.as_ref(), &full_path, perms)?;
-        listen(&fd, Backlog::MAXCONN)?;
-        info!("Listening on {full_path:?}");
+        info!("Bound to {:?}", full_path);
         self.fd = Some(fd);
         self.path = Some(full_path);
 
         Ok(())
     }
 
-    /// Bind the fd socket to relative path in dir_fd if defined.
-    /// If not defined, the path is considered as full-path.
+    pub fn listen(&self) -> ConmonResult<()> {
+        if let Some(fd) = &self.fd {
+            listen(fd, Backlog::MAXCONN)?;
+            info!("Listening on {:?}", self.path);
+        }
+        Ok(())
+    }
+
+    /// Binds the socket to relative path.
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - The socket to bind.
+    /// * `dir_fd` - The file descriptor pointing to a directory in which we bind.
+    ///   If not set, the `path` is used as a directory.
+    /// * `path` - Path to bind to. If `dir_fd` is set, the path is used in
+    ///   the `dir_fd` context.
+    /// * `perms` - Permissions to `fchmod()` socket with.
     fn bind_relative_to_dir(
         &mut self,
         fd: &OwnedFd,
@@ -365,6 +463,7 @@ impl UnixSocket {
             })?
         };
 
+        info!("{:}", addr);
         fchmod(fd, perms)?;
         bind(fd.as_raw_fd(), &addr)?;
         Ok(())
@@ -377,7 +476,12 @@ impl UnixSocket {
     }
 
     /// Generates the socket parent directory based on the UnixSocket options.
+    ///
+    /// # Returns
+    ///
+    /// * The parent directory.
     fn socket_parent_dir(&mut self) -> ConmonResult<PathBuf> {
+        // Use the `bundle_path` as base path. Fallback to `socket_path`.
         let base_path = if self.use_full_attach_path {
             self.bundle_path.to_owned()
         } else if let Some(cuuid) = &self.cuuid {
@@ -390,6 +494,7 @@ impl UnixSocket {
             "".into()
         };
 
+        // We don't have `bundle_path` nor `cuuid` and `socket_path`.
         if base_path.is_empty() {
             return Err(ConmonError::new(
                 "Base path for socket cannot be determined",
@@ -445,7 +550,11 @@ impl UnixSocket {
         Ok(new_base)
     }
 
-    /// Accept new UnixSocket client (remote) connection.
+    /// Accepts new UnixSocket client (remote) connection.
+    ///
+    /// # Returns
+    /// * The RemoteSocket with new client connection. The type of the RemoteSocket
+    ///   is the same as type of this UnixSocket.
     pub fn accept(&self) -> ConmonResult<Option<RemoteSocket>> {
         if self.fd.is_none() {
             return Ok(None);
@@ -478,14 +587,54 @@ impl Drop for UnixSocket {
     }
 }
 
+/// Creates new socket for sd-notify.
+///
+/// This socket is later used to forward messages to systemd.
+///
+/// # Arguments
+///
+/// * `socket_path` - Path to `notify.sock`.
+///
+/// # Returns
+///
+/// * (created socket, addr)
+fn make_notify_socket_and_addr(socket_path: &Path) -> nix::Result<(OwnedFd, UnixAddr)> {
+    // socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Datagram,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    )?;
+    let addr = UnixAddr::new(socket_path)?;
+
+    Ok((fd, addr))
+}
+
+/// Enum representing UnixSocket, RemoteSocket or invalid socket.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Socket {
     Unix(UnixSocket),
     Remote(RemoteSocket),
+    Invalid(),
 }
 
 impl Socket {
+    /// Handles the POLLIN event for a Socket.
+    ///
+    /// # Arguments
+    ///
+    /// * `log_plugin` - The log plugin to forward container message to.
+    /// * `new_sockets` - Vector into which newly created RemoteSocket can be added into.
+    /// * `workerfd_stdin` - The container's stdin.
+    /// * `console_fds` - The list of podman's fds using which the podman receives
+    ///   stdout/stderr data from container.
+    /// * `terminal_fds` - Terminal fds into which we forward data for container's stdin.
+    /// * `stdout_fd` - The fd of container's stdout. We use it to change the terminal
+    ///   size.
+    /// * `sdnotify_socket` - Path to systemd's "notify.sock".
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_data(
         &mut self,
         log_plugin: &mut dyn LogPlugin,
@@ -494,20 +643,31 @@ impl Socket {
         console_fds: &Vec<i32>,
         terminal_fds: &Vec<i32>,
         stdout_fd: i32,
+        sdnotify_socket: &Option<PathBuf>,
     ) -> ConmonResult<bool> {
         match self {
             Socket::Unix(l) => {
+                // Unix socket. Just `accept` new client connection and return.
                 if let Some(remote) = l.accept()? {
                     new_sockets.push(remote);
                 }
                 return Ok(true);
             }
             Socket::Remote(r) => {
-                let bytes_read = r.read()?;
+                // Client socket. Read what has been sent to it.
+                let bytes_read = match r.read() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        r.clear_buffer();
+                        error!("read error: {e}");
+                        return Ok(true);
+                    }
+                };
                 if bytes_read == 0 {
                     return Ok(false);
                 }
 
+                // If the Socket has a handler, call the handler directly and return.
                 if let Some(handler) = r.handler.as_mut() {
                     return Ok(handler(&r.buf[..bytes_read]));
                 }
@@ -526,20 +686,29 @@ impl Socket {
                         } else {
                             &[2] // stderr
                         };
-                        for &fd in console_fds {
-                            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                            let iov = [
-                                std::io::IoSlice::new(prefix_buf),
-                                std::io::IoSlice::new(&r.buf[..bytes_read]),
-                            ];
-                            writev(borrowed, &iov)?;
+
+                        // We send data in chunks, because our buffer has 32768 bytes while podman's
+                        // buffer has 8192+1 bytes. It would be nice to unify that, but we need to
+                        // keep the backwards compatibility for now. We also have to keep using
+                        // SOCKET_SEQPACKET and therefore everything needs to be sent in a single packet.
+                        let data = &r.buf[..bytes_read];
+                        for chunk in data.chunks(CONMON_CLIENT_BUFFER_SIZE) {
+                            for &fd in console_fds {
+                                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                                let iov = [
+                                    std::io::IoSlice::new(prefix_buf),
+                                    std::io::IoSlice::new(chunk),
+                                ];
+                                writev(borrowed, &iov)?;
+                            }
                         }
                         r.clear_buffer();
                     }
                     SocketType::Console => {
                         // Console socket: forward data to container's stdin.
                         if let Some(workerfd_stdin) = workerfd_stdin.as_ref() {
-                            write(workerfd_stdin, &r.buf[..bytes_read])?;
+                            let bytes_written = write(workerfd_stdin, &r.buf[..bytes_read])?;
+                            info!("bytes written: {}", bytes_written);
                         }
                         // Forward data to terminal.
                         for &fd in terminal_fds {
@@ -549,11 +718,30 @@ impl Socket {
                         }
                         r.clear_buffer();
                     }
-                    SocketType::Notify => {}
-                    SocketType::Attach => {}
+                    SocketType::Notify => {
+                        // We received something from "notify.sock" from the container. We need
+                        // to forward it to host system's systemd.
+                        if let Some(notify_path) = &sdnotify_socket {
+                            let (notify_fd, notify_addr) =
+                                make_notify_socket_and_addr(notify_path)?;
+                            // Handle all complete lines.
+                            while let Some((ptr, len)) = r.next_line(true) {
+                                let line = unsafe { std::slice::from_raw_parts(ptr, len) };
+                                let line_str = String::from_utf8_lossy(line);
+                                info!("Received systemd notify line: {}", line_str);
+                                sendto(
+                                    notify_fd.as_raw_fd(),
+                                    line,
+                                    &notify_addr,
+                                    MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+                                )?;
+                            }
+                        }
+                    }
                     SocketType::TerminalFifo | SocketType::ConsoleFifo => {
-                        // Handle all complete lines
-                        while let Some((ptr, len)) = r.next_line() {
+                        // We received control message for "ctlr" or "winsz".
+                        // Handle all complete lines.
+                        while let Some((ptr, len)) = r.next_line(false) {
                             let line = unsafe { std::slice::from_raw_parts(ptr, len) };
                             let line_str = String::from_utf8_lossy(line);
                             if r.socket_type == SocketType::TerminalFifo {
@@ -565,8 +753,11 @@ impl Socket {
                             }
                         }
                     }
-                    SocketType::EventFd | SocketType::Inotify => {}
+                    SocketType::Inotify | SocketType::SignalFd | SocketType::Attach => {}
                 }
+            }
+            Socket::Invalid() => {
+                return Ok(true);
             }
         }
         Ok(true)

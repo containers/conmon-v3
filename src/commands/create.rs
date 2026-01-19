@@ -1,5 +1,6 @@
 use crate::cli::CreateCfg;
 use crate::error::ConmonResult;
+use crate::exit::OpenFilesSnapshot;
 use crate::logging::plugin::LogPlugin;
 use crate::runtime::args::RuntimeArgsGenerator;
 
@@ -12,9 +13,13 @@ impl Create {
         Self { cfg }
     }
 
-    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<i32> {
+    pub fn exec(
+        &self,
+        log_plugin: &mut dyn LogPlugin,
+        open_files: &OpenFilesSnapshot,
+    ) -> ConmonResult<i32> {
         // Start the `runtime create` session.
-        let mut runtime_session = crate::runtime::session::RuntimeSession::new();
+        let mut runtime_session = crate::runtime::session::RuntimeSession::new(open_files.clone());
         runtime_session.launch(&self.cfg.common, self, false)?;
 
         // ===
@@ -29,7 +34,7 @@ impl Create {
         }
 
         // Wait until the `runtime create` finishes and return an error in case it fails.
-        runtime_session.wait_for_success(self.cfg.common.api_version)?;
+        runtime_session.wait_for_success(self.cfg.common.api_version, false)?;
 
         runtime_session.write_container_pid_file(&self.cfg.common)?;
 
@@ -39,9 +44,16 @@ impl Create {
         // ===
 
         // Run the eventloop to forward log messages to log plugin.
-        runtime_session.run_event_loop(log_plugin, self.cfg.common.leave_stdin_open)?;
+        runtime_session.run_event_loop(
+            log_plugin,
+            self.cfg.common.leave_stdin_open,
+            self.cfg.common.stdin,
+        )?;
 
-        Ok(0)
+        // Wait for the `runtime exec` to finish and write its exit code.
+        runtime_session.write_exit_code(self.cfg.common.api_version, false)?;
+
+        Ok(runtime_session.container_exit_code())
     }
 }
 

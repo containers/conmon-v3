@@ -1,5 +1,6 @@
 use crate::cli::ExecCfg;
 use crate::error::ConmonResult;
+use crate::exit::OpenFilesSnapshot;
 use crate::logging::plugin::LogPlugin;
 use crate::runtime::args::RuntimeArgsGenerator;
 
@@ -12,8 +13,12 @@ impl Exec {
         Self { cfg }
     }
 
-    pub fn exec(&self, log_plugin: &mut dyn LogPlugin) -> ConmonResult<i32> {
-        let mut runtime_session = crate::runtime::session::RuntimeSession::new();
+    pub fn exec(
+        &self,
+        log_plugin: &mut dyn LogPlugin,
+        open_files: &OpenFilesSnapshot,
+    ) -> ConmonResult<i32> {
+        let mut runtime_session = crate::runtime::session::RuntimeSession::new(open_files.clone());
         runtime_session.launch(&self.cfg.common, self, self.cfg.attach)?;
 
         // ===
@@ -21,12 +26,26 @@ impl Exec {
         // (See `RuntimeProcess::spawn` code and description for more information).
         // ===
 
+        // In case of `--terminal`, wait until runtime creates the console socket.
+        if self.cfg.common.terminal {
+            runtime_session.wait_for_terminal_creation()?;
+        }
+
+        // Wait until the `runtime create` finishes and return an error in case it fails.
+        runtime_session.wait_for_success(self.cfg.common.api_version, true)?;
+
+        runtime_session.write_container_pid_file(&self.cfg.common)?;
+
         // Run the eventloop to forward log messages to log plugin.
-        runtime_session.run_event_loop(log_plugin, self.cfg.common.leave_stdin_open)?;
+        runtime_session.run_event_loop(
+            log_plugin,
+            self.cfg.common.leave_stdin_open,
+            self.cfg.common.stdin,
+        )?;
 
         // Wait for the `runtime exec` to finish and write its exit code.
-        runtime_session.write_container_pid_file(&self.cfg.common)?;
-        runtime_session.write_exit_code(self.cfg.common.api_version)?;
+        // runtime_session.write_container_pid_file(&self.cfg.common)?;
+        runtime_session.write_exit_code(self.cfg.common.api_version, true)?;
 
         Ok(runtime_session.container_exit_code())
     }

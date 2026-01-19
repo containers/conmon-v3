@@ -59,7 +59,7 @@ pub fn process_winsz_ctrl_line(stdout_fd: i32, line: &str) -> ConmonResult<()> {
 /// Parses "msg_type height width\n" in `line` and acts.
 pub fn process_terminal_ctrl_line(stdout_fd: i32, line: &str) -> ConmonResult<()> {
     let parts: Vec<_> = line.split_whitespace().collect();
-    if parts.len() != 3 {
+    if parts.len() < 3 {
         return Err(ConmonError::new("Invalid control message format", 1));
     }
 
@@ -134,7 +134,10 @@ unsafe fn resize_winsz(stdout_fd: i32, height: u16, width: u16) {
 
     let ret = unsafe { libc::ioctl(stdout_fd, libc::TIOCSWINSZ, &ws) };
     if ret == -1 {
-        warn!("Failed to set process pty terminal size: {width}x{height}");
+        warn!(
+            "Failed to set process pty terminal size: {width}x{height}, {:?}",
+            Errno::last()
+        );
     }
 }
 

@@ -1,7 +1,8 @@
 use crate::error::{ConmonError, ConmonResult};
+use crate::exit::set_subreaper;
 use crate::runtime::stdio::read_pipe;
 
-use log::warn;
+use log::{info, warn};
 use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::stat::Mode;
@@ -13,7 +14,9 @@ use nix::unistd::{
 use std::env;
 use std::io::{Error, Result as IoResult};
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::process::CommandExt; // for pre_exec
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+// for pre_exec
 use std::process::{Command, Stdio, exit};
 
 /// Convert a nix::Error into std::io::Error (for use inside pre_exec closure).
@@ -90,6 +93,7 @@ impl RuntimeProcess {
     /// Spawn the runtime binary defined by `args`.
     /// The stdio is redirected to `workerfd_stdin`, `workerfd_stdout` and `workerfd_stderr`.
     /// Returns the PID.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &mut self,
         args: &[String],
@@ -98,6 +102,9 @@ impl RuntimeProcess {
         workerfd_stderr: Stdio,
         mut start_pipe_fd: Option<OwnedFd>,
         replace_listen_pid: bool,
+        logging_is_passthrough: bool,
+        double_fork: bool,
+        pidfile: &Option<PathBuf>,
     ) -> ConmonResult<i32> {
         if args.is_empty() {
             return Err(ConmonError::new(
@@ -106,21 +113,36 @@ impl RuntimeProcess {
             ));
         }
 
-        redirect_self_to_devnull()?;
+        if !logging_is_passthrough {
+            redirect_self_to_devnull()?;
+        }
 
-        unsafe {
-            match fork() {
-                // In the parent: exit immediately so the child won't be a process group leader.
-                Ok(ForkResult::Parent { .. }) => {
-                    exit(0);
-                }
-                // In the child: continue execution.
-                Ok(ForkResult::Child) => {}
-                Err(e) => {
-                    return Err(ConmonError::new(format!("Failed to fork: {e}"), 1));
+        if double_fork {
+            unsafe {
+                match fork() {
+                    // In the parent: exit immediately so the child won't be a process group leader.
+                    Ok(ForkResult::Parent { child }) => {
+                        self.pid = child.as_raw();
+                        // Store the RuntimeProcess::pid in the `conmon_pidfile`.
+                        if let Some(pidfile) = &pidfile {
+                            std::fs::write(pidfile, self.pid.to_string())?;
+                        }
+                        exit(0);
+                    }
+                    // In the child: continue execution.
+                    Ok(ForkResult::Child) => {}
+                    Err(e) => {
+                        return Err(ConmonError::new(format!("Failed to fork: {e}"), 1));
+                    }
                 }
             }
         }
+
+        // Detach from controlling terminal: new session.
+        setsid()?;
+
+        // Enable subreaper, so we can wait for container process exit code.
+        set_subreaper(true)?;
 
         // Wait with the `spawn()` until parent tells us to start the runtime
         // using the start_pipe_fd (if defined).
@@ -136,9 +158,6 @@ impl RuntimeProcess {
 
         // Child setup performed between fork and exec.
         fn child_setup(oldmask: &SigSet, replace_listen_pid: bool) -> IoResult<()> {
-            // Detach from controlling terminal: new session.
-            setsid().map_err(io_err)?;
-
             // Restore (unblock) the parent's original signal mask.
             pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(oldmask), None).map_err(io_err)?;
 
@@ -149,15 +168,18 @@ impl RuntimeProcess {
             Ok(())
         }
 
+        info!("Executing {:?}", args);
+
         // Build and spawn the child.
         let program = &args[0];
         let argv = &args[1..];
         let mut cmd = Command::new(program);
-        cmd.args(argv)
-            .stdin(workerfd_stdin)
-            .stdout(workerfd_stdout)
-            .stderr(workerfd_stderr);
-
+        cmd.args(argv);
+        if !logging_is_passthrough {
+            cmd.stdin(workerfd_stdin)
+                .stdout(workerfd_stdout)
+                .stderr(workerfd_stderr);
+        }
         unsafe {
             cmd.pre_exec(move || child_setup(&oldmask, replace_listen_pid));
         }
@@ -166,7 +188,12 @@ impl RuntimeProcess {
             .spawn()
             .map_err(|e| ConmonError::new(format!("Failed to spawn: {e}"), 1))?;
 
+        if logging_is_passthrough {
+            redirect_self_to_devnull()?;
+        }
+
         self.pid = child.id() as i32;
+        info!("Conmon PID: {}", self.pid);
         Ok(self.pid)
     }
 

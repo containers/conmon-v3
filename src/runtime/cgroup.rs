@@ -9,7 +9,7 @@ use nix::sys::statfs;
 use nix::unistd::close;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
@@ -19,11 +19,21 @@ use crate::unix_socket::{RemoteSocket, SocketType};
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Sets up OOM (out-of-memory) handling for `pid` .
+///
+/// # Arguments
+///
+/// * `pid` - The pid to setup OOM for.
+/// * `persist_dir` - Optional path into which the OOM marker files will be created.
+/// * `bundle` - Path into which the OOM marker file is created.
+///
+/// # Returns
+///
+/// * RemoteSocket to pass to event-loop.
 pub fn setup_oom_handling(
     pid: i32,
     persist_dir: &Option<PathBuf>,
     bundle: &Path,
-) -> ConmonResult<RemoteSocket> {
+) -> ConmonResult<Option<RemoteSocket>> {
     info!("Setting up OOM handler.");
     unsafe {
         let stat = statfs::statfs("/sys/fs/cgroup")?;
@@ -36,17 +46,24 @@ pub fn setup_oom_handling(
     }
 }
 
-/// Helper function that inspects /proc/[pid]/cgroup and returns the absolute
-/// filesystem path to the cgroup directory for a given `pid` and `subsystem`.
-fn process_cgroup_subsystem_path(
-    pid: i32,
-    cgroup2: bool,
-    subsystem: &str,
-) -> ConmonResult<PathBuf> {
+/// Inspects /proc/[pid]/cgroup and returns the absolute
+/// filesystem path to the cgroup directory for a given `pid`.
+///
+/// # Arguments
+///
+/// * `pid` - The pid of process to inspect.
+///
+/// # Returns
+///
+/// * Absolut path to cgroup directory.
+fn process_cgroup_subsystem_path(pid: i32) -> ConmonResult<PathBuf> {
     // Open the /proc/`pid`/cgroup file.
     let cgroups_file_path = format!("/proc/{pid}/cgroup");
     let file = match File::open(&cgroups_file_path) {
         Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(PathBuf::from(""));
+        }
         Err(e) => {
             return Err(ConmonError::new(
                 format!("Failed to open cgroups file {}: {}", cgroups_file_path, e),
@@ -64,9 +81,9 @@ fn process_cgroup_subsystem_path(
         };
 
         // Format: hierarchy-ID:controllers:path
-        let (after_first_colon, path_part) = match line.split_once(':') {
+        let path_part = match line.split_once(':') {
             Some((_, rest)) => match rest.split_once(':') {
-                Some((controllers, path)) => (controllers, path),
+                Some((_, path)) => path,
                 None => {
                     return Err(ConmonError::new(
                         format!("Error parsing cgroup, second ':' not found: {}", line),
@@ -84,50 +101,43 @@ fn process_cgroup_subsystem_path(
 
         let mut path = path_part.trim_end_matches('\n');
 
-        if cgroup2 {
-            // v2: path is directly under CGROUP_ROOT
-            let mut full = PathBuf::from(CGROUP_ROOT);
-            // path from /proc is absolute inside cgroup root, e.g. "/user.slice/..."
-            if path.starts_with('/') {
-                path = &path[1..];
-            }
-            full.push(path);
-            return Ok(full);
+        // v2: path is directly under CGROUP_ROOT
+        let mut full = PathBuf::from(CGROUP_ROOT);
+        // path from /proc is absolute inside cgroup root, e.g. "/user.slice/..."
+        if path.starts_with('/') {
+            path = &path[1..];
         }
-
-        // v1: controllers may be "memory", "cpu,cpuacct", "name=systemd", etc.
-        for ctr in after_first_colon.split(',') {
-            // "name=systemd" => "name"
-            let subpath = ctr.split('=').next().unwrap_or(ctr);
-
-            if subpath == subsystem {
-                let mut full = PathBuf::from(CGROUP_ROOT);
-                full.push(subpath);
-                // path already starts with '/', so join as string
-                if path.starts_with('/') {
-                    path = &path[1..];
-                }
-                full.push(path);
-                return Ok(full);
-            }
-        }
+        full.push(path);
+        return Ok(full);
     }
 
-    Err(ConmonError::new(
-        format!("Error finding subsystem '{}' in cgroup file", subsystem),
-        1,
-    ))
+    Err(ConmonError::new("Error parsing cgroup file", 1))
 }
 
-/// Sets up OOM handling using cgroup v2 for `pid`.
+/// Sets up OOM (out-of-memory) handling for `pid` .
+///
+/// # Arguments
+///
+/// * `pid` - The pid to setup OOM for.
+/// * `persist_dir` - Optional path into which the OOM marker files will be created.
+/// * `bundle` - Path into which the OOM marker file is created.
+///
+/// # Returns
+///
+/// * RemoteSocket to pass to event-loop.
 unsafe fn setup_oom_handling_cgroup_v2(
     pid: i32,
     persist_dir: &Option<PathBuf>,
     bundle: &Path,
-) -> ConmonResult<RemoteSocket> {
-    let cgroup2_path = process_cgroup_subsystem_path(pid, true, "")?;
-    let memory_events_file_path = cgroup2_path.join("memory.events");
+) -> ConmonResult<Option<RemoteSocket>> {
+    // Get the cgroup path.
+    let cgroup2_path = process_cgroup_subsystem_path(pid)?;
+    if cgroup2_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
 
+    // Setup inotify watch for memory.events.
+    let memory_events_file_path = cgroup2_path.join("memory.events");
     let ifd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
     if ifd < 0 {
         return Err(ConmonError::new(
@@ -137,7 +147,6 @@ unsafe fn setup_oom_handling_cgroup_v2(
     }
 
     let ifd_owned = unsafe { OwnedFd::from_raw_fd(ifd) };
-
     let cstr = CString::new(memory_events_file_path.to_string_lossy().as_bytes()).unwrap();
     if unsafe { libc::inotify_add_watch(ifd, cstr.as_ptr(), libc::IN_MODIFY) } < 0 {
         return Err(ConmonError::new(
@@ -149,6 +158,7 @@ unsafe fn setup_oom_handling_cgroup_v2(
         ));
     }
 
+    // Create new RemoteSocket and set its handler to `check_cgroup2_oom`.
     let persist_dir_clone = persist_dir.clone();
     let bundle = PathBuf::from(bundle);
     info!(
@@ -161,9 +171,23 @@ unsafe fn setup_oom_handling_cgroup_v2(
         true
     });
 
-    Ok(socket)
+    Ok(Some(socket))
 }
 
+/// Handles the memory.events file change.
+///
+/// This function is called by the event-loop when inotify watch
+/// created by `setup_oom_handling_cgroup_v2` triggers.
+///
+/// # Arguments
+///
+/// * `cgroup2_path` - The cgroup path for pid we monitor.
+/// * `persist_dir` - Optional path into which the OOM marker files will be created.
+/// * `bundle` - Path into which the OOM marker file is created.
+///
+/// # Returns
+///
+/// * RemoteSocket to pass to event-loop.
 pub fn check_cgroup2_oom(
     cgroup2_path: &Path,
     persist_dir: &Option<PathBuf>,
@@ -173,10 +197,9 @@ pub fn check_cgroup2_oom(
     static mut LAST_OOM_KILL_COUNTER: i64 = 0;
 
     unsafe {
+        // Open the memory.events file.
         let base = cgroup2_path;
-
         let memory_events_file_path = Path::new(&base).join("memory.events");
-
         let file = match File::open(&memory_events_file_path) {
             Ok(f) => f,
             Err(err) => {
@@ -195,9 +218,9 @@ pub fn check_cgroup2_oom(
             }
         };
 
+        // Read the memory.events file to detect the OOM.
         let reader = BufReader::new(file);
         let mut oom_detected = false;
-
         for line_result in reader.lines() {
             let line = match line_result {
                 Ok(l) => l,
@@ -247,10 +270,13 @@ pub fn check_cgroup2_oom(
     }
 }
 
-// // -----------------------------------------------------------------------------
-// // Create OOM marker files (v1 and v2)
-// // -----------------------------------------------------------------------------
-
+/// Creates the OOM marker files.
+///
+/// # Arguments
+///
+/// * `persist_dir` - Optional path into which the OOM marker files will be created.
+///   if not provided, the `bundle` path is used.
+/// * `bundle` - Fallback path when `persist_dir` is not provided.
 fn create_oom_files(persist_dir: &Option<PathBuf>, bundle: &Path) -> Result<(), ()> {
     info!("OOM received");
     let mut r = 0;
@@ -268,6 +294,11 @@ fn create_oom_files(persist_dir: &Option<PathBuf>, bundle: &Path) -> Result<(), 
     if r == 0 { Ok(()) } else { Err(()) }
 }
 
+/// Creates the OOM marker file.
+///
+/// # Arguments
+///
+/// * `base_path` - The path in which the OOM marker file is created.
 fn create_oom_file(base_path: &Path) -> Result<(), ()> {
     if base_path.as_os_str().is_empty() {
         return Ok(());
