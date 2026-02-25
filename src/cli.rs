@@ -454,6 +454,8 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
     log_plugin_cfg.no_container_partial_message = opts.no_container_partial_message;
     log_plugin_cfg.name = opts.name.clone();
     log_plugin_cfg.no_sync = opts.no_sync_log;
+    log_plugin_cfg.max_size = opts.log_size_max.unwrap_or_else(|| 0) as usize;
+    log_plugin_cfg.global_max_size = opts.log_global_size_max.unwrap_or_else(|| 0) as usize;
 
     Ok((plugin, log_plugin_cfg))
 }

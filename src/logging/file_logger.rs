@@ -5,10 +5,10 @@ use crate::{
     logging::plugin::{LogPlugin, LogPluginCfg},
 };
 use std::{
-    cmp::min,
-    fs::{File, OpenOptions},
-    io::Write,
+    cmp::min, fs::{File, OpenOptions}, io::Write, path::PathBuf
 };
+use std::fs::rename;
+
 
 const TSBUFLEN: usize = 44;
 
@@ -20,6 +20,11 @@ pub struct FileLogger {
     stdout_has_partial: bool,
     stderr_has_partial: bool,
     no_sync: bool,
+    max_size: u64,
+    global_max_size: u64,
+    bytes_written: u64,
+    total_bytes_written: u64,
+    path: PathBuf,
 }
 
 impl FileLogger {
@@ -41,12 +46,18 @@ impl FileLogger {
                     1,
                 )
             })?;
+        let metadata = file.metadata()?;
 
         Ok(Self {
             file,
             stdout_has_partial: false,
             stderr_has_partial: false,
             no_sync: cfg.no_sync,
+            max_size: cfg.max_size as u64,
+            global_max_size: cfg.global_max_size as u64,
+            bytes_written: metadata.len(),
+            total_bytes_written: metadata.len(),
+            path: cfg.path.clone(),
         })
     }
 
@@ -95,6 +106,33 @@ impl FileLogger {
             buf[buf.len() - 1] = 0;
         }
     }
+
+    fn reopen(path: &PathBuf) -> ConmonResult<File> {
+        // "<path>.tmp".
+        let tmp_path: PathBuf = {
+            let mut s = path.clone();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+
+        // Open temp file.
+        let new_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .map_err(|e| {
+                ConmonError::new(
+                    format!("Failed to open log file {:?}: {}", tmp_path, e),
+                    1,
+                )
+            })?;
+
+        // Replace the previous file
+        rename(tmp_path, path)?;
+        Ok(new_file)
+    }
+
 }
 
 impl Drop for FileLogger {
@@ -153,6 +191,21 @@ impl LogPlugin for FileLogger {
             Self::set_k8s_timestamp(&mut tsbuf, pipename);
 
             let ts_len = tsbuf.iter().position(|&b| b == 0).unwrap_or(tsbuf.len());
+
+            // The log message lenght + 2 for "P " or "F "
+            let mut bytes_to_be_written: u64 = ts_len as u64 + 2;
+            if partial {
+                bytes_to_be_written += 1; // The extra "\n" in the end we add later.
+            }
+
+            // If the caller specified a global max, enforce it before writing.
+            if self.global_max_size > 0 && self.total_bytes_written + bytes_to_be_written >= self.global_max_size {
+                break;
+            }
+            if self.max_size > 0 && self.bytes_written + bytes_to_be_written >= self.max_size {
+                self.file = FileLogger::reopen(&self.path)?;
+                self.bytes_written = 0;
+            }
 
             // timestamp + stream
             self.file

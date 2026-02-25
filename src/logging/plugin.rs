@@ -19,6 +19,8 @@ pub struct LogPluginCfg {
     pub no_container_partial_message: bool,
     pub name: Option<String>,
     pub no_sync: bool,
+    pub max_size: usize,
+    pub global_max_size: usize,
 }
 
 pub fn initialize_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box<dyn LogPlugin>> {
