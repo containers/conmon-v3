@@ -835,6 +835,9 @@ mod tests {
             fn write(&mut self, _is_stdout: bool, _data: &[u8]) -> ConmonResult<()> {
                 Ok(())
             }
+            fn reopen(&mut self) -> ConmonResult<()> {
+                Ok(())
+            }
         }
 
         let open_files = OpenFilesSnapshot::default();

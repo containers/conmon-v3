@@ -745,7 +745,7 @@ impl Socket {
                             let line = unsafe { std::slice::from_raw_parts(ptr, len) };
                             let line_str = String::from_utf8_lossy(line);
                             if r.socket_type == SocketType::TerminalFifo {
-                                if let Err(err) = process_terminal_ctrl_line(stdout_fd, &line_str) {
+                                if let Err(err) = process_terminal_ctrl_line(log_plugin, stdout_fd, &line_str) {
                                     warn!("failed to process terminal ctrl line: {}", err);
                                 }
                             } else if let Err(err) = process_winsz_ctrl_line(stdout_fd, &line_str) {

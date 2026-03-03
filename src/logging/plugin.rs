@@ -7,6 +7,7 @@ use crate::{
 
 pub trait LogPlugin {
     fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()>;
+    fn reopen(&mut self) -> ConmonResult<()>;
 }
 
 #[derive(Default, Debug, Clone)]
@@ -21,6 +22,9 @@ pub struct LogPluginCfg {
     pub no_sync: bool,
     pub max_size: usize,
     pub global_max_size: usize,
+    pub max_files: i32,
+    pub allowlist_dirs: Option<Vec<PathBuf>>,
+    pub rotate: bool,
 }
 
 pub fn initialize_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box<dyn LogPlugin>> {

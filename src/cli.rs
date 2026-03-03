@@ -197,12 +197,12 @@ pub struct Opts {
     pub seccomp_notify_plugins: Option<String>,
 
     /// Enable log rotation instead of truncation when log-size-max is reached
-    #[arg(long = "log-rotate", action = ArgAction::SetTrue)]
+    #[arg(long = "log-rotate", action = ArgAction::SetTrue, default_value_t = false)]
     pub log_rotate: bool,
 
     /// Number of backup log files to keep (default: 1)
-    #[arg(long = "log-max-files", value_parser = clap::value_parser!(i32), default_value_t = 1)]
-    pub log_max_files: i32,
+    #[arg(long = "log-max-files", value_parser = clap::value_parser!(i64), allow_hyphen_values = true, default_value_t = 1)]
+    pub log_max_files: i64,
 
     /// Allowed log directory (can be specified multiple times)
     #[arg(long = "log-allowlist-dir")]
@@ -447,6 +447,25 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
         warn!("--no-container-partial-message has no effect without journald log driver");
     }
 
+    // Validate and normalize log-max-files bounds.
+    let raw_max_files = opts.log_max_files;
+    if raw_max_files < 0 {
+        return Err(ConmonError::new(
+            "log-max-files must be non-negative",
+            1,
+        ));
+    }
+    if opts.log_rotate && raw_max_files == 0 {
+        return Err(ConmonError::new(
+            "log-max-files must be at least 1 when log-rotate is enabled",
+            1,
+        ));
+    }
+    if raw_max_files > i32::MAX as i64 {
+        return Err(ConmonError::new("log-max-files out of range", 1));
+    }
+    let max_files = raw_max_files as i32;
+
     log_plugin_cfg.cid = opts.cid.clone();
     log_plugin_cfg.cuuid = opts.cuuid.clone();
     log_plugin_cfg.log_labels = opts.log_labels.clone();
@@ -456,6 +475,13 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
     log_plugin_cfg.no_sync = opts.no_sync_log;
     log_plugin_cfg.max_size = opts.log_size_max.unwrap_or_else(|| 0) as usize;
     log_plugin_cfg.global_max_size = opts.log_global_size_max.unwrap_or_else(|| 0) as usize;
+    log_plugin_cfg.max_files = max_files;
+    log_plugin_cfg.allowlist_dirs = if opts.log_allowlist_dir.is_empty() {
+        None
+    } else {
+        Some(opts.log_allowlist_dir.clone())
+    };
+    log_plugin_cfg.rotate = opts.log_rotate;
 
     Ok((plugin, log_plugin_cfg))
 }
@@ -751,6 +777,47 @@ mod tests {
         let (plugin, cfg) = determine_log_plugin(&o)?;
         assert_eq!(plugin, "file"); // unchanged
         assert_eq!(cfg.path, PathBuf::from("/tmp/only-path.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn log_max_files_negative_is_rejected() {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            log_max_files: -1,
+            ..Default::default()
+        };
+
+        let err = determine_log_plugin(&o).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("log-max-files must be non-negative"));
+    }
+
+    #[test]
+    fn log_max_files_zero_with_rotate_is_rejected() {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            log_rotate: true,
+            log_max_files: 0,
+            ..Default::default()
+        };
+
+        let err = determine_log_plugin(&o).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("log-max-files must be at least 1"));
+    }
+
+    #[test]
+    fn allowlist_dirs_is_none_when_not_specified() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            ..Default::default()
+        };
+
+        let (_plugin, cfg) = determine_log_plugin(&o)?;
+        assert!(cfg.allowlist_dirs.is_none());
         Ok(())
     }
 }

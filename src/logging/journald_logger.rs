@@ -132,6 +132,10 @@ impl JournaldLogger {
 }
 
 impl LogPlugin for JournaldLogger {
+    fn reopen(&mut self) -> ConmonResult<()> {
+        Ok(())
+    }
+
     fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()> {
         // Select the right partial buffer.
         let (partial_buf, partial_buf_len) = if is_stdout {
