@@ -275,7 +275,7 @@ fn is_executable(p: &Path) -> bool {
     false
 }
 
-pub fn determine_cmd(mut opts: Opts, log_plugin: &String) -> ConmonResult<Cmd> {
+pub fn determine_cmd(mut opts: Opts, logging_passthrough: bool) -> ConmonResult<Cmd> {
     let api_version = opts.api_version.unwrap_or(0);
 
     if opts.version_flag {
@@ -368,7 +368,7 @@ pub fn determine_cmd(mut opts: Opts, log_plugin: &String) -> ConmonResult<Cmd> {
         exit_dir: opts.exit_dir,
         name: opts.name,
         no_sync_log: opts.no_sync_log,
-        logging_passthrough: log_plugin == "passthrough",
+        logging_passthrough,
         sync_flag: opts.sync_flag,
         sdnotify_socket: opts.sdnotify_socket,
     };
@@ -400,12 +400,9 @@ pub fn determine_cmd(mut opts: Opts, log_plugin: &String) -> ConmonResult<Cmd> {
     }
 }
 
-// Handles the logging related options from `opts` and returns the name of the log plugin
-// and the LogPluginCfg struct.
-pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)> {
-    let mut plugin: String = "file".into();
-    let mut log_plugin_cfg = LogPluginCfg::default();
-
+// Handles the logging related options from `opts` and returns a list of (plugin name, LogPluginCfg)
+// so that multiple log plugins can be configured (one entry per --log-path).
+pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCfg)>> {
     if opts.log_path.is_empty() {
         return Err(ConmonError::new(
             "Log driver not provided. Use --log-path",
@@ -413,41 +410,7 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
         ));
     }
 
-    // Collect paths, and possibly the plugin name from "plugin:path" entries.
-    // TODO: Support multiple log plugins at the same time.
-    for p in &opts.log_path {
-        let s = p.to_string_lossy();
-
-        if let Some((plug, path)) = s.split_once(':') {
-            let path = path.trim();
-            if !path.is_empty() {
-                log_plugin_cfg.path = path.into();
-            }
-
-            let plug = plug.trim();
-            if plug.is_empty() {
-                continue;
-            }
-            // Plugin names on filesystem cannot contain dash.
-            plugin = plug.into();
-            plugin = plugin.replace("-", "_");
-        } else if s == "journald" {
-            plugin = "journald".to_string();
-        } else if s == "passthrough" {
-            plugin = "passthrough".to_string();
-        } else {
-            // No "plugin:" prefix; treat as a path.
-            if !s.is_empty() {
-                log_plugin_cfg.path = s.to_string().into();
-            }
-        }
-    }
-
-    if opts.no_container_partial_message && plugin != "journald" {
-        warn!("--no-container-partial-message has no effect without journald log driver");
-    }
-
-    // Validate and normalize log-max-files bounds.
+    // Validate and normalize log-max-files bounds (apply to all file-based plugins).
     let raw_max_files = opts.log_max_files;
     if raw_max_files < 0 {
         return Err(ConmonError::new(
@@ -466,24 +429,71 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)>
     }
     let max_files = raw_max_files as i32;
 
-    log_plugin_cfg.cid = opts.cid.clone();
-    log_plugin_cfg.cuuid = opts.cuuid.clone();
-    log_plugin_cfg.log_labels = opts.log_labels.clone();
-    log_plugin_cfg.log_tag = opts.log_tag.clone();
-    log_plugin_cfg.no_container_partial_message = opts.no_container_partial_message;
-    log_plugin_cfg.name = opts.name.clone();
-    log_plugin_cfg.no_sync = opts.no_sync_log;
-    log_plugin_cfg.max_size = opts.log_size_max.unwrap_or_else(|| 0) as usize;
-    log_plugin_cfg.global_max_size = opts.log_global_size_max.unwrap_or_else(|| 0) as usize;
-    log_plugin_cfg.max_files = max_files;
-    log_plugin_cfg.allowlist_dirs = if opts.log_allowlist_dir.is_empty() {
-        None
-    } else {
-        Some(opts.log_allowlist_dir.clone())
+    // Base config from non-path options (shared by all plugin instances).
+    let base_cfg = LogPluginCfg {
+        path: PathBuf::new(),
+        cid: opts.cid.clone(),
+        cuuid: opts.cuuid.clone(),
+        log_tag: opts.log_tag.clone(),
+        log_labels: opts.log_labels.clone(),
+        no_container_partial_message: opts.no_container_partial_message,
+        name: opts.name.clone(),
+        no_sync: opts.no_sync_log,
+        max_size: opts.log_size_max.unwrap_or_else(|| 0) as usize,
+        global_max_size: opts.log_global_size_max.unwrap_or_else(|| 0) as usize,
+        max_files,
+        allowlist_dirs: if opts.log_allowlist_dir.is_empty() {
+            None
+        } else {
+            Some(opts.log_allowlist_dir.clone())
+        },
+        rotate: opts.log_rotate,
     };
-    log_plugin_cfg.rotate = opts.log_rotate;
 
-    Ok((plugin, log_plugin_cfg))
+    let mut entries: Vec<(String, LogPluginCfg)> = Vec::with_capacity(opts.log_path.len());
+
+    for p in &opts.log_path {
+        let s = p.to_string_lossy();
+        let mut plugin: String = "file".into();
+        let mut path = PathBuf::new();
+
+        if let Some((plug, path_str)) = s.split_once(':') {
+            let path_str = path_str.trim();
+            if !path_str.is_empty() {
+                path = path_str.into();
+            }
+            let plug = plug.trim();
+            if !plug.is_empty() {
+                plugin = plug.replace("-", "_");
+            }
+        } else if s == "journald" {
+            plugin = "journald".to_string();
+        } else if s == "passthrough" {
+            plugin = "passthrough".to_string();
+        } else if !s.is_empty() {
+            path = s.to_string().into();
+        }
+
+        let mut cfg = base_cfg.clone();
+        cfg.path = path;
+        entries.push((plugin, cfg));
+    }
+
+    // Passthrough must be the sole plugin: reject mixing with others.
+    let passthrough_count = entries.iter().filter(|(name, _)| name == "passthrough").count();
+    if passthrough_count > 0 && entries.len() > 1 {
+        return Err(ConmonError::new(
+            "passthrough log driver cannot be combined with other log drivers",
+            1,
+        ));
+    }
+
+    let has_journald = entries.iter().any(|(name, _)| name == "journald");
+    if opts.no_container_partial_message && !has_journald {
+        warn!("--no-container-partial-message has no effect without journald log driver");
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -508,8 +518,7 @@ mod tests {
             ..Default::default()
         };
         // Even if other required fields are missing, version should short-circuit
-        let log_plugin = String::from("file");
-        let cmd = determine_cmd(o, &log_plugin).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Version => {}
             _ => panic!("expected Version"),
@@ -522,8 +531,7 @@ mod tests {
         let o = Opts {
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Container ID not provided"));
         Ok(())
     }
@@ -534,8 +542,7 @@ mod tests {
             cid: Some("abc".into()),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Runtime path not provided"));
         Ok(())
     }
@@ -549,8 +556,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Attach can only be specified with exec")
@@ -569,8 +575,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("non-legacy exec session"));
         Ok(())
     }
@@ -584,8 +589,7 @@ mod tests {
             ..Default::default()
         };
         // run path (no exec/restore) requires cuuid
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Container UUID not provided"));
         Ok(())
     }
@@ -601,8 +605,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Cannot use 'exec' and 'restore'"));
         Ok(())
     }
@@ -616,8 +619,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("is not valid"));
         Ok(())
     }
@@ -635,8 +637,7 @@ mod tests {
             exec_process_spec: Some(PathBuf::from("proc.json")),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let cmd = determine_cmd(o, &log_plugin).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Exec(cfg) => {
                 assert_eq!(cfg.common.api_version, 1);
@@ -660,8 +661,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let err = determine_cmd(o, &log_plugin).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Exec process spec path not provided")
@@ -679,8 +679,7 @@ mod tests {
             restore: Some(PathBuf::from("checkpoint")),
             ..Default::default()
         };
-        let log_plugin = String::from("file");
-        let cmd = determine_cmd(o, &log_plugin).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Restore(cfg) => {
                 assert_eq!(cfg.common.cid, "abc");
@@ -702,8 +701,7 @@ mod tests {
         };
         // no bundle/container_pidfile specified -> defaults should kick in
         let cwd = std::env::current_dir()?;
-        let log_plugin = String::from("file");
-        let cmd = determine_cmd(o, &log_plugin).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Create(cfg) => {
                 // bundle defaults to cwd
@@ -733,9 +731,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file");
-        assert_eq!(cfg.path, PathBuf::from("/var/log/my.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/my.log"));
         Ok(())
     }
 
@@ -746,9 +745,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file");
-        assert_eq!(cfg.path, PathBuf::from("/var/log/app.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/app.log"));
         Ok(())
     }
 
@@ -759,9 +759,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "k8s_file");
-        assert_eq!(cfg.path, PathBuf::from("/var/log/k8s.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "k8s_file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/k8s.log"));
         Ok(())
     }
 
@@ -774,9 +775,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file"); // unchanged
-        assert_eq!(cfg.path, PathBuf::from("/tmp/only-path.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "file"); // unchanged
+        assert_eq!(entries[0].1.path, PathBuf::from("/tmp/only-path.log"));
         Ok(())
     }
 
@@ -816,8 +818,46 @@ mod tests {
             ..Default::default()
         };
 
-        let (_plugin, cfg) = determine_log_plugin(&o)?;
-        assert!(cfg.allowlist_dirs.is_none());
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].1.allowlist_dirs.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn multiple_log_paths_produce_multiple_entries() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![
+                PathBuf::from("file:/var/log/a.log"),
+                PathBuf::from("journald"),
+            ],
+            cid: Some("cid".into()),
+            cuuid: Some("cuuid".into()),
+            ..Default::default()
+        };
+
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/a.log"));
+        assert_eq!(entries[1].0, "journald");
+        assert_eq!(entries[1].1.path, PathBuf::new());
+        Ok(())
+    }
+
+    #[test]
+    fn passthrough_combined_with_other_plugin_is_rejected() {
+        let o = Opts {
+            log_path: vec![
+                PathBuf::from("passthrough"),
+                PathBuf::from("/var/log/other.log"),
+            ],
+            ..Default::default()
+        };
+
+        let err = determine_log_plugin(&o).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("passthrough log driver cannot be combined"));
     }
 }

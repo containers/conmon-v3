@@ -14,7 +14,7 @@ use conmon::exit::run_exit_command;
 use conmon::exit::snapshot_open_fds;
 use conmon::exit::write_exit_files;
 use conmon::log;
-use conmon::logging::plugin::initialize_log_plugin;
+use conmon::logging::plugin::initialize_log_plugins;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -61,13 +61,17 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
         return Version {}.exec();
     }
 
-    // Parse the log plugin to use and initialize it.
-    let (plugin_name, plugin_cfg) = determine_log_plugin(&opts)?;
-    info!("Using log plugin: {plugin_name:?} {plugin_cfg:?}");
-    let mut log_plugin = initialize_log_plugin(&plugin_name, &plugin_cfg)?;
+    // Parse the log plugin(s) to use and initialize them.
+    let plugin_entries = determine_log_plugin(&opts)?;
+    let plugin_names: Vec<&str> = plugin_entries.iter().map(|(n, _)| n.as_str()).collect();
+    info!("Using log plugin(s): {:?}", plugin_names);
+    let mut log_plugin = initialize_log_plugins(&plugin_entries)?;
+
+    // logging_passthrough: only true when the sole plugin is passthrough.
+    let logging_passthrough = plugin_entries.len() == 1 && plugin_entries[0].0 == "passthrough";
 
     // Determine the conmon subcommand to run and execute it.
-    let result = match determine_cmd(opts, &plugin_name) {
+    let result = match determine_cmd(opts, logging_passthrough) {
         Ok(cmd) => match cmd {
             Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut(), &open_files),
             Cmd::Exec(cfg) => Exec::new(cfg).exec(log_plugin.as_mut(), &open_files),
