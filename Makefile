@@ -75,6 +75,10 @@ prettier: ## Prettify supported files.
 	$(CONTAINER_RUNTIME) run -it --privileged -v ${PWD}:/w -w /w --entrypoint bash node:latest -c \
 		'npm install -g prettier && prettier -w .'
 
+.PHONY: docs
+docs: ## Generate man pages.
+	$(MAKE) -C docs docs
+
 .PHONY: clean
 clean: ## Cleanup the project files.
 	rm -rf target/

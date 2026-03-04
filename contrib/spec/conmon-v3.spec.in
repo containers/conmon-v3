@@ -27,6 +27,7 @@ BuildRequires: glibc-devel
 BuildRequires: libseccomp-devel
 BuildRequires: pkgconfig
 BuildRequires: systemd-devel
+BuildRequires: go-md2man
 
 Requires: glib2
 Requires: systemd-libs
@@ -40,10 +41,13 @@ Requires: libseccomp
 
 %build
 %{__make} release
+%{__make} docs
 
 %install
 mkdir -p %{buildroot}%{_bindir}
 install -m 0755 target/release/conmon %{buildroot}%{_bindir}/conmon-v3
+mkdir -p %{buildroot}%{_mandir}/man8
+install -m 0644 docs/conmon.8 %{buildroot}%{_mandir}/man8/conmon.8
 
 #define license tag if not already defined
 %{!?_licensedir:%global license %doc}
@@ -52,6 +56,7 @@ install -m 0755 target/release/conmon %{buildroot}%{_bindir}/conmon-v3
 %license LICENSE
 %doc README.md
 %{_bindir}/conmon-v3
+%{_mandir}/man8/conmon.8*
 
 %changelog
 * Tue Mar 03 2026 Generated from git - 0-0
