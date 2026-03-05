@@ -11,6 +11,8 @@ use log::warn;
 #[derive(Parser)]
 #[command(
     name = "conmon",
+    about = "OCI container runtime monitor",
+    long_about = "An OCI container runtime monitor (conmon v3). Monitors containers and handles logging, attach, and lifecycle.",
     override_usage = "conmon [OPTIONS] -c <CID> --runtime <PATH>",
     disable_version_flag = true
 )]
