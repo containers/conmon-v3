@@ -30,7 +30,7 @@ pub struct LogPluginCfg {
 /// Creates a single log plugin from name and config.
 fn create_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box<dyn LogPlugin>> {
     match name {
-        "none" | "passthrough" => Ok(Box::new(NoneLogger::new(cfg)?)),
+        "none" | "passthrough" | "null" | "off" => Ok(Box::new(NoneLogger::new(cfg)?)),
         "file" | "k8s_file" => Ok(Box::new(FileLogger::new(cfg)?)),
         "journald" => Ok(Box::new(JournaldLogger::new(cfg)?)),
         _ => Err(ConmonError::new(format!("No such log driver {name}"), 1)),
@@ -120,6 +120,26 @@ mod tests {
         let mut plugin = initialize_log_plugins(&entries)?;
         plugin.write(true, b"hello")?;
         plugin.write(false, b"world")?;
+        plugin.reopen()?;
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_log_plugin_null_alias_works() -> ConmonResult<()> {
+        let cfg = LogPluginCfg::default();
+        let mut plugin = initialize_log_plugin("null", &cfg)?;
+        plugin.write(true, b"test")?;
+        plugin.write(false, b"data")?;
+        plugin.reopen()?;
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_log_plugin_off_alias_works() -> ConmonResult<()> {
+        let cfg = LogPluginCfg::default();
+        let mut plugin = initialize_log_plugin("off", &cfg)?;
+        plugin.write(true, b"test")?;
+        plugin.write(false, b"data")?;
         plugin.reopen()?;
         Ok(())
     }

@@ -755,6 +755,34 @@ mod tests {
     }
 
     #[test]
+    fn null_plugin_alias_is_parsed() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("null:/var/log/null.log")],
+            ..Default::default()
+        };
+
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "null");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/null.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn off_plugin_alias_is_parsed() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("off:/var/log/off.log")],
+            ..Default::default()
+        };
+
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "off");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/off.log"));
+        Ok(())
+    }
+
+    #[test]
     fn plugin_dash_is_normalized_to_underscore() -> ConmonResult<()> {
         let o = Opts {
             log_path: vec![PathBuf::from("k8s-file:/var/log/k8s.log")],
