@@ -98,6 +98,31 @@ e2e_task:
     - make
     - make e2e
 
+# Run Podman's upstream `make localsystem` tests against this conmon
+podman_localsystem_task:
+  # Runs within Cirrus's "community cluster"
+  gce_instance:
+    image_name: "${FEDORA_NETAVARK_IMAGE}"
+    cpu: 2
+    memory: 8
+    disk: 200
+
+  script:
+    - source $CARGO_HOME/env
+    - cd $CIRRUS_WORKING_DIR
+    # Build and install conmon-v3 so Podman uses the updated binary
+    - make release
+    - make install
+    # Install dependencies needed to build and test Podman
+    - dnf install -y git golang make bats jq crun runc
+    # Fetch and build Podman from upstream main
+    - git clone --depth=1 https://github.com/containers/podman.git
+    - cd podman
+    - make binaries
+    # Explicitly point Podman at the freshly installed conmon and run localsystem tests
+    - export CONTAINERS_CONMON=/usr/bin/conmon
+    - make localsystem
+
 # This task is critical.  It updates the "last-used by" timestamp stored
 # in metadata for all VM images.  This mechanism functions in tandem with
 # an out-of-band pruning operation to remove disused VM images.
