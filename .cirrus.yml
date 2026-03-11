@@ -19,7 +19,7 @@ env:
   TRAVIS: "true"
 
   # Use the netavark image - it has the rust installed already.
-  IMAGE_SUFFIX: "c20250422t130822z-f42f41d13"
+  IMAGE_SUFFIX: "c20251211t152018z-f43f42d14"
   FEDORA_NETAVARK_IMAGE: "fedora-netavark-${IMAGE_SUFFIX}"
 
 # Only github users with write-access can define or use encrypted variables
@@ -93,7 +93,8 @@ e2e_task:
 
   script:
     - source $CARGO_HOME/env
-    - dnf install -y podman runc
+    - dnf install -y podman runc socat
+    - mkdir -p /var/run/crio
     - cd $CIRRUS_WORKING_DIR
     - make
     - make e2e
