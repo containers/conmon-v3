@@ -8,6 +8,11 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser};
 use log::warn;
 
+/// Accept any string for --log-path (including empty) so we can reject empty with "log-path must not be empty" in determine_log_plugin.
+fn parse_log_path_any(s: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(s))
+}
+
 #[derive(Parser)]
 #[command(
     name = "conmon",
@@ -78,8 +83,8 @@ pub struct Opts {
     #[arg(long = "log-level")]
     pub log_level: Option<String>,
 
-    /// Log file path (can be specified multiple times)
-    #[arg(long = "log-path", short = 'l')]
+    /// Log file path (can be specified multiple times). Empty string is accepted here and rejected later with a clear error.
+    #[arg(long = "log-path", short = 'l', value_parser = clap::builder::ValueParser::new(parse_log_path_any))]
     pub log_path: Vec<PathBuf>,
 
     /// Maximum size of log file
@@ -453,6 +458,13 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
 
     for p in &opts.log_path {
         let s = p.to_string_lossy();
+        if s.is_empty() || s == ":" {
+            return Err(ConmonError::new("log-path must not be empty", 1));
+        }
+        if s == "k8s-file" {
+            return Err(ConmonError::new("k8s-file requires a filename", 1));
+        }
+
         let mut plugin: String = "file".into();
         let mut path = PathBuf::new();
 
@@ -478,6 +490,12 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
         entries.push((plugin, cfg));
     }
 
+    for (name, cfg) in &entries {
+        if name == "k8s_file" && cfg.path.as_os_str().is_empty() {
+            return Err(ConmonError::new("k8s-file requires a filename", 1));
+        }
+    }
+
     // Passthrough must be the sole plugin: reject mixing with others.
     let passthrough_count = entries
         .iter()
@@ -491,8 +509,20 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
     }
 
     let has_journald = entries.iter().any(|(name, _)| name == "journald");
+    if has_journald {
+        if let Some(ref cid) = opts.cid {
+            if cid.chars().count() <= 12 {
+                return Err(ConmonError::new(
+                    "Container ID must be longer than 12 characters",
+                    1,
+                ));
+            }
+        }
+    }
     if opts.no_container_partial_message && !has_journald {
-        warn!("--no-container-partial-message has no effect without journald log driver");
+        let msg = "--no-container-partial-message has no effect without journald log driver";
+        warn!("{msg}");
+        eprintln!("{msg}");
     }
 
     Ok(entries)
@@ -860,7 +890,7 @@ mod tests {
                 PathBuf::from("file:/var/log/a.log"),
                 PathBuf::from("journald"),
             ],
-            cid: Some("cid".into()),
+            cid: Some("cid1234567890".into()),
             cuuid: Some("cuuid".into()),
             ..Default::default()
         };

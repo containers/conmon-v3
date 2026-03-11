@@ -9,14 +9,26 @@ use conmon::commands::create::Create;
 use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
 use conmon::commands::version::Version;
-use conmon::error::ConmonResult;
+use conmon::error::{ConmonError, ConmonResult};
 use conmon::exit::run_exit_command;
 use conmon::exit::snapshot_open_fds;
 use conmon::exit::write_exit_files;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugins;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+/// Check whether the path refers to an executable file (used for pre-validation only).
+fn is_executable(p: &Path) -> bool {
+    if let Ok(md) = fs::metadata(p) {
+        let mode = md.permissions().mode();
+        return (mode & 0o111) != 0;
+    }
+    false
+}
 
 /// Runs the conmon and returns the exit code.
 ///
@@ -59,6 +71,29 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     // even if the log_plugin cannot be initialized for whatever reason.
     if opts.version_flag {
         return Version {}.exec();
+    }
+
+    // Pre-validate core arguments so errors match conmon v2 order (e.g. cid before log-path).
+    opts.cid
+        .as_ref()
+        .ok_or_else(|| ConmonError::new("Container ID not provided. Use --cid", 1))?;
+    let api_version = opts.api_version.unwrap_or(0);
+    let cuuid_required = !opts.exec || api_version >= 1;
+    if cuuid_required && opts.cuuid.is_none() {
+        return Err(ConmonError::new(
+            "Container UUID not provided. Use --cuuid",
+            1,
+        ));
+    }
+    let runtime = opts
+        .runtime
+        .as_ref()
+        .ok_or_else(|| ConmonError::new("Runtime path not provided. Use --runtime", 1))?;
+    if !is_executable(runtime) {
+        return Err(ConmonError::new(
+            format!("Runtime path {} is not valid", runtime.display()),
+            1,
+        ));
     }
 
     // Parse the log plugin(s) to use and initialize them.
