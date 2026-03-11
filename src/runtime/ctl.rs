@@ -10,8 +10,8 @@ use nix::unistd::{mkfifo, unlink};
 
 use crate::cli::CommonCfg;
 use crate::error::{ConmonError, ConmonResult};
-use crate::unix_socket::{RemoteSocket, SocketType};
 use crate::logging::plugin::LogPlugin;
+use crate::unix_socket::{RemoteSocket, SocketType};
 
 /// Constants for `ctl` commands.
 const WIN_RESIZE_EVENT: i32 = 1;
@@ -58,7 +58,11 @@ pub fn process_winsz_ctrl_line(stdout_fd: i32, line: &str) -> ConmonResult<()> {
 }
 
 /// Parses "msg_type height width\n" in `line` and acts.
-pub fn process_terminal_ctrl_line(log_plugin: &mut dyn LogPlugin, stdout_fd: i32, line: &str) -> ConmonResult<()> {
+pub fn process_terminal_ctrl_line(
+    log_plugin: &mut dyn LogPlugin,
+    stdout_fd: i32,
+    line: &str,
+) -> ConmonResult<()> {
     let parts: Vec<_> = line.split_whitespace().collect();
     if parts.len() < 3 {
         return Err(ConmonError::new("Invalid control message format", 1));

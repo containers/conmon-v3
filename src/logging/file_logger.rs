@@ -6,10 +6,10 @@ use crate::{
 };
 
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, OFlag, AtFlags, readlink};
-use nix::sys::stat::{fstat, fstatat, stat, Mode, SFlag};
-use nix::unistd::{geteuid, getuid};
+use nix::fcntl::{AtFlags, OFlag, open, openat, readlink};
 use nix::libc;
+use nix::sys::stat::{Mode, SFlag, fstat, fstatat, stat};
+use nix::unistd::{geteuid, getuid};
 
 use std::{
     cmp::min,
@@ -234,8 +234,7 @@ impl FileLogger {
                                 Mode::empty(),
                             ),
                             None => {
-                                let dir_fd =
-                                    unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+                                let dir_fd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
                                 openat(
                                     dir_fd,
                                     name.as_c_str(),
@@ -356,11 +355,7 @@ impl FileLogger {
         )
         .map_err(|e| ConmonError::new(format!("Failed to open parent dir: {e}"), 1))?;
 
-        match fstatat(
-            &parent_fd,
-            base_c.as_c_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
+        match fstatat(&parent_fd, base_c.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(st) => {
                 let kind = SFlag::from_bits_truncate(st.st_mode);
                 if kind.contains(SFlag::S_IFLNK) {
@@ -368,15 +363,19 @@ impl FileLogger {
                 }
                 Ok(())
             }
-            Err(e) if e == Errno::ENOENT => {
+            Err(Errno::ENOENT) => {
                 // Parent directory checks
-                let pst = fstat(&parent_fd)
-                    .map_err(|e2| ConmonError::new(format!("Failed to stat parent directory: {e2}"), 1))?;
+                let pst = fstat(&parent_fd).map_err(|e2| {
+                    ConmonError::new(format!("Failed to stat parent directory: {e2}"), 1)
+                })?;
 
                 // Not world-writable
-                if (pst.st_mode & (libc::S_IWOTH as u32)) != 0 {
+                if (pst.st_mode & libc::S_IWOTH) != 0 {
                     return Err(ConmonError::new(
-                        format!("Parent directory is world-writable: {}", parent_dir.display()),
+                        format!(
+                            "Parent directory is world-writable: {}",
+                            parent_dir.display()
+                        ),
                         1,
                     ));
                 }
@@ -426,10 +425,14 @@ impl FileLogger {
         }
 
         // Validate path using secure validation
-        let _validation_fd = self.secure_validate_log_path(&self.path)?;
+        self.secure_validate_log_path(&self.path)?;
 
         // Shift: .N-1 -> .N, ...
-        let loop_start = if self.max_files > 1 { self.max_files } else { 2 };
+        let loop_start = if self.max_files > 1 {
+            self.max_files
+        } else {
+            2
+        };
         let mut had_errors = false;
 
         for i in (2..=loop_start).rev() {
@@ -441,11 +444,11 @@ impl FileLogger {
                 Err(e) => {
                     // Ignore ENOENT
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!("{}", format!(
+                        warn!(
                             "Failed to shift backup file {} to {}: {e}",
                             from.display(),
                             to.display()
-                        ));
+                        );
                         had_errors = true;
                     }
                 }
@@ -488,17 +491,17 @@ impl FileLogger {
         let backup_path = PathBuf::from(format!("{}.1", self.path.display()));
 
         let new_fd = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o640)
-                    .open(&temp_path)
-                    .map_err(|e| {
-                        ConmonError::new(
-                            format!("Failed to create new file {:?}: {}", temp_path, e),
-                            1,
-                        )
-                    })?;
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o640)
+            .open(&temp_path)
+            .map_err(|e| {
+                ConmonError::new(
+                    format!("Failed to create new file {:?}: {}", temp_path, e),
+                    1,
+                )
+            })?;
         Ok((new_fd, temp_path, backup_path))
     }
 
@@ -513,11 +516,11 @@ impl FileLogger {
 
         // Move new file into place
         if let Err(e) = std::fs::rename(temp_path, &self.path) {
-            warn!("{}", format!("Failed to move new log file into place: {e}"));
+            warn!("Failed to move new log file into place: {e}");
 
             // Try to restore original file
             if let Err(e2) = std::fs::rename(backup_path, &self.path) {
-                warn!("{}", format!("CRITICAL: Failed to restore original log file: {e2}"));
+                warn!("CRITICAL: Failed to restore original log file: {e2}");
                 warn!("Original log data may be in backup file");
             }
 
@@ -534,7 +537,7 @@ impl FileLogger {
             if !p.as_os_str().is_empty() {
                 if let Err(e) = std::fs::remove_file(p) {
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!("{}", format!("Failed to remove temporary file {}: {e}", p.display()));
+                        warn!("Failed to remove temporary file {}: {e}", p.display());
                     }
                 }
             }
@@ -549,7 +552,10 @@ impl FileLogger {
 
             // Lock old fd.
             if self.file.as_raw_fd() < 0 {
-                return Err(ConmonError::new("Cannot rotate: invalid file descriptor", 1));
+                return Err(ConmonError::new(
+                    "Cannot rotate: invalid file descriptor",
+                    1,
+                ));
             }
             if !self.lock_fd_write(self.file.as_raw_fd()) {
                 // Locked by other process => skip rotation.
@@ -559,7 +565,10 @@ impl FileLogger {
             // Validate fd still points at expected path/device/inode.
             if !self.validate_fd_path_security(&self.path) {
                 self.unlock_fd(self.file.as_raw_fd());
-                return Err(ConmonError::new("File descriptor security validation failed", 1));
+                return Err(ConmonError::new(
+                    "File descriptor security validation failed",
+                    1,
+                ));
             }
 
             // Create new temporary log file with restrictive permissions.
@@ -572,7 +581,10 @@ impl FileLogger {
             };
 
             // Shift backups and rotate.
-            if let Err(e) = self.shift_backup_files().and_then(|_| self.perform_file_rotation(&temp_path, &backup_path)) {
+            if let Err(e) = self
+                .shift_backup_files()
+                .and_then(|_| self.perform_file_rotation(&temp_path, &backup_path))
+            {
                 self.cleanup_temp_file(Some(new_fd), Some(&temp_path));
                 self.unlock_fd(self.file.as_raw_fd());
                 return Err(e);
@@ -601,15 +613,12 @@ impl FileLogger {
                 })?;
 
             if let Err(e) = std::fs::rename(&temp_path, &self.path) {
-                warn!("{}", format!("Failed to move new log file into place: {e}"));
+                warn!("Failed to move new log file into place: {e}");
                 if let Err(e2) = std::fs::remove_file(&temp_path) {
                     if e2.kind() != std::io::ErrorKind::NotFound {
                         warn!(
-                            "{}",
-                            format!(
-                                "Failed to remove temporary log file {}: {e2}",
-                                temp_path.display()
-                            )
+                            "Failed to remove temporary log file {}: {e2}",
+                            temp_path.display()
                         );
                     }
                 }
@@ -626,7 +635,9 @@ impl FileLogger {
 
     /// Rotates a log when configured so and next record would push us over `self.max_size`.
     fn rotate_if_needed(&mut self, bytes_to_be_written: u64) -> ConmonResult<()> {
-        if self.max_size > 0 && self.bytes_written.saturating_add(bytes_to_be_written) >= self.max_size {
+        if self.max_size > 0
+            && self.bytes_written.saturating_add(bytes_to_be_written) >= self.max_size
+        {
             self.rotate()?;
         }
         Ok(())
@@ -671,7 +682,8 @@ impl LogPlugin for FileLogger {
             // bytes: timestamp + "F\n"
             let bytes_to_be_written = ts_len as u64 + 2;
             if self.global_max_size > 0
-                && self.total_bytes_written.saturating_add(bytes_to_be_written) >= self.global_max_size
+                && self.total_bytes_written.saturating_add(bytes_to_be_written)
+                    >= self.global_max_size
             {
                 return Ok(());
             }
@@ -683,7 +695,9 @@ impl LogPlugin for FileLogger {
             self.file
                 .write_all(b"F\n")
                 .map_err(|e| map_err(e, "failed to write terminating F-sequence"))?;
-            self.file.flush().map_err(|e| map_err(e, "failed to flush log file"))?;
+            self.file
+                .flush()
+                .map_err(|e| map_err(e, "failed to flush log file"))?;
 
             self.bytes_written = self.bytes_written.saturating_add(bytes_to_be_written);
             self.total_bytes_written = self.total_bytes_written.saturating_add(bytes_to_be_written);
@@ -712,7 +726,8 @@ impl LogPlugin for FileLogger {
 
             // Enforce global max before writing.
             if self.global_max_size > 0
-                && self.total_bytes_written.saturating_add(bytes_to_be_written) >= self.global_max_size
+                && self.total_bytes_written.saturating_add(bytes_to_be_written)
+                    >= self.global_max_size
             {
                 break;
             }
@@ -763,7 +778,9 @@ impl LogPlugin for FileLogger {
             buflen -= line_len;
         }
 
-        self.file.flush().map_err(|e| map_err(e, "failed to flush log file"))?;
+        self.file
+            .flush()
+            .map_err(|e| map_err(e, "failed to flush log file"))?;
         Ok(())
     }
 }

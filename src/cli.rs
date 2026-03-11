@@ -415,10 +415,7 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
     // Validate and normalize log-max-files bounds (apply to all file-based plugins).
     let raw_max_files = opts.log_max_files;
     if raw_max_files < 0 {
-        return Err(ConmonError::new(
-            "log-max-files must be non-negative",
-            1,
-        ));
+        return Err(ConmonError::new("log-max-files must be non-negative", 1));
     }
     if opts.log_rotate && raw_max_files == 0 {
         return Err(ConmonError::new(
@@ -441,8 +438,8 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
         no_container_partial_message: opts.no_container_partial_message,
         name: opts.name.clone(),
         no_sync: opts.no_sync_log,
-        max_size: opts.log_size_max.unwrap_or_else(|| 0) as usize,
-        global_max_size: opts.log_global_size_max.unwrap_or_else(|| 0) as usize,
+        max_size: opts.log_size_max.unwrap_or(0) as usize,
+        global_max_size: opts.log_global_size_max.unwrap_or(0) as usize,
         max_files,
         allowlist_dirs: if opts.log_allowlist_dir.is_empty() {
             None
@@ -482,7 +479,10 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
     }
 
     // Passthrough must be the sole plugin: reject mixing with others.
-    let passthrough_count = entries.iter().filter(|(name, _)| name == "passthrough").count();
+    let passthrough_count = entries
+        .iter()
+        .filter(|(name, _)| name == "passthrough")
+        .count();
     if passthrough_count > 0 && entries.len() > 1 {
         return Err(ConmonError::new(
             "passthrough log driver cannot be combined with other log drivers",
@@ -821,9 +821,10 @@ mod tests {
         };
 
         let err = determine_log_plugin(&o).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("log-max-files must be non-negative"));
+        assert!(
+            err.to_string()
+                .contains("log-max-files must be non-negative")
+        );
     }
 
     #[test]
@@ -836,9 +837,7 @@ mod tests {
         };
 
         let err = determine_log_plugin(&o).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("log-max-files must be at least 1"));
+        assert!(err.to_string().contains("log-max-files must be at least 1"));
     }
 
     #[test]
@@ -886,8 +885,9 @@ mod tests {
         };
 
         let err = determine_log_plugin(&o).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("passthrough log driver cannot be combined"));
+        assert!(
+            err.to_string()
+                .contains("passthrough log driver cannot be combined")
+        );
     }
 }
