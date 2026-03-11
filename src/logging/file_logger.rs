@@ -288,9 +288,10 @@ impl FileLogger {
         };
 
         if fd_path != expected_canon {
-            warn!("File descriptor path mismatch: expected {}, got {}",
+            warn!(
+                "File descriptor path mismatch: expected {}, got {}",
                 expected_canon.display(),
-                fd_path.display()
+                std::path::Path::new(&fd_path).display()
             );
             return false;
         }
