@@ -21,6 +21,9 @@ env:
   # Use the netavark image - it has the rust installed already.
   IMAGE_SUFFIX: "c20251211t152018z-f43f42d14"
   FEDORA_NETAVARK_IMAGE: "fedora-netavark-${IMAGE_SUFFIX}"
+  CI_DESIRED_RUNTIME: crun    # As of 2024-05-28 there are no other supported runtimes
+  CI_DESIRED_STORAGE: overlay # overlay, vfs, or composefs (which is actually overlay)
+  PODMAN_TESTING: "/usr/bin/podman-testing"
 
 # Only github users with write-access can define or use encrypted variables
 # This credential represents a service account with access to manage both VMs
@@ -111,18 +114,19 @@ podman_localsystem_task:
   script:
     - source $CARGO_HOME/env
     - cd $CIRRUS_WORKING_DIR
+      # Install podman-tests
+    - dnf install -y podman-tests bats netavark aardvark-dns
+    # Reinstall netavark - it is removed in the image.
+    - dnf update -y netavark aardvark-dns
+    - dnf reinstall -y netavark aardvark-dns
     # Build and install conmon-v3 so Podman uses the updated binary
     - make release
-    - make install
-    # Install dependencies needed to build and test Podman
-    - dnf install -y git golang make bats jq crun runc
-    # Fetch and build Podman from upstream main
-    - git clone --depth=1 https://github.com/containers/podman.git
-    - cd podman
-    - make binaries
-    # Explicitly point Podman at the freshly installed conmon and run localsystem tests
-    - export CONTAINERS_CONMON=/usr/bin/conmon
-    - make localsystem
+    - sudo make install
+    # Double check that conmon right conmon is installed
+    - /usr/bin/conmon --version | grep -qE '^conmon version 3(\.|$)'
+    - ls -l /usr/libexec/podman
+    # Run the localsystem tests
+    - bats /usr/share/podman/test/system/
 
 # This task is critical.  It updates the "last-used by" timestamp stored
 # in metadata for all VM images.  This mechanism functions in tandem with
