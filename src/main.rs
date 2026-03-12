@@ -110,7 +110,7 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
         Ok(cmd) => match cmd {
             Cmd::Create(cfg) => Create::new(cfg).exec(log_plugin.as_mut(), &open_files),
             Cmd::Exec(cfg) => Exec::new(cfg).exec(log_plugin.as_mut(), &open_files),
-            Cmd::Restore(cfg) => Restore::new(cfg).exec(),
+            Cmd::Restore(cfg) => Restore::new(cfg).exec(log_plugin.as_mut(), &open_files),
             Cmd::Version => Version {}.exec(),
         },
         Err(e) => Err(e),
