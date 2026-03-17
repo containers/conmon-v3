@@ -13,3 +13,8 @@ latest-*.txt
 *.rej
 *.orig
 *.patch
+*.spec
+*.rpm
+/build
+/x86_64
+*.8

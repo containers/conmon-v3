@@ -8,6 +8,7 @@ env:
 
   # Rust package cache also lives here
   CARGO_HOME: "/var/cache/cargo"
+  HOME: "/root"
 
   # Overrides default location (/tmp/cirrus) for repo clone (will become $SRC)
   CIRRUS_WORKING_DIR: "/var/tmp/src/${CONMON_SLUG}"
@@ -19,8 +20,12 @@ env:
   TRAVIS: "true"
 
   # Use the netavark image - it has the rust installed already.
-  IMAGE_SUFFIX: "c20250422t130822z-f42f41d13"
+  IMAGE_SUFFIX: "c20251211t152018z-f43f42d14"
   FEDORA_NETAVARK_IMAGE: "fedora-netavark-${IMAGE_SUFFIX}"
+  CI_DESIRED_RUNTIME: crun    # As of 2024-05-28 there are no other supported runtimes
+  CI_DESIRED_STORAGE: overlay # overlay, vfs, or composefs (which is actually overlay)
+  CI_DESIRED_DATABASE: sqlite
+  PODMAN_TESTING: "/usr/bin/podman-testing"
 
 # Only github users with write-access can define or use encrypted variables
 # This credential represents a service account with access to manage both VMs
@@ -93,10 +98,37 @@ e2e_task:
 
   script:
     - source $CARGO_HOME/env
-    - dnf install -y podman runc
+    - dnf install -y podman runc socat
+    - mkdir -p /var/run/crio
     - cd $CIRRUS_WORKING_DIR
     - make
     - make e2e
+
+# Run Podman's upstream `make localsystem` tests against this conmon
+podman_localsystem_task:
+  # Runs within Cirrus's "community cluster"
+  gce_instance:
+    image_name: "${FEDORA_NETAVARK_IMAGE}"
+    cpu: 2
+    memory: 8
+    disk: 200
+
+  script:
+    - source $CARGO_HOME/env
+    - cd $CIRRUS_WORKING_DIR
+      # Install podman-tests
+    - dnf install -y podman-tests bats netavark aardvark-dns
+    # Reinstall netavark - it is removed in the image.
+    - dnf update -y netavark aardvark-dns
+    - dnf reinstall -y netavark aardvark-dns
+    # Build and install conmon-v3 so Podman uses the updated binary
+    - make release
+    - sudo make install
+    # Double check that conmon right conmon is installed
+    - /usr/bin/conmon --version | grep -qE '^conmon version 3(\.|$)'
+    - ls -l /usr/libexec/podman
+    # Run the localsystem tests
+    - bats /usr/share/podman/test/system/
 
 # This task is critical.  It updates the "last-used by" timestamp stored
 # in metadata for all VM images.  This mechanism functions in tandem with

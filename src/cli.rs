@@ -6,14 +6,22 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
+use log::warn;
+
+/// Accept any string for --log-path (including empty) so we can reject empty with "log-path must not be empty" in determine_log_plugin.
+fn parse_log_path_any(s: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(s))
+}
 
 #[derive(Parser)]
 #[command(
     name = "conmon",
+    about = "OCI container runtime monitor",
+    long_about = "An OCI container runtime monitor (conmon v3). Monitors containers and handles logging, attach, and lifecycle.",
     override_usage = "conmon [OPTIONS] -c <CID> --runtime <PATH>",
     disable_version_flag = true
 )]
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Opts {
     /// Conmon API version to use
     #[arg(long = "api-version", value_parser = clap::value_parser!(i32))]
@@ -56,7 +64,7 @@ pub struct Opts {
     pub exit_command: Option<PathBuf>,
 
     /// Additional arg to pass to the exit command. Can be specified multiple times
-    #[arg(long = "exit-command-arg")]
+    #[arg(long = "exit-command-arg", allow_hyphen_values = true)]
     pub exit_args: Vec<String>,
 
     /// Delay before invoking the exit command (in seconds)
@@ -75,8 +83,8 @@ pub struct Opts {
     #[arg(long = "log-level")]
     pub log_level: Option<String>,
 
-    /// Log file path (can be specified multiple times)
-    #[arg(long = "log-path", short = 'l')]
+    /// Log file path (can be specified multiple times). Empty string is accepted here and rejected later with a clear error.
+    #[arg(long = "log-path", short = 'l', value_parser = clap::builder::ValueParser::new(parse_log_path_any))]
     pub log_path: Vec<PathBuf>,
 
     /// Maximum size of log file
@@ -132,7 +140,7 @@ pub struct Opts {
     pub restore: Option<PathBuf>,
 
     /// Additional arg to pass to the restore command. (DEPRECATED)
-    #[arg(long = "restore-arg", hide = true)]
+    #[arg(long = "restore-arg", hide = true, allow_hyphen_values = true)]
     pub restore_args: Vec<String>,
 
     /// Path to store runtime data for the container
@@ -140,11 +148,11 @@ pub struct Opts {
     pub runtime: Option<PathBuf>,
 
     /// Additional arg to pass to the runtime. Can be specified multiple times
-    #[arg(long = "runtime-arg")]
+    #[arg(long = "runtime-arg", allow_hyphen_values = true)]
     pub runtime_args: Vec<String>,
 
     /// Additional opts to pass to the restore or exec command. Can be specified multiple times
-    #[arg(long = "runtime-opt")]
+    #[arg(long = "runtime-opt", allow_hyphen_values = true)]
     pub runtime_opts: Vec<String>,
 
     /// Path to the host's sd-notify socket to relay messages to
@@ -196,12 +204,12 @@ pub struct Opts {
     pub seccomp_notify_plugins: Option<String>,
 
     /// Enable log rotation instead of truncation when log-size-max is reached
-    #[arg(long = "log-rotate", action = ArgAction::SetTrue)]
+    #[arg(long = "log-rotate", action = ArgAction::SetTrue, default_value_t = false)]
     pub log_rotate: bool,
 
     /// Number of backup log files to keep (default: 1)
-    #[arg(long = "log-max-files", value_parser = clap::value_parser!(i32), default_value_t = 1)]
-    pub log_max_files: i32,
+    #[arg(long = "log-max-files", value_parser = clap::value_parser!(i64), allow_hyphen_values = true, default_value_t = 1)]
+    pub log_max_files: i64,
 
     /// Allowed log directory (can be specified multiple times)
     #[arg(long = "log-allowlist-dir")]
@@ -226,15 +234,29 @@ pub struct CommonCfg {
     pub runtime_opts: Vec<String>,
     pub no_pivot: bool,
     pub no_new_keyring: bool,
+    pub conmon_pidfile: Option<PathBuf>,
+    pub container_pidfile: PathBuf,
+    pub bundle: PathBuf,
+    pub full_attach: bool,
+    pub socket_dir_path: PathBuf,
+    pub stdin: bool,
+    pub leave_stdin_open: bool,
+    pub terminal: bool,
+    pub timeout: Option<i32>,
+    pub replace_listen_pid: bool,
+    pub persist_dir: Option<PathBuf>,
+    pub exit_dir: Option<PathBuf>,
+    pub name: Option<String>,
+    pub no_sync_log: bool,
+    pub logging_passthrough: bool,
+    pub sync_flag: bool,
+    pub sdnotify_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
 pub struct CreateCfg {
     pub common: CommonCfg,
-    pub bundle: PathBuf,
-    pub container_pidfile: PathBuf,
     pub systemd_cgroup: bool,
-    pub conmon_pidfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -242,7 +264,6 @@ pub struct ExecCfg {
     pub common: CommonCfg,
     pub exec_process_spec: PathBuf,
     pub attach: bool,
-    pub container_pidfile: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -250,8 +271,6 @@ pub struct RestoreCfg {
     pub common: CommonCfg,
     pub restore_path: PathBuf,
     pub systemd_cgroup: bool,
-    pub container_pidfile: PathBuf,
-    pub bundle: PathBuf,
 }
 
 /// Try to detect "executable" bit.
@@ -263,7 +282,7 @@ fn is_executable(p: &Path) -> bool {
     false
 }
 
-pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
+pub fn determine_cmd(mut opts: Opts, logging_passthrough: bool) -> ConmonResult<Cmd> {
     let api_version = opts.api_version.unwrap_or(0);
 
     if opts.version_flag {
@@ -316,6 +335,23 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         ));
     }
 
+    let cwd = std::env::current_dir()
+        .map_err(|e| ConmonError::new(format!("Failed to get working directory: {e}"), 1))?;
+
+    // container-pidfile defaults to "$cwd/pidfile-$cid" if none provided
+    let container_pidfile = opts
+        .container_pidfile
+        .take()
+        .unwrap_or_else(|| cwd.join(format!("pidfile-{}", cid)));
+
+    // bundle defaults to "$cwd" if none provided
+    let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
+
+    let socket_dir_path = opts
+        .socket_dir_path
+        .take()
+        .unwrap_or_else(|| PathBuf::from("/var/run/crio"));
+
     let common = CommonCfg {
         api_version,
         cid,
@@ -325,19 +361,24 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
         runtime_opts: opts.runtime_opts,
         no_pivot: opts.no_pivot,
         no_new_keyring: opts.no_new_keyring,
+        conmon_pidfile: opts.conmon_pidfile,
+        container_pidfile,
+        bundle,
+        full_attach: opts.full_attach,
+        socket_dir_path,
+        stdin: opts.stdin,
+        leave_stdin_open: opts.leave_stdin_open,
+        terminal: opts.terminal,
+        timeout: opts.timeout,
+        replace_listen_pid: opts.replace_listen_pid,
+        persist_dir: opts.persist_dir,
+        exit_dir: opts.exit_dir,
+        name: opts.name,
+        no_sync_log: opts.no_sync_log,
+        logging_passthrough,
+        sync_flag: opts.sync_flag,
+        sdnotify_socket: opts.sdnotify_socket,
     };
-
-    let cwd = std::env::current_dir()
-        .map_err(|e| ConmonError::new(format!("Failed to get working directory: {e}"), 1))?;
-
-    // bundle defaults to "$cwd" if none provided
-    let bundle = opts.bundle.take().unwrap_or_else(|| cwd.clone());
-
-    // container-pidfile defaults to "$cwd/pidfile-$cid" if none provided
-    let container_pidfile = opts
-        .container_pidfile
-        .take()
-        .unwrap_or_else(|| cwd.join(format!("pidfile-{}", common.cid)));
 
     // decide which subcommand this flag combination means
     if let Some(restore_path) = opts.restore.take() {
@@ -345,8 +386,6 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             common,
             restore_path,
             systemd_cgroup: opts.systemd_cgroup,
-            container_pidfile,
-            bundle,
         }))
     } else if opts.exec {
         let exec_process_spec = opts.exec_process_spec.take().ok_or_else(|| {
@@ -359,52 +398,134 @@ pub fn determine_cmd(mut opts: Opts) -> ConmonResult<Cmd> {
             common,
             exec_process_spec,
             attach: opts.attach,
-            container_pidfile,
         }))
     } else {
         Ok(Cmd::Create(CreateCfg {
             common,
-            bundle,
-            container_pidfile,
             systemd_cgroup: opts.systemd_cgroup,
-            conmon_pidfile: opts.conmon_pidfile,
         }))
     }
 }
 
-// Handles the logging related options from `opts` and returns the name of the log plugin
-// and the LogPluginCfg struct.
-pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<(String, LogPluginCfg)> {
-    let mut plugin: String = "file".into();
-    let mut log_plugin_cfg = LogPluginCfg::default();
+// Handles the logging related options from `opts` and returns a list of (plugin name, LogPluginCfg)
+// so that multiple log plugins can be configured (one entry per --log-path).
+pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCfg)>> {
+    if opts.log_path.is_empty() {
+        return Err(ConmonError::new(
+            "Log driver not provided. Use --log-path",
+            1,
+        ));
+    }
 
-    // Collect paths, and possibly the plugin name from "plugin:path" entries.
-    // TODO: Support multiple log plugins at the same time.
+    // Validate and normalize log-max-files bounds (apply to all file-based plugins).
+    let raw_max_files = opts.log_max_files;
+    if raw_max_files < 0 {
+        return Err(ConmonError::new("log-max-files must be non-negative", 1));
+    }
+    if opts.log_rotate && raw_max_files == 0 {
+        return Err(ConmonError::new(
+            "log-max-files must be at least 1 when log-rotate is enabled",
+            1,
+        ));
+    }
+    if raw_max_files > i32::MAX as i64 {
+        return Err(ConmonError::new("log-max-files out of range", 1));
+    }
+    let max_files = raw_max_files as i32;
+
+    // Base config from non-path options (shared by all plugin instances).
+    let base_cfg = LogPluginCfg {
+        path: PathBuf::new(),
+        cid: opts.cid.clone(),
+        cuuid: opts.cuuid.clone(),
+        log_tag: opts.log_tag.clone(),
+        log_labels: opts.log_labels.clone(),
+        no_container_partial_message: opts.no_container_partial_message,
+        name: opts.name.clone(),
+        no_sync: opts.no_sync_log,
+        max_size: opts.log_size_max.unwrap_or(0) as usize,
+        global_max_size: opts.log_global_size_max.unwrap_or(0) as usize,
+        max_files,
+        allowlist_dirs: if opts.log_allowlist_dir.is_empty() {
+            None
+        } else {
+            Some(opts.log_allowlist_dir.clone())
+        },
+        rotate: opts.log_rotate,
+    };
+
+    let mut entries: Vec<(String, LogPluginCfg)> = Vec::with_capacity(opts.log_path.len());
+
     for p in &opts.log_path {
         let s = p.to_string_lossy();
+        if s.is_empty() || s == ":" {
+            return Err(ConmonError::new("log-path must not be empty", 1));
+        }
+        if s == "k8s-file" {
+            return Err(ConmonError::new("k8s-file requires a filename", 1));
+        }
 
-        if let Some((plug, path)) = s.split_once(':') {
-            let path = path.trim();
-            if !path.is_empty() {
-                log_plugin_cfg.path = path.into();
+        let mut plugin: String = "file".into();
+        let mut path = PathBuf::new();
+
+        if let Some((plug, path_str)) = s.split_once(':') {
+            let path_str = path_str.trim();
+            if !path_str.is_empty() {
+                path = path_str.into();
             }
-
             let plug = plug.trim();
-            if plug.is_empty() {
-                continue;
+            if !plug.is_empty() {
+                plugin = plug.replace("-", "_");
             }
-            // Plugin names on filesystem cannot contain dash.
-            plugin = plug.into();
-            plugin = plugin.replace("-", "_");
-        } else {
-            // No "plugin:" prefix; treat as a path.
-            if !s.is_empty() {
-                log_plugin_cfg.path = s.to_string().into();
-            }
+        } else if s == "journald" {
+            plugin = "journald".to_string();
+        } else if s == "passthrough" {
+            plugin = "passthrough".to_string();
+        } else if !s.is_empty() {
+            path = s.to_string().into();
+        }
+
+        let mut cfg = base_cfg.clone();
+        cfg.path = path;
+        entries.push((plugin, cfg));
+    }
+
+    for (name, cfg) in &entries {
+        if name == "k8s_file" && cfg.path.as_os_str().is_empty() {
+            return Err(ConmonError::new("k8s-file requires a filename", 1));
         }
     }
 
-    Ok((plugin, log_plugin_cfg))
+    // Passthrough must be the sole plugin: reject mixing with others.
+    let passthrough_count = entries
+        .iter()
+        .filter(|(name, _)| name == "passthrough")
+        .count();
+    if passthrough_count > 0 && entries.len() > 1 {
+        return Err(ConmonError::new(
+            "passthrough log driver cannot be combined with other log drivers",
+            1,
+        ));
+    }
+
+    let has_journald = entries.iter().any(|(name, _)| name == "journald");
+    if has_journald {
+        if let Some(ref cid) = opts.cid {
+            if cid.chars().count() <= 12 {
+                return Err(ConmonError::new(
+                    "Container ID must be longer than 12 characters",
+                    1,
+                ));
+            }
+        }
+    }
+    if opts.no_container_partial_message && !has_journald {
+        let msg = "--no-container-partial-message has no effect without journald log driver";
+        warn!("{msg}");
+        eprintln!("{msg}");
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -429,7 +550,7 @@ mod tests {
             ..Default::default()
         };
         // Even if other required fields are missing, version should short-circuit
-        let cmd = determine_cmd(o).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Version => {}
             _ => panic!("expected Version"),
@@ -442,7 +563,7 @@ mod tests {
         let o = Opts {
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Container ID not provided"));
         Ok(())
     }
@@ -453,7 +574,7 @@ mod tests {
             cid: Some("abc".into()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Runtime path not provided"));
         Ok(())
     }
@@ -467,7 +588,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Attach can only be specified with exec")
@@ -486,7 +607,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("non-legacy exec session"));
         Ok(())
     }
@@ -500,7 +621,7 @@ mod tests {
             ..Default::default()
         };
         // run path (no exec/restore) requires cuuid
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Container UUID not provided"));
         Ok(())
     }
@@ -516,7 +637,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("Cannot use 'exec' and 'restore'"));
         Ok(())
     }
@@ -530,7 +651,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(err.to_string().contains("is not valid"));
         Ok(())
     }
@@ -548,7 +669,7 @@ mod tests {
             exec_process_spec: Some(PathBuf::from("proc.json")),
             ..Default::default()
         };
-        let cmd = determine_cmd(o).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Exec(cfg) => {
                 assert_eq!(cfg.common.api_version, 1);
@@ -572,7 +693,7 @@ mod tests {
             runtime: Some(runtime.path().to_path_buf()),
             ..Default::default()
         };
-        let err = determine_cmd(o).unwrap_err();
+        let err = determine_cmd(o, false).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Exec process spec path not provided")
@@ -590,7 +711,7 @@ mod tests {
             restore: Some(PathBuf::from("checkpoint")),
             ..Default::default()
         };
-        let cmd = determine_cmd(o).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Restore(cfg) => {
                 assert_eq!(cfg.common.cid, "abc");
@@ -612,13 +733,13 @@ mod tests {
         };
         // no bundle/container_pidfile specified -> defaults should kick in
         let cwd = std::env::current_dir()?;
-        let cmd = determine_cmd(o).expect("ok");
+        let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Create(cfg) => {
                 // bundle defaults to cwd
-                assert_eq!(cfg.bundle, cwd);
+                assert_eq!(cfg.common.bundle, cwd);
                 // container-pidfile defaults to "$cwd/pidfile-$cid"
-                assert_eq!(cfg.container_pidfile, cwd.join("pidfile-abc"));
+                assert_eq!(cfg.common.container_pidfile, cwd.join("pidfile-abc"));
             }
             _ => panic!("expected Run"),
         }
@@ -636,31 +757,16 @@ mod tests {
     }
 
     #[test]
-    fn defaults_when_no_paths() -> ConmonResult<()> {
-        let o = Opts {
-            log_path: vec![],
-            ..Default::default()
-        };
-
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file");
-        assert!(
-            cfg.path.as_os_str().is_empty(),
-            "default path should be empty"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn plain_path_without_plugin_prefix() -> ConmonResult<()> {
         let o = Opts {
             log_path: vec![PathBuf::from("/var/log/my.log")],
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file");
-        assert_eq!(cfg.path, PathBuf::from("/var/log/my.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/my.log"));
         Ok(())
     }
 
@@ -671,9 +777,38 @@ mod tests {
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file");
-        assert_eq!(cfg.path, PathBuf::from("/var/log/app.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/app.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn null_plugin_alias_is_parsed() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("null:/var/log/null.log")],
+            ..Default::default()
+        };
+
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "null");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/null.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn off_plugin_alias_is_parsed() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("off:/var/log/off.log")],
+            ..Default::default()
+        };
+
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "off");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/off.log"));
         Ok(())
     }
 
@@ -684,9 +819,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "k8s_file");
-        assert_eq!(cfg.path, PathBuf::from("/var/log/k8s.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "k8s_file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/k8s.log"));
         Ok(())
     }
 
@@ -699,9 +835,89 @@ mod tests {
             ..Default::default()
         };
 
-        let (plugin, cfg) = determine_log_plugin(&o)?;
-        assert_eq!(plugin, "file"); // unchanged
-        assert_eq!(cfg.path, PathBuf::from("/tmp/only-path.log"));
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "file"); // unchanged
+        assert_eq!(entries[0].1.path, PathBuf::from("/tmp/only-path.log"));
         Ok(())
+    }
+
+    #[test]
+    fn log_max_files_negative_is_rejected() {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            log_max_files: -1,
+            ..Default::default()
+        };
+
+        let err = determine_log_plugin(&o).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("log-max-files must be non-negative")
+        );
+    }
+
+    #[test]
+    fn log_max_files_zero_with_rotate_is_rejected() {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            log_rotate: true,
+            log_max_files: 0,
+            ..Default::default()
+        };
+
+        let err = determine_log_plugin(&o).unwrap_err();
+        assert!(err.to_string().contains("log-max-files must be at least 1"));
+    }
+
+    #[test]
+    fn allowlist_dirs_is_none_when_not_specified() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            ..Default::default()
+        };
+
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].1.allowlist_dirs.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_log_paths_produce_multiple_entries() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![
+                PathBuf::from("file:/var/log/a.log"),
+                PathBuf::from("journald"),
+            ],
+            cid: Some("cid1234567890".into()),
+            cuuid: Some("cuuid".into()),
+            ..Default::default()
+        };
+
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/a.log"));
+        assert_eq!(entries[1].0, "journald");
+        assert_eq!(entries[1].1.path, PathBuf::new());
+        Ok(())
+    }
+
+    #[test]
+    fn passthrough_combined_with_other_plugin_is_rejected() {
+        let o = Opts {
+            log_path: vec![
+                PathBuf::from("passthrough"),
+                PathBuf::from("/var/log/other.log"),
+            ],
+            ..Default::default()
+        };
+
+        let err = determine_log_plugin(&o).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("passthrough log driver cannot be combined")
+        );
     }
 }

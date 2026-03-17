@@ -1,6 +1,8 @@
 use crate::cli::RestoreCfg;
 use crate::error::ConmonResult;
-use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
+use crate::exit::OpenFilesSnapshot;
+use crate::logging::plugin::LogPlugin;
+use crate::runtime::args::RuntimeArgsGenerator;
 
 pub struct Restore {
     cfg: RestoreCfg,
@@ -11,10 +13,47 @@ impl Restore {
         Self { cfg }
     }
 
-    pub fn exec(&self) -> ConmonResult<()> {
-        let _runtime_args = generate_runtime_args(&self.cfg.common, self);
+    pub fn exec(
+        &self,
+        log_plugin: &mut dyn LogPlugin,
+        open_files: &OpenFilesSnapshot,
+    ) -> ConmonResult<i32> {
+        // Start the `runtime create` session.
+        let mut runtime_session = crate::runtime::session::RuntimeSession::new(open_files.clone());
+        runtime_session.launch(&self.cfg.common, self, false)?;
 
-        Ok(())
+        // ===
+        // Now, after the `launch()`, we are in the child process of our original process,
+        // because we double-fork in the RuntimeProcess::spawn.
+        // (See `RuntimeProcess::spawn` code and description for more information).
+        // ===
+
+        // In case of `--terminal`, wait until runtime creates the console socket.
+        if self.cfg.common.terminal {
+            runtime_session.wait_for_terminal_creation()?;
+        }
+
+        // Wait until the `runtime create` finishes and return an error in case it fails.
+        runtime_session.wait_for_success(self.cfg.common.api_version, false)?;
+
+        runtime_session.write_container_pid_file(&self.cfg.common)?;
+
+        // ===
+        // Now we wait for an external application like podman to really start the container.
+        // and handle the containers stdio or its termination.
+        // ===
+
+        // Run the eventloop to forward log messages to log plugin.
+        runtime_session.run_event_loop(
+            log_plugin,
+            self.cfg.common.leave_stdin_open,
+            self.cfg.common.stdin,
+        )?;
+
+        // Wait for the `runtime exec` to finish and write its exit code.
+        runtime_session.write_exit_code(self.cfg.common.api_version, false)?;
+
+        Ok(runtime_session.container_exit_code())
     }
 }
 
@@ -30,9 +69,18 @@ impl RuntimeArgsGenerator for Restore {
         argv.extend([
             "restore".to_string(),
             "--bundle".to_string(),
-            self.cfg.bundle.to_string_lossy().into_owned(),
+            self.cfg.common.bundle.to_string_lossy().into_owned(),
             "--pid-file".to_string(),
-            self.cfg.container_pidfile.to_string_lossy().into_owned(),
+            self.cfg
+                .common
+                .container_pidfile
+                .to_string_lossy()
+                .into_owned(),
+            "--detach".to_string(),
+            "--image-path".to_string(),
+            self.cfg.restore_path.to_string_lossy().into_owned(),
+            "--work-path".to_string(),
+            self.cfg.common.bundle.to_string_lossy().into_owned(),
         ]);
         Ok(())
     }
@@ -51,6 +99,8 @@ mod tests {
         runtime_opts: Vec<&str>,
         no_pivot: bool,
         no_new_keyring: bool,
+        pidfile: &str,
+        bundle: &str,
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
@@ -59,20 +109,15 @@ mod tests {
             runtime_opts: runtime_opts.into_iter().map(|s| s.to_string()).collect(),
             no_pivot,
             no_new_keyring,
+            container_pidfile: PathBuf::from(pidfile),
+            bundle: PathBuf::from(bundle),
             ..Default::default()
         }
     }
 
-    fn mk_restore_cfg(
-        systemd_cgroup: bool,
-        bundle: &str,
-        pidfile: &str,
-        common: CommonCfg,
-    ) -> RestoreCfg {
+    fn mk_restore_cfg(systemd_cgroup: bool, common: CommonCfg) -> RestoreCfg {
         RestoreCfg {
             systemd_cgroup,
-            bundle: PathBuf::from(bundle),
-            container_pidfile: PathBuf::from(pidfile),
             common,
             ..Default::default()
         }
@@ -86,11 +131,13 @@ mod tests {
             vec!["--optA", "X"],
             false,
             false,
+            "/tmp/pid-A",
+            "/tmp/bundle-A",
         );
-        let cfg = mk_restore_cfg(true, "/tmp/bundle-A", "/tmp/pid-A", common);
+        let cfg = mk_restore_cfg(true, common);
         let restore = Restore::new(cfg);
 
-        let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
+        let argv = generate_runtime_args(&restore.cfg.common, &restore, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
@@ -102,6 +149,11 @@ mod tests {
             "/tmp/bundle-A".into(),
             "--pid-file".into(),
             "/tmp/pid-A".into(),
+            "--detach".into(),
+            "--image-path".into(),
+            "".into(),
+            "--work-path".into(),
+            "/tmp/bundle-A".into(),
             "--optA".into(),
             "X".into(),
             "cid123".into(),
@@ -111,11 +163,19 @@ mod tests {
 
     #[test]
     fn generate_args_without_systemd_cgroup() {
-        let common = mk_common("cid456", vec![], vec!["--optB"], true, true);
-        let cfg = mk_restore_cfg(false, "/tmp/bundle-B", "/tmp/pid-B", common);
+        let common = mk_common(
+            "cid456",
+            vec![],
+            vec!["--optB"],
+            true,
+            true,
+            "/tmp/pid-B",
+            "/tmp/bundle-B",
+        );
+        let cfg = mk_restore_cfg(false, common);
         let restore = Restore::new(cfg);
 
-        let argv = generate_runtime_args(&restore.cfg.common, &restore).expect("ok");
+        let argv = generate_runtime_args(&restore.cfg.common, &restore, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
@@ -126,6 +186,11 @@ mod tests {
             "/tmp/bundle-B".into(),
             "--pid-file".into(),
             "/tmp/pid-B".into(),
+            "--detach".into(),
+            "--image-path".into(),
+            "".into(),
+            "--work-path".into(),
+            "/tmp/bundle-B".into(),
             "--no-pivot".into(),
             "--no-new-keyring".into(),
             "--optB".into(),

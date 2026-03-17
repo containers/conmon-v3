@@ -1,6 +1,8 @@
 use crate::cli::ExecCfg;
 use crate::error::ConmonResult;
-use crate::runtime::args::{RuntimeArgsGenerator, generate_runtime_args};
+use crate::exit::OpenFilesSnapshot;
+use crate::logging::plugin::LogPlugin;
+use crate::runtime::args::RuntimeArgsGenerator;
 
 pub struct Exec {
     cfg: ExecCfg,
@@ -11,10 +13,41 @@ impl Exec {
         Self { cfg }
     }
 
-    pub fn exec(&self) -> ConmonResult<()> {
-        let _runtime_args = generate_runtime_args(&self.cfg.common, self);
+    pub fn exec(
+        &self,
+        log_plugin: &mut dyn LogPlugin,
+        open_files: &OpenFilesSnapshot,
+    ) -> ConmonResult<i32> {
+        let mut runtime_session = crate::runtime::session::RuntimeSession::new(open_files.clone());
+        runtime_session.launch(&self.cfg.common, self, self.cfg.attach)?;
 
-        Ok(())
+        // ===
+        // Now, after the `launch`, we are in the child process of our original process
+        // (See `RuntimeProcess::spawn` code and description for more information).
+        // ===
+
+        // In case of `--terminal`, wait until runtime creates the console socket.
+        if self.cfg.common.terminal {
+            runtime_session.wait_for_terminal_creation()?;
+        }
+
+        // Wait until the `runtime create` finishes and return an error in case it fails.
+        runtime_session.wait_for_success(self.cfg.common.api_version, true)?;
+
+        runtime_session.write_container_pid_file(&self.cfg.common)?;
+
+        // Run the eventloop to forward log messages to log plugin.
+        runtime_session.run_event_loop(
+            log_plugin,
+            self.cfg.common.leave_stdin_open,
+            self.cfg.common.stdin,
+        )?;
+
+        // Wait for the `runtime exec` to finish and write its exit code.
+        // runtime_session.write_container_pid_file(&self.cfg.common)?;
+        runtime_session.write_exit_code(self.cfg.common.api_version, true)?;
+
+        Ok(runtime_session.container_exit_code())
     }
 }
 
@@ -27,7 +60,11 @@ impl RuntimeArgsGenerator for Exec {
         argv.extend([
             "exec".to_string(),
             "--pid-file".to_string(),
-            self.cfg.container_pidfile.to_string_lossy().into_owned(),
+            self.cfg
+                .common
+                .container_pidfile
+                .to_string_lossy()
+                .into_owned(),
             "--process".to_string(),
             self.cfg.exec_process_spec.to_string_lossy().into_owned(),
             "--detach".to_string(),
@@ -48,6 +85,7 @@ mod tests {
         runtime_opts: Vec<&str>,
         no_pivot: bool,
         no_new_keyring: bool,
+        pidfile: &str,
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
@@ -56,13 +94,13 @@ mod tests {
             runtime_opts: runtime_opts.into_iter().map(|s| s.to_string()).collect(),
             no_pivot,
             no_new_keyring,
+            container_pidfile: PathBuf::from(pidfile),
             ..Default::default()
         }
     }
 
-    fn mk_exec_cfg(pidfile: &str, proc_spec: &str, common: CommonCfg) -> ExecCfg {
+    fn mk_exec_cfg(proc_spec: &str, common: CommonCfg) -> ExecCfg {
         ExecCfg {
-            container_pidfile: PathBuf::from(pidfile),
             exec_process_spec: PathBuf::from(proc_spec),
             common,
             ..Default::default()
@@ -77,12 +115,13 @@ mod tests {
             vec!["--optA", "X"],
             false,
             false,
+            "/tmp/pidfile",
         );
-        let cfg = mk_exec_cfg("/tmp/pidfile", "/tmp/process.json", common);
+        let cfg = mk_exec_cfg("/tmp/process.json", common);
         let exec = Exec::new(cfg);
 
         let argv =
-            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec).expect("ok");
+            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
@@ -103,12 +142,12 @@ mod tests {
 
     #[test]
     fn generate_args_exec_with_generic_flags() {
-        let common = mk_common("cid456", vec![], vec!["--optB"], true, true);
-        let cfg = mk_exec_cfg("/run/pid", "/cfg/proc.json", common);
+        let common = mk_common("cid456", vec![], vec!["--optB"], true, true, "/run/pid");
+        let cfg = mk_exec_cfg("/cfg/proc.json", common);
         let exec = Exec::new(cfg);
 
         let argv =
-            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec).expect("ok");
+            crate::runtime::args::generate_runtime_args(&exec.cfg.common, &exec, None).expect("ok");
 
         let expected: Vec<String> = vec![
             "./runtime".into(),
