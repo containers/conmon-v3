@@ -8,6 +8,7 @@ env:
 
   # Rust package cache also lives here
   CARGO_HOME: "/var/cache/cargo"
+  HOME: "/root"
 
   # Overrides default location (/tmp/cirrus) for repo clone (will become $SRC)
   CIRRUS_WORKING_DIR: "/var/tmp/src/${CONMON_SLUG}"
@@ -23,6 +24,7 @@ env:
   FEDORA_NETAVARK_IMAGE: "fedora-netavark-${IMAGE_SUFFIX}"
   CI_DESIRED_RUNTIME: crun    # As of 2024-05-28 there are no other supported runtimes
   CI_DESIRED_STORAGE: overlay # overlay, vfs, or composefs (which is actually overlay)
+  CI_DESIRED_DATABASE: sqlite
   PODMAN_TESTING: "/usr/bin/podman-testing"
 
 # Only github users with write-access can define or use encrypted variables

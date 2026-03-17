@@ -51,10 +51,7 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     let open_files = snapshot_open_fds();
 
     // Start logging.
-    let mut log_path = PathBuf::new();
-    if let Some(ref bundle) = opts.bundle {
-        log_path = bundle.join("conmon-debug.log");
-    }
+    let log_path = PathBuf::new();
     log::init_logging(
         "CONMON_LOG_PATH",
         log_path,
