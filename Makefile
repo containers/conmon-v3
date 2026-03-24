@@ -4,7 +4,9 @@ CONTAINER_RUNTIME ?= podman
 BUILD_DIR ?= .build
 TEST_FLAGS ?=
 PACKAGE_NAME ?= $(shell cargo metadata --no-deps --format-version 1 | jq -r '.packages[2] | [ .name, .version ] | join("-v")')
-PREFIX ?= /usr
+PREFIX ?= /usr/local
+DATADIR ?= ${PREFIX}/share
+MANDIR ?= $(DATADIR)/man
 CI_TAG ?=
 CONMON_V2_DIR ?= conmon-v2
 CONMON_V2_URL ?= https://github.com/containers/conmon.git
@@ -37,11 +39,11 @@ help:  ## Display this help.
 ##@ Build targets:
 
 .PHONY: default
-default: ## Build the conmon binary.
+default: docs ## Build the conmon binary.
 	cargo build
 
 .PHONY: release
-release: ## Build the conmon binary in release mode.
+release: docs ## Build the conmon binary in release mode.
 	cargo build --release
 
 .PHONY: release-static
@@ -86,8 +88,10 @@ clean: ## Cleanup the project files.
 
 .PHONY: install
 install: ## Install the binary.
-	mkdir -p "${DESTDIR}$(PREFIX)/bin"
-	install -D -t "${DESTDIR}$(PREFIX)/bin" target/release/conmon
+	install -d "${DESTDIR}$(PREFIX)/bin"
+	install -m 0755 target/release/conmon "${DESTDIR}$(PREFIX)/bin/conmon-v3"
+	install -d "${DESTDIR}${MANDIR}/man8"
+	install -m 0644 docs/*.8 "${DESTDIR}${MANDIR}/man8/conmon-v3.8"
 
 .PHONY: conmon-v2
 conmon-v2: ## Fetch the conmon-v2 into "conmon-v2" directory.

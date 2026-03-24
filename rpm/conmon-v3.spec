@@ -7,17 +7,19 @@
 %global provider_prefix %{provider}.%{provider_tld}/%{project}/%{repo}
 %global import_path %{provider_prefix}
 %global git0 https://%{import_path}
-%global commit0 #COMMIT#
-%global shortcommit0 %(c=%{commit0}; echo ${c:0:8})
 
 Name: %{repo}
-Version: 0
-Release: #COMMITDATE#.git%{shortcommit0}%{?dist}
+Version: 3.0.0
+Release: %autorelease
 Summary: OCI container runtime monitor (v3)
 License: Apache-2.0
 URL: %{git0}
-Source0: %{git0}/archive/%{commit0}/%{name}-%{shortcommit0}.tar.gz
+Source0: conmon-v3-3.0.0.tar.gz
+%if %{defined golang_arches_future}
+ExclusiveArch: %{golang_arches_future}
+%else
 ExclusiveArch: aarch64 %{arm} ppc64le s390x x86_64
+%endif
 
 BuildRequires: cargo
 BuildRequires: rust
@@ -37,17 +39,13 @@ Requires: libseccomp
 %{summary}.
 
 %prep
-%autosetup -Sgit -n %{name}-%{shortcommit0}
+%autosetup -Sgit -n conmon-v3-3.0.0
 
 %build
 %{__make} release
-%{__make} docs
 
 %install
-mkdir -p %{buildroot}%{_bindir}
-install -m 0755 target/release/conmon %{buildroot}%{_bindir}/conmon-v3
-mkdir -p %{buildroot}%{_mandir}/man8
-install -m 0644 docs/conmon.8 %{buildroot}%{_mandir}/man8/conmon.8
+%{__make} DESTDIR=%{buildroot} PREFIX=%{_prefix} install
 
 #define license tag if not already defined
 %{!?_licensedir:%global license %doc}
@@ -55,10 +53,8 @@ install -m 0644 docs/conmon.8 %{buildroot}%{_mandir}/man8/conmon.8
 %files
 %license LICENSE
 %doc README.md
-%{_bindir}/conmon-v3
-%{_mandir}/man8/conmon.8*
+%{_bindir}/%{name}
+%{_mandir}/man8/%{name}.8*
 
 %changelog
-* Tue Mar 03 2026 Generated from git - 0-0
-- Snapshot build
-
+%autochangelog

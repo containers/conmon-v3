@@ -123,7 +123,8 @@ podman_localsystem_task:
     - dnf reinstall -y netavark aardvark-dns
     # Build and install conmon-v3 so Podman uses the updated binary
     - make release
-    - sudo make install
+    - sudo make PREFIX=/usr install
+    - sudo mv /usr/bin/conmon-v3 /usr/bin/conmon
     # Double check that conmon right conmon is installed
     - /usr/bin/conmon --version | grep -qE '^conmon version 3(\.|$)'
     - ls -l /usr/libexec/podman
