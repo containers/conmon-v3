@@ -32,6 +32,42 @@ In most cases, conmon should be packaged with your favorite container
 manager. However, if you'd like to try building it from source, follow
 the steps below.
 
+## Run Podman with conmon-v3
+
+To test conmon-v3 on Fedora, CentOS or RHEL, do the following:
+
+```shell
+$ sudo dnf copr enable rhcontainerbot/podman-next
+$ sudo dnf install conmon-v3
+$ sudo dnf copr disable rhcontainerbot/podman-next
+```
+
+It is important to disable the copr repository after the installation, otherwise any future `dnf update` installs the latest unreleased versions of Podman and other tools.
+
+To update conmon-v3 to latest version, enable the repository using the command line option:
+
+```shell
+$ sudo dnf --enablerepo=copr:copr.fedorainfracloud.org:rhcontainerbot:podman-next update conmon-v3
+```
+
+To switch Podman to conmon-v3, edit the `/usr/share/containers/containers.conf` and change the `conmon_path` option like this:
+
+```
+conmon_path = [
+  "/usr/bin/conmon-v3"
+]
+```
+
+To verify that Podman is really using the conmon-v3, run the `podman info` command like this:
+
+```
+$ podman info|grep conmon
+  conmon:
+    package: conmon-v3-3.0.0-1.20260324101217195131.main.fc43.x86_64
+    path: /usr/bin/conmon-v3
+    version: 'conmon version 3.0.0-dev, commit: <commit_hash>'
+```
+
 ## Dependencies
 
 These dependencies are required for the build:
