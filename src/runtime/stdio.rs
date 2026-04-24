@@ -105,7 +105,7 @@ fn recv_data_and_fds(fd: RawFd, buf: &mut [u8]) -> nix::Result<RecvResult> {
     let msg = recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsgspace), MsgFlags::empty())?;
 
     let mut fds = Vec::new();
-    let rights = msg.cmsgs().unwrap().next();
+    let rights = msg.cmsgs()?.next();
     if let Some(ControlMessageOwned::ScmRights(rights)) = rights {
         fds.extend(rights);
     }
@@ -409,4 +409,60 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::{
+        AddressFamily, ControlMessage, SockFlag, SockType, sendmsg, socketpair,
+    };
+    use std::io::IoSlice;
+
+    fn send_fds(count: usize, payload: &[u8]) -> ConmonResult<(OwnedFd, Vec<(OwnedFd, OwnedFd)>)> {
+        let (sender, receiver) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )?;
+
+        let mut keepalive = Vec::new();
+        let mut fds_to_send: Vec<RawFd> = Vec::new();
+        for _ in 0..count {
+            let (r, w) = pipe2(OFlag::O_CLOEXEC)?;
+            fds_to_send.push(r.as_raw_fd());
+            keepalive.push((r, w));
+        }
+
+        let iov = [IoSlice::new(payload)];
+        let cmsg = ControlMessage::ScmRights(&fds_to_send);
+        sendmsg::<()>(sender.as_raw_fd(), &iov, &[cmsg], MsgFlags::empty(), None)?;
+
+        Ok((receiver, keepalive))
+    }
+
+    #[test]
+    fn recv_data() -> ConmonResult<()> {
+        let payload = b"foo";
+        let (receiver, _keepalive) = send_fds(1, payload)?;
+
+        let mut buf = [0u8; 16];
+        let res = recv_data_and_fds(receiver.as_raw_fd(), &mut buf)?;
+        assert_eq!(res.n, payload.len());
+        assert_eq!(&buf[..payload.len()], payload);
+        assert_eq!(res.fds.len(), 1);
+        Ok(())
+    }
+
+    /// `recv_data_and_fds` only expects at max 4 fds in the `SCM_RIGHTS` control message.
+    #[test]
+    fn recv_data_too_many_scm_rights() -> ConmonResult<()> {
+        let (receiver, _keepalive) = send_fds(5, b"foo")?;
+
+        let mut buf = [0u8; 16];
+        let recv = recv_data_and_fds(receiver.as_raw_fd(), &mut buf);
+        assert_eq!(recv.err(), Some(Errno::ENOBUFS));
+        Ok(())
+    }
 }
