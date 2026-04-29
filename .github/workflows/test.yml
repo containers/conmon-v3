@@ -1,0 +1,120 @@
+name: Run tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y go-md2man libsystemd-dev pkg-config
+
+      - run: make
+
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev pkg-config
+
+      - run: make lint
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y go-md2man libsystemd-dev pkg-config
+
+      - run: make
+
+      - run: make unit
+
+  e2e:
+    name: E2E tests (vs conmon-v2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build + runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman runc socat bats jq go-md2man libsystemd-dev pkg-config
+          sudo mkdir -p /var/run/crio
+
+      - run: make
+
+      - run: make e2e
+
+  podman-integration:
+    name: Podman localsystem tests (Fedora)
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/fedora/fedora:latest
+      options: --privileged
+    steps:
+      - name: Install deps
+        run: |
+          dnf install -y \
+            rust cargo make jq git \
+            go-md2man systemd-devel pkgconf-pkg-config \
+            podman-tests bats netavark aardvark-dns \
+            iproute
+
+      - uses: actions/checkout@v6
+
+      - name: Mark workspace as safe (container UID mismatch)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - run: make release
+
+      - run: make PREFIX=/usr install
+
+      - name: Install conmon-v3 as /usr/bin/conmon
+        run: mv /usr/bin/conmon-v3 /usr/bin/conmon
+
+      - name: Verify conmon version
+        run: /usr/bin/conmon --version | grep -qE '^conmon version 3(\.|$)'
+
+      - name: Run podman localsystem tests
+        run: bats /usr/share/podman/test/system/
