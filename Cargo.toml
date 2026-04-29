@@ -8,7 +8,7 @@ readme = "README.md"
 description = "An OCI container runtime monitor, version 3"
 homepage = "https://github.com/containers/conmon-v3"
 repository = "https://github.com/containers/conmon-v3"
-exclude = ["/.cirrus.yml", "/.github/*"]
+exclude = ["/.github/*"]
 
 [[bin]]
 name = "conmon"

@@ -1,4 +1,5 @@
 MAKEFILE_PATH := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+SHELL := /bin/bash
 BINARY := conmon
 CONTAINER_RUNTIME ?= podman
 BUILD_DIR ?= .build
