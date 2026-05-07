@@ -85,6 +85,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y podman runc socat bats jq go-md2man libsystemd-dev pkg-config
           sudo mkdir -p /var/run/crio
+          sudo chmod 777 /var/run/crio
 
       - run: make
 
@@ -119,6 +120,9 @@ jobs:
 
       - name: Verify conmon version
         run: /usr/bin/conmon --version | grep -qE '^conmon version 3(\.|$)'
+
+      - name: Configure cgroupfs (no systemd in container)
+        run: printf '[engine]\ncgroup_manager = "cgroupfs"\n' >> /etc/containers/containers.conf
 
       - name: Run podman localsystem tests
         run: bats /usr/share/podman/test/system/
