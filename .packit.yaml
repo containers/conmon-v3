@@ -5,6 +5,15 @@
 downstream_package_name: conmon-v3
 upstream_tag_template: v{version}
 
+# fix-spec-file runs on Copr only; see .packit-copr-rpm.sh
+srpm_build_deps:
+  - cargo
+  - git-archive-all
+  - make
+
+actions:
+  fix-spec-file: "bash .packit-copr-rpm.sh"
+
 packages:
   conmon-fedora:
     pkg_tool: fedpkg
@@ -24,10 +33,14 @@ jobs:
         message: "Ephemeral COPR build failed."
     enable_net: true
     targets:
-      - fedora-all-aarch64
-      - fedora-all-x86_64
-      - fedora-eln-aarch64
-      - fedora-eln-x86_64
+      fedora-all-aarch64: {}
+      fedora-all-x86_64: {}
+      fedora-eln-aarch64:
+        additional_repos:
+          - "https://kojipkgs.fedoraproject.org/repos/eln-build/latest/aarch64/"
+      fedora-eln-x86_64:
+        additional_repos:
+          - "https://kojipkgs.fedoraproject.org/repos/eln-build/latest/x86_64/"
 
   - job: copr_build
     trigger: pull_request
@@ -52,6 +65,7 @@ jobs:
   # Run on commit to main branch
   - job: copr_build
     trigger: commit
+    packages: [conmon-fedora]
     branch: main
     owner: rhcontainerbot
     project: podman-next
