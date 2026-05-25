@@ -28,15 +28,14 @@ fi
 mkdir -p /var/run/crio
 
 # Show installed package versions
-rpm -q conmon-v3 runc || true
+rpm -q conmon-v3 runc
 
 # Run e2e tests using the installed conmon-v3 binary
 # Use timeout to ensure we don't hang waiting for background processes
 cd "$CONMON_V2_DIR/test" && timeout 840 env CONMON_BINARY="/usr/bin/conmon-v3" bats . || {
     rc=$?
     if [ $rc -eq 124 ]; then
-        echo "BATS timed out after 14 minutes (tests may have passed but processes didn't exit)"
-        exit 0  # Exit successfully since tests passed
+        echo "BATS timed out after 14 minutes" >&2
     fi
     exit $rc
 }
