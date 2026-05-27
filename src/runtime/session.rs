@@ -477,8 +477,13 @@ impl RuntimeSession {
             // On timeout, write custom error message.
             if self.timed_out {
                 let err_str = "command timed out";
-                self.sync_pipe_fd =
-                    write_or_close_sync_fd(fd, to_report, Some(err_str), api_version, true)?;
+                self.sync_pipe_fd = write_or_close_sync_fd(
+                    fd,
+                    to_report,
+                    Some(err_str),
+                    api_version,
+                    write_exit_code,
+                )?;
             } else if let Some(mainfd_stderr) = &self.mainfd_stderr {
                 // If we have stderr from runtime, read it and pass the error message to parent.
                 // TODO: We are reading just once here and if container prints more than
@@ -488,11 +493,17 @@ impl RuntimeSession {
                 let n = read_pipe(mainfd_stderr, &mut err_bytes)?;
                 let err_str = std::str::from_utf8(&err_bytes[..n])?;
                 error!("Runtime exited with error: {err_str}");
-                self.sync_pipe_fd =
-                    write_or_close_sync_fd(fd, to_report, Some(err_str), api_version, true)?;
+                self.sync_pipe_fd = write_or_close_sync_fd(
+                    fd,
+                    to_report,
+                    Some(err_str),
+                    api_version,
+                    write_exit_code,
+                )?;
             } else {
                 // We do not have any error message, so just pass None as err_str.
-                self.sync_pipe_fd = write_or_close_sync_fd(fd, to_report, None, api_version, true)?;
+                self.sync_pipe_fd =
+                    write_or_close_sync_fd(fd, to_report, None, api_version, write_exit_code)?;
             }
         }
         Ok(())
