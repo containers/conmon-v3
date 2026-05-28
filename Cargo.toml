@@ -10,6 +10,11 @@ homepage = "https://github.com/containers/conmon-v3"
 repository = "https://github.com/containers/conmon-v3"
 exclude = ["/.cirrus.yml", "/.github/*"]
 
+# Used by cargo-vendor-filterer (optional smaller RPM Source1); see Makefile vendor-tarball-filtered.
+[package.metadata.vendor-filter]
+platforms = ["*-unknown-linux-*"]
+tier = "2"
+
 [[bin]]
 name = "conmon"
 path = "src/main.rs"
