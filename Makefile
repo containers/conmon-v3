@@ -3,6 +3,10 @@ BINARY := conmon
 CONTAINER_RUNTIME ?= podman
 BUILD_DIR ?= .build
 TEST_FLAGS ?=
+# When CI is set (e.g. in GitHub Actions), keep Cargo.lock fixed (see containers/netavark Makefile).
+CARGO ?= cargo $(if $(CI),--locked,)
+# Directory for RPM Source1: conmon-v3-v$(version)-vendor.tar.gz (top-level path ./vendor/).
+VENDOR_TARBALL_DIR ?= vendor-tarball
 PACKAGE_NAME ?= $(shell cargo metadata --no-deps --format-version 1 | jq -r '.packages[2] | [ .name, .version ] | join("-v")')
 PREFIX ?= /usr/local
 DATADIR ?= ${PREFIX}/share
@@ -40,15 +44,15 @@ help:  ## Display this help.
 
 .PHONY: default
 default: docs ## Build the conmon binary.
-	cargo build
+	$(CARGO) build
 
 .PHONY: release
 release: docs ## Build the conmon binary in release mode.
-	cargo build --release
+	$(CARGO) build --release
 
 .PHONY: release-static
 release-static: ## Build the conmon binary in release-static mode.
-	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu
+	RUSTFLAGS="-C target-feature=+crt-static" $(CARGO) build --release --target x86_64-unknown-linux-gnu
 	strip -s target/x86_64-unknown-linux-gnu/release/conmon
 	ldd target/x86_64-unknown-linux-gnu/release/conmon 2>&1 | grep -qE '(statically linked)|(not a dynamic executable)'
 
@@ -59,7 +63,7 @@ test: unit e2e ## Run both `unit` and `e2e` tests
 
 .PHONY: unit
 unit: ## Run the unit tests.
-	cargo test --no-fail-fast
+	$(CARGO) test --no-fail-fast
 
 .PHONY: e2e
 e2e: conmon-v2 ## Run the e2e tests.
@@ -67,8 +71,36 @@ e2e: conmon-v2 ## Run the e2e tests.
 
 .PHONY: lint
 lint: ## Run the linter.
-	cargo fmt && git diff --exit-code
-	cargo clippy --all-targets --all-features -- -D warnings
+	$(CARGO) fmt && git diff --exit-code
+	$(CARGO) clippy --all-targets --all-features -- -D warnings
+
+##@ Vendor / RPM (offline) targets:
+
+.PHONY: vendor
+vendor: ## Populate ./vendor for offline builds (see rpm/conmon-v3.spec Source1).
+	rm -rf vendor
+	$(CARGO) vendor vendor
+
+.PHONY: install.cargo-vendor-filterer
+install.cargo-vendor-filterer: ## Install cargo-vendor-filterer (optional smaller vendor tarballs).
+	cargo install cargo-vendor-filterer
+
+.PHONY: vendor-tarball
+vendor-tarball: vendor ## Write $(VENDOR_TARBALL_DIR)/conmon-v3-v$(version)-vendor.tar.gz for RPM Source1.
+	@set -euo pipefail; \
+	version="$$(grep '^version' Cargo.toml | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*//; s/^\"//; s/\"$$//')"; \
+	mkdir -p "$(VENDOR_TARBALL_DIR)"; \
+	tar --exclude-vcs -czf "$(VENDOR_TARBALL_DIR)/conmon-v3-v$$version-vendor.tar.gz" vendor; \
+	echo "Wrote $(VENDOR_TARBALL_DIR)/conmon-v3-v$$version-vendor.tar.gz"
+
+.PHONY: vendor-tarball-filtered
+vendor-tarball-filtered: release install.cargo-vendor-filterer ## Smaller vendor tarball via cargo-vendor-filterer.
+	@set -euo pipefail; \
+	version="$$(grep '^version' Cargo.toml | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*//; s/^\"//; s/\"$$//')"; \
+	mkdir -p "$(VENDOR_TARBALL_DIR)"; \
+	cargo vendor-filterer --format=tar.gz --prefix vendor/; \
+	mv vendor.tar.gz "$(VENDOR_TARBALL_DIR)/conmon-v3-v$$version-vendor.tar.gz"; \
+	echo "Wrote $(VENDOR_TARBALL_DIR)/conmon-v3-v$$version-vendor.tar.gz"
 
 ##@ Utility targets:
 
@@ -85,13 +117,29 @@ docs: ## Generate man pages.
 clean: ## Cleanup the project files.
 	rm -rf target/
 	rm -rf conmon-v2/
+	rm -rf vendor vendor-tarball
 
 .PHONY: install
-install: ## Install the binary.
+install: docs ## Install the binary.
 	install -d "${DESTDIR}$(PREFIX)/bin"
-	install -m 0755 target/release/conmon "${DESTDIR}$(PREFIX)/bin/conmon-v3"
+	@set -eu; \
+	bin=""; \
+	if [ -x target/rpm/conmon ]; then \
+		bin="target/rpm/conmon"; \
+	elif [ -x target/release/conmon ]; then \
+		bin="target/release/conmon"; \
+	elif [ -x target/debug/conmon ]; then \
+		bin="target/debug/conmon"; \
+	else \
+		echo "ERROR: no conmon binary found. Build one of:"; \
+		echo "  - make (debug)"; \
+		echo "  - make release"; \
+		echo "  - rpm build (produces target/rpm/conmon)"; \
+		exit 1; \
+	fi; \
+	install -m 0755 "$$bin" "${DESTDIR}$(PREFIX)/bin/conmon-v3"
 	install -d "${DESTDIR}${MANDIR}/man8"
-	install -m 0644 docs/*.8 "${DESTDIR}${MANDIR}/man8/conmon-v3.8"
+	install -m 0644 docs/conmon.8 "${DESTDIR}${MANDIR}/man8/conmon-v3.8"
 
 .PHONY: conmon-v2
 conmon-v2: ## Fetch the conmon-v2 into "conmon-v2" directory.
