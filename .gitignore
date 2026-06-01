@@ -3,6 +3,7 @@
 /target
 /result
 /vendor
+/vendor-tarball
 .build
 .cargo-upgrades
 latest-*.txt
