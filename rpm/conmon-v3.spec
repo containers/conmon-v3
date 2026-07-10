@@ -8,6 +8,9 @@
 %global repo conmon-v3
 # Cargo.toml version (hyphen); RPM Version uses tilde for ordering.
 %global upstream_version 3.0.0-dev
+# Forge snapshot; bump for manual SRPMs (Packit/Copr sets this from HEAD).
+%global commit 13fa97af947777881ecbf0cbf7238bee11292360
+%global shortcommit %(c=%{commit}; echo ${c:0:7})
 
 # Build environment toggles.
 %global conmon_is_rhel 0%{?rhel:1}
@@ -32,7 +35,7 @@ License:        %{shrink:
 }
 
 URL:            %{forgeurl}
-Source0:        %{forgeurl}/archive/v%{upstream_version}/%{repo}-%{upstream_version}.tar.gz
+Source0:        %{forgeurl}/archive/%{commit}.tar.gz#/%{repo}-%{shortcommit}.tar.gz
 Source1:        %{forgeurl}/releases/download/v%{upstream_version}/%{repo}-v%{upstream_version}-vendor.tar.gz
 
 %if %{defined golang_arches_future}
@@ -61,7 +64,7 @@ Requires:       libseccomp
 %{summary}.
 
 %prep
-%autosetup -Sgit -n %{repo}-%{upstream_version} -p1
+%autosetup -Sgit -n %{repo}-%{commit} -p1
 %if %{defined copr_username} || %{defined packit_no_vendor_tarball}
 %cargo_prep -N
 # %%cargo_prep always sets [net] offline = true (Koji); Copr/Packit need crates.io with enable_net.
