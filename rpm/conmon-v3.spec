@@ -14,10 +14,8 @@
 
 # Build environment toggles.
 %global conmon_is_rhel 0%{?rhel:1}
-%global conmon_is_copr 0%{?copr_username:1}
-%global conmon_is_packit_no_vendor 0%{?packit_no_vendor_tarball:1}
 %global conmon_use_rust_toolset_macros %{conmon_is_rhel}
-%global conmon_use_vendor_tarball 0%{?fedora}%{?rhel} && (0%{?fedora} || 0%{?rhel} >= 10) && !%{conmon_is_copr} && !%{conmon_is_packit_no_vendor}
+%global conmon_use_vendor_tarball 0%{?fedora}%{?rhel} && (0%{?fedora} || 0%{?rhel} >= 10)
 
 Name:           %{repo}
 Version:        %(echo %{upstream_version} | sed 's/-/~/')
@@ -65,17 +63,12 @@ Requires:       libseccomp
 
 %prep
 %autosetup -Sgit -n %{repo}-%{commit} -p1
-%if %{defined copr_username} || %{defined packit_no_vendor_tarball}
-%cargo_prep -N
-# %%cargo_prep always sets [net] offline = true (Koji); Copr/Packit need crates.io with enable_net.
-sed -i 's/^offline = true$/offline = false/' .cargo/config.toml
-%else
 tar fx %{SOURCE1}
-%if 0%{?fedora} || 0%{?rhel} >= 10
+# %%cargo_prep sets [net] offline = true and replaces crates.io with vendor sources.
+%if %{conmon_use_vendor_tarball}
 %cargo_prep -v vendor
 %else
 %cargo_prep -V 1
-%endif
 %endif
 
 %build
