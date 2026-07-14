@@ -71,16 +71,15 @@ jobs:
     project: podman-next
     enable_net: true
 
-  # The conmon-v3 project is not yet ready for downstream sync.
   # Downstream sync for Fedora
-  # - job: propose_downstream
-  #   trigger: release
-  #   packages: [conmon-fedora]
-  #   update_release: false
-  #   dist_git_branches:
-  #     - fedora-all
+  - job: propose_downstream
+    trigger: release
+    packages: [conmon-fedora]
+    update_release: false
+    dist_git_branches:
+      - fedora-all
 
-  # The conmon-v3 project is not yet ready for downstream sync.
+  # The conmon-v3 project is not yet ready for CentOS Stream.
   # # Downstream sync for CentOS Stream
   # - job: propose_downstream
   #   trigger: release
@@ -89,15 +88,14 @@ jobs:
   #   dist_git_branches:
   #     - c10s
 
-  # The conmon-v3 project is not in Fedora yet.
-  # - job: koji_build
-  #   trigger: commit
-  #   packages: [conmon-fedora]
-  #   dist_git_branches:
-  #     - fedora-all
+  - job: koji_build
+    trigger: commit
+    packages: [conmon-fedora]
+    dist_git_branches:
+      - fedora-all
 
-  # - job: bodhi_update
-  #   trigger: commit
-  #   packages: [conmon-fedora]
-  #   dist_git_branches:
-  #     - fedora-branched # rawhide updates are created automatically
+  - job: bodhi_update
+    trigger: commit
+    packages: [conmon-fedora]
+    dist_git_branches:
+      - fedora-branched # rawhide updates are created automatically
