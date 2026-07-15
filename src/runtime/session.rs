@@ -775,7 +775,7 @@ impl RuntimeSession {
     pub fn wait_for_terminal_creation(&mut self) -> ConmonResult<()> {
         debug!("Waiting for terminal creation.");
         if let Some(cs) = self.console_socket.take() {
-            self.terminal_socket = Some(receive_console_fd(cs)?);
+            self.terminal_socket = Some(receive_console_fd(cs, self.process.pid())?);
         }
         debug!("Terminal created.");
         Ok(())

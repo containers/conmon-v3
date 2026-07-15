@@ -570,7 +570,8 @@ impl UnixSocket {
                     RemoteSocket::new(self.socket_type, unsafe { OwnedFd::from_raw_fd(new_fd) });
                 Ok(Some(remote))
             }
-            Err(Errno::EWOULDBLOCK) => Ok(None),
+            Err(Errno::EINTR) => self.accept(),
+            Err(Errno::EAGAIN) => Ok(None),
             Err(e) => {
                 eprintln!("warn: Failed to accept client connection on attach socket: {e}");
                 Ok(None)
