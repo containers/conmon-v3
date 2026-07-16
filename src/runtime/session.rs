@@ -465,6 +465,14 @@ impl RuntimeSession {
 
         // Send exit code toe sync_pipe.
         if let Some(fd) = self.sync_pipe_fd.take() {
+            // Once create has reported the container PID, it must not write another
+            // response to the sync pipe, even if the runtime later exits or times out.
+            // Exec (write_exit_code=true) writes the final exit status.
+            if !write_exit_code && self.container_started {
+                self.sync_pipe_fd = Some(fd);
+                return Ok(());
+            }
+
             // Prepare the exit code according to the `write_exit_code`.
             let mut to_report = -1;
 
@@ -474,11 +482,8 @@ impl RuntimeSession {
                 to_report = -self.exit_code;
             }
 
-            // On timeout, write custom error message.
-            if self.timed_out {
-                let err_str = "command timed out";
-                self.sync_pipe_fd =
-                    write_or_close_sync_fd(fd, to_report, Some(err_str), api_version, true)?;
+            let err_msg = if self.timed_out {
+                Some("command timed out".to_string())
             } else if let Some(mainfd_stderr) = &self.mainfd_stderr {
                 // If we have stderr from runtime, read it and pass the error message to parent.
                 // TODO: We are reading just once here and if container prints more than
@@ -486,14 +491,20 @@ impl RuntimeSession {
                 // This might be a problem, but the original conmon-v2 code behaves the same way.
                 let mut err_bytes = [0u8; 8192];
                 let n = read_pipe(mainfd_stderr, &mut err_bytes)?;
-                let err_str = std::str::from_utf8(&err_bytes[..n])?;
+                let err_str = String::from_utf8_lossy(&err_bytes[..n]);
                 error!("Runtime exited with error: {err_str}");
-                self.sync_pipe_fd =
-                    write_or_close_sync_fd(fd, to_report, Some(err_str), api_version, true)?;
+                Some(err_str.into_owned())
             } else {
-                // We do not have any error message, so just pass None as err_str.
-                self.sync_pipe_fd = write_or_close_sync_fd(fd, to_report, None, api_version, true)?;
-            }
+                None
+            };
+
+            self.sync_pipe_fd = write_or_close_sync_fd(
+                fd,
+                to_report,
+                err_msg.as_deref(),
+                api_version,
+                write_exit_code,
+            )?;
         }
         Ok(())
     }
@@ -847,6 +858,73 @@ mod tests {
         assert!(
             msg.contains("RuntimeSession called without stdio"),
             "unexpected error message: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_exit_code_skips_sync_pipe_after_create_success() -> ConmonResult<()> {
+        use crate::runtime::stdio::create_pipe;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::fd::AsFd;
+
+        let (sync_r, sync_w) = create_pipe()?;
+        let (stderr_r, stderr_w) = create_pipe()?;
+        write(&stderr_w, b"late runtime error\n")?;
+        drop(stderr_w);
+
+        let mut sess = RuntimeSession {
+            sync_pipe_fd: Some(sync_w),
+            mainfd_stderr: Some(stderr_r),
+            container_started: true,
+            container_status: 0,
+            timeout: 0,
+            timed_out: true,
+            exit_code: 1,
+            ..Default::default()
+        };
+        let sync_w_fd = sess.sync_pipe_fd.as_ref().unwrap().as_raw_fd();
+
+        sess.write_exit_code(0, false)?;
+
+        assert!(sess.sync_pipe_fd.is_some());
+        assert_eq!(sess.sync_pipe_fd.as_ref().unwrap().as_raw_fd(), sync_w_fd);
+
+        let mut pollfds = [PollFd::new(sync_r.as_fd(), PollFlags::POLLIN)];
+        let ready = poll(&mut pollfds, PollTimeout::ZERO)?;
+        assert_eq!(ready, 0, "sync pipe should have no pending data");
+        Ok(())
+    }
+
+    #[test]
+    fn write_exit_code_reports_negative_pid_on_create_failure() -> ConmonResult<()> {
+        use crate::runtime::stdio::{create_pipe, read_pipe};
+        use serde_json::Value;
+
+        let (sync_r, sync_w) = create_pipe()?;
+        let (stderr_r, stderr_w) = create_pipe()?;
+        write(&stderr_w, b"runc create failed: bad config\n")?;
+        drop(stderr_w);
+
+        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+        sess.sync_pipe_fd = Some(sync_w);
+        sess.mainfd_stderr = Some(stderr_r);
+        sess.exit_code = 1;
+        sess.container_started = false;
+
+        sess.write_exit_code(0, false)?;
+
+        let mut buf = [0u8; 8192];
+        let n = read_pipe(&sync_r, &mut buf)?;
+        let output = std::str::from_utf8(&buf[..n])?;
+        let v: Value = serde_json::from_str(output)?;
+        assert_eq!(v.get("pid").unwrap(), -1);
+        assert!(
+            v.get("message")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("runc create failed")
         );
         Ok(())
     }
