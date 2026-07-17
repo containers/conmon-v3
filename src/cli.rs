@@ -481,6 +481,10 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
             plugin = "journald".to_string();
         } else if s == "passthrough" {
             plugin = "passthrough".to_string();
+        } else if s == "none" || s == "null" || s == "off" {
+            // Bare driver names (no ':') must not be treated as file paths.
+            // Matches conmon-v2: `--log-path none` disables logging.
+            plugin = s.to_string();
         } else if !s.is_empty() {
             path = s.to_string().into();
         }
@@ -781,6 +785,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "file");
         assert_eq!(entries[0].1.path, PathBuf::from("/var/log/app.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn bare_none_null_off_are_drivers_not_paths() -> ConmonResult<()> {
+        for name in ["none", "null", "off"] {
+            let o = Opts {
+                log_path: vec![PathBuf::from(name)],
+                ..Default::default()
+            };
+            let entries = determine_log_plugin(&o)?;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, name);
+            assert!(entries[0].1.path.as_os_str().is_empty());
+        }
         Ok(())
     }
 
