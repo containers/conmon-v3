@@ -218,20 +218,25 @@ impl RemoteSocket {
         Ok(n)
     }
 
-    /// Returns a pointer + length to the next newline-terminated line.
+    /// Returns an owned copy of the next complete line or, when allowed,
+    /// the remaining partial line.
     ///
-    /// After returning the line, it advances buf_start and compacts whatever remains.
+    /// Consumes the returned line by advancing `buf_start`. Remaining data stays
+    /// in place until `read()` compacts the buffer when more space is needed.
     ///
     /// # Returns
     ///
-    /// * (pointer to line, length of the line)
-    /// * None if no complete line is available.
+    /// * Owned bytes of the line. Complete lines include the trailing `\n`.
+    ///   Partial lines (when `allow_partial` is `true`) may omit the newline.
+    ///   The returned `Vec` remains valid after the internal buffer is updated.
+    /// * `None` if the buffer is empty, or if no complete line is available and
+    ///   partial lines are not allowed.
     ///
     /// # Arguments
     ///
-    /// * `allow_partial` - If true, if returns the buffer content even if it does
-    ///   not end with a new-line character.
-    pub fn next_line(&mut self, allow_partial: bool) -> Option<(*const u8, usize)> {
+    /// * `allow_partial` - When `true`, returns any remaining buffered bytes even
+    ///   if they do not end with a newline.
+    pub fn next_line(&mut self, allow_partial: bool) -> Option<Vec<u8>> {
         // Search for '\n' in the available buffer slice.
         if let Some(rel) = self.buf[self.buf_start..self.buf_end]
             .iter()
@@ -239,10 +244,7 @@ impl RemoteSocket {
         {
             let line_start = self.buf_start;
             let line_end = line_start + rel + 1; // include '\n'
-            let len = line_end - line_start;
-
-            // Get raw pointer BEFORE altering the buffer.
-            let ptr = self.buf[line_start..line_end].as_ptr();
+            let line = self.buf[line_start..line_end].to_vec();
 
             // Advance buffer start.
             self.buf_start = line_end;
@@ -251,27 +253,20 @@ impl RemoteSocket {
             if self.buf_start == self.buf_end {
                 self.buf_start = 0;
                 self.buf_end = 0;
-            } else {
-                self.compact_buffer();
             }
 
-            return Some((ptr, len));
+            return Some(line);
         }
 
         // No '\n' found
         if allow_partial && self.buf_start < self.buf_end {
-            let line_start = self.buf_start;
-            let line_end = self.buf_end;
-            let len = line_end - line_start;
-
-            // Raw pointer to remaining data
-            let ptr = self.buf[line_start..line_end].as_ptr();
+            let line = self.buf[self.buf_start..self.buf_end].to_vec();
 
             // Consume everything
             self.buf_start = 0;
             self.buf_end = 0;
 
-            return Some((ptr, len));
+            return Some(line);
         }
 
         None
@@ -725,13 +720,12 @@ impl Socket {
                             let (notify_fd, notify_addr) =
                                 make_notify_socket_and_addr(notify_path)?;
                             // Handle all complete lines.
-                            while let Some((ptr, len)) = r.next_line(true) {
-                                let line = unsafe { std::slice::from_raw_parts(ptr, len) };
-                                let line_str = String::from_utf8_lossy(line);
+                            while let Some(line) = r.next_line(true) {
+                                let line_str = String::from_utf8_lossy(&line);
                                 info!("Received systemd notify line: {}", line_str);
                                 sendto(
                                     notify_fd.as_raw_fd(),
-                                    line,
+                                    &line,
                                     &notify_addr,
                                     MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
                                 )?;
@@ -741,9 +735,8 @@ impl Socket {
                     SocketType::TerminalFifo | SocketType::ConsoleFifo => {
                         // We received control message for "ctlr" or "winsz".
                         // Handle all complete lines.
-                        while let Some((ptr, len)) = r.next_line(false) {
-                            let line = unsafe { std::slice::from_raw_parts(ptr, len) };
-                            let line_str = String::from_utf8_lossy(line);
+                        while let Some(line) = r.next_line(false) {
+                            let line_str = String::from_utf8_lossy(&line);
                             if r.socket_type == SocketType::TerminalFifo {
                                 if let Err(err) =
                                     process_terminal_ctrl_line(log_plugin, stdout_fd, &line_str)
@@ -763,5 +756,102 @@ impl Socket {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn socket_with_buffered_data(data: &[u8], socket_type: SocketType) -> RemoteSocket {
+        let (r, _w) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("pipe");
+        let mut socket = RemoteSocket::new(socket_type, r);
+        assert!(
+            data.len() <= socket.buf.len(),
+            "test data exceeds RemoteSocket buffer capacity"
+        );
+        let len = data.len();
+        socket.buf[..len].copy_from_slice(data);
+        socket.buf_start = 0;
+        socket.buf_end = len;
+        socket
+    }
+
+    #[test]
+    fn next_line_returns_both_lines_when_buffer_has_two_newlines() {
+        let mut socket = socket_with_buffered_data(b"1 80 24\n2 0 0\n", SocketType::TerminalFifo);
+
+        let first = socket.next_line(false).expect("first line");
+        assert_eq!(first, b"1 80 24\n");
+
+        let second = socket.next_line(false).expect("second line");
+        assert_eq!(second, b"2 0 0\n");
+
+        assert!(socket.next_line(false).is_none());
+        assert_eq!(socket.buf_start, 0);
+        assert_eq!(socket.buf_end, 0);
+    }
+
+    #[test]
+    fn next_line_owned_result_remains_valid_after_next_call() {
+        let mut socket = socket_with_buffered_data(b"a\nbc\n", SocketType::ConsoleFifo);
+
+        let first = socket.next_line(false).expect("first line");
+        let second = socket.next_line(false).expect("second line");
+
+        assert_eq!(first, b"a\n");
+        assert_eq!(second, b"bc\n");
+    }
+
+    #[test]
+    fn next_line_extracts_second_line_without_eager_compaction() {
+        let mut socket = socket_with_buffered_data(b"a\nbc\n", SocketType::ConsoleFifo);
+
+        assert_eq!(socket.next_line(false).as_deref(), Some(b"a\n".as_slice()),);
+        assert!(socket.buf_start > 0);
+
+        assert_eq!(socket.next_line(false).as_deref(), Some(b"bc\n".as_slice()),);
+    }
+
+    #[test]
+    fn next_line_allow_partial_returns_trailing_bytes_without_newline() {
+        let mut socket = socket_with_buffered_data(b"READY=1", SocketType::Notify);
+
+        let line = socket.next_line(true).expect("partial line");
+        assert_eq!(line, b"READY=1");
+        assert!(socket.next_line(true).is_none());
+    }
+
+    #[test]
+    fn next_line_preserves_incomplete_trailing_data() {
+        let mut socket = socket_with_buffered_data(b"first\npartial", SocketType::ConsoleFifo);
+
+        assert_eq!(
+            socket.next_line(false).as_deref(),
+            Some(b"first\n".as_slice()),
+        );
+
+        assert!(socket.next_line(false).is_none());
+
+        assert_eq!(&socket.buf[socket.buf_start..socket.buf_end], b"partial");
+    }
+
+    #[test]
+    fn next_line_allow_partial_returns_complete_then_partial_line() {
+        let mut socket = socket_with_buffered_data(b"READY=1\nSTATUS=running", SocketType::Notify);
+
+        assert_eq!(
+            socket.next_line(true).as_deref(),
+            Some(b"READY=1\n".as_slice()),
+        );
+
+        assert_eq!(
+            socket.next_line(true).as_deref(),
+            Some(b"STATUS=running".as_slice()),
+        );
+
+        assert!(socket.next_line(true).is_none());
+        assert_eq!(socket.buf_start, 0);
+        assert_eq!(socket.buf_end, 0);
     }
 }
