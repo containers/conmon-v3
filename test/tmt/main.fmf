@@ -46,6 +46,7 @@
     test: bash podman.sh
     require:
         - conmon-v3
+        - runc
     duration: 60m
     environment:
         PODMAN_TESTING: /usr/bin/podman-testing
