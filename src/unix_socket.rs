@@ -611,6 +611,44 @@ fn make_notify_socket_and_addr(socket_path: &Path) -> nix::Result<(OwnedFd, Unix
     Ok((fd, addr))
 }
 
+/// Exact sd-notify lines conmon forwards to the host (matches conmon v2).
+const NOTIFY_PASSON_LINES: &[&str] = &[
+    "READY=1",
+    "RELOADING=1",
+    "STOPPING=1",
+    "WATCHDOG=1",
+    "WATCHDOG=trigger",
+];
+
+/// sd-notify line prefixes conmon forwards to the host (matches conmon v2).
+const NOTIFY_PASSON_PREFIXES: &[&str] = &["STATUS=", "ERRNO=", "BUSERROR=", "MONOTONIC_USEC="];
+
+/// Returns whether a single notify line should be relayed to the host socket.
+fn should_forward_notify_line(line: &str) -> bool {
+    NOTIFY_PASSON_LINES.contains(&line)
+        || NOTIFY_PASSON_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+}
+
+/// Filter a notify datagram, keeping only whitelisted lines (matches conmon v2).
+fn filter_notify_payload(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in data.split(|&b| b == b'\n' || b == b'\r') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(line_str) = std::str::from_utf8(line) else {
+            continue;
+        };
+        if should_forward_notify_line(line_str) {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
 /// Enum representing UnixSocket, RemoteSocket or invalid socket.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -719,24 +757,26 @@ impl Socket {
                         r.clear_buffer();
                     }
                     SocketType::Notify => {
-                        // We received something from "notify.sock" from the container. We need
-                        // to forward it to host system's systemd.
+                        // Relay whitelisted sd-notify lines from the container to the host.
+                        // Some messages (e.g. BARRIER=1) are intentionally dropped; see conmon v2.
                         if let Some(notify_path) = &sdnotify_socket {
-                            let (notify_fd, notify_addr) =
-                                make_notify_socket_and_addr(notify_path)?;
-                            // Handle all complete lines.
-                            while let Some((ptr, len)) = r.next_line(true) {
-                                let line = unsafe { std::slice::from_raw_parts(ptr, len) };
-                                let line_str = String::from_utf8_lossy(line);
-                                info!("Received systemd notify line: {}", line_str);
+                            let payload = filter_notify_payload(&r.buf[..bytes_read]);
+                            if !payload.is_empty() {
+                                let (notify_fd, notify_addr) =
+                                    make_notify_socket_and_addr(notify_path)?;
+                                info!(
+                                    "Forwarding systemd notify: {}",
+                                    String::from_utf8_lossy(&payload)
+                                );
                                 sendto(
                                     notify_fd.as_raw_fd(),
-                                    line,
+                                    &payload,
                                     &notify_addr,
                                     MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
                                 )?;
                             }
                         }
+                        r.clear_buffer();
                     }
                     SocketType::TerminalFifo | SocketType::ConsoleFifo => {
                         // We received control message for "ctlr" or "winsz".
@@ -763,5 +803,55 @@ impl Socket {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod notify_filter_tests {
+    use super::*;
+
+    #[test]
+    fn forwards_ready_line() {
+        assert_eq!(filter_notify_payload(b"READY=1\n"), b"READY=1\n");
+    }
+
+    #[test]
+    fn drops_barrier_line() {
+        assert_eq!(filter_notify_payload(b"BARRIER=1\n"), b"");
+    }
+
+    #[test]
+    fn drops_barrier_but_keeps_ready() {
+        assert_eq!(filter_notify_payload(b"READY=1\nBARRIER=1\n"), b"READY=1\n");
+    }
+
+    #[test]
+    fn drops_concatenated_unlisted_line() {
+        assert_eq!(filter_notify_payload(b"READY=1BARRIER=1\n"), b"");
+    }
+
+    #[test]
+    fn forwards_status_prefix() {
+        assert_eq!(
+            filter_notify_payload(b"STATUS=starting\n"),
+            b"STATUS=starting\n"
+        );
+    }
+
+    #[test]
+    fn forwards_multiple_allowed_lines() {
+        assert_eq!(
+            filter_notify_payload(b"STATUS=ok\nREADY=1\nBARRIER=1\n"),
+            b"STATUS=ok\nREADY=1\n"
+        );
+    }
+
+    #[test]
+    fn should_forward_notify_line_matches_v2_whitelist() {
+        assert!(should_forward_notify_line("READY=1"));
+        assert!(should_forward_notify_line("WATCHDOG=trigger"));
+        assert!(should_forward_notify_line("STATUS=foo"));
+        assert!(!should_forward_notify_line("BARRIER=1"));
+        assert!(!should_forward_notify_line("READY=1BARRIER=1"));
     }
 }
