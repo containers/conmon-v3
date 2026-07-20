@@ -15,6 +15,8 @@
     adjust:
         enabled: false
         when: initiator is not defined or initiator != packit
+    environment:
+        RUST_BACKTRACE: 1
 
 /unit:
     summary: Unit tests
@@ -27,6 +29,8 @@
     adjust:
         enabled: false
         when: initiator is not defined or initiator != packit
+    environment:
+        RUST_BACKTRACE: 1
 
 /e2e:
     summary: End-to-end tests
@@ -40,6 +44,8 @@
         - runc
         - socat
     duration: 15m
+    environment:
+        RUST_BACKTRACE: 1
 
 /podman:
     summary: Podman system tests with conmon-v3
@@ -47,6 +53,8 @@
     require:
         - conmon-v3
         - runc
+        - crun
     duration: 60m
     environment:
         PODMAN_TESTING: /usr/bin/podman-testing
+        RUST_BACKTRACE: 1
