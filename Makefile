@@ -69,6 +69,22 @@ unit: ## Run the unit tests.
 e2e: conmon-v2 ## Run the e2e tests.
 	CONMON_BINARY="$(MAKEFILE_PATH)target/debug/conmon" conmon-v2/test/run-tests.sh
 
+.PHONY: .install.fmt
+.install.fmt:
+	@if ! cargo fmt --version >/dev/null 2>&1; then \
+		if command -v rustfmt >/dev/null 2>&1; then \
+			mkdir -p ~/.cargo/bin; \
+			echo '#!/bin/bash' > ~/.cargo/bin/cargo-fmt; \
+			echo 'exec rustfmt "$$@"' >> ~/.cargo/bin/cargo-fmt; \
+			chmod +x ~/.cargo/bin/cargo-fmt; \
+			export PATH="$$HOME/.cargo/bin:$$PATH"; \
+			echo "Created cargo-fmt wrapper in ~/.cargo/bin/"; \
+		else \
+			echo "Error: rustfmt not found" >&2; \
+			exit 1; \
+		fi \
+	fi
+
 .PHONY: lint
 lint: ## Run the linter.
 	$(CARGO) fmt && git diff --exit-code
