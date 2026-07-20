@@ -5,7 +5,7 @@ set -exo pipefail
 uname -r
 
 # Install dependencies
-dnf install -y podman-tests bats
+dnf install -y podman-tests bats conmon-v3
 
 # Show installed package versions
 rpm -q conmon-v3 podman containers-common-extra crun runc || true
