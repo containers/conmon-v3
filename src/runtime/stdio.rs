@@ -11,16 +11,23 @@ use nix::{
     libc::{SHUT_RD, shutdown},
     poll::{PollFd, PollFlags, poll},
     sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg},
-    unistd::{pipe2, read},
+    sys::wait::{Id, WaitPidFlag, WaitStatus, waitid},
+    unistd::{Pid, pipe2, read},
 };
 
 use std::{
     io::{self, IoSliceMut},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use log::{debug, info};
+
+/// Maximum time to wait for the runtime to connect on `--console-socket` and send the pty fd.
+const CONSOLE_SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+// Poll interval used while waiting for runtime connection / fd delivery.
+const CONSOLE_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Creates new pipe and return read/write fds.
 ///
@@ -114,7 +121,9 @@ fn recv_data_and_fds(fd: RawFd, buf: &mut [u8]) -> nix::Result<RecvResult> {
 
 /// Accepts the console_socket connection and returns the fd sent over it.
 ///
-/// This function blocks until the fd is received.
+/// Polls the listen socket until the runtime connects or the runtime process exits.
+/// When the runtime exits, any already-queued connection is drained before failing.
+/// A timeout prevents conmon from blocking forever if the runtime never connects.
 ///
 /// # Returns
 ///
@@ -123,49 +132,242 @@ fn recv_data_and_fds(fd: RawFd, buf: &mut [u8]) -> nix::Result<RecvResult> {
 /// # Arguments
 ///
 /// * `console_socket` - The `UnixSocket` to receive the console file-descriptor from.
+/// * `runtime_pid` - PID of the runtime child (e.g. crun/runc) to detect early exit.
 ///
 /// # Errors
 ///
 /// * [`ConmonError`] on any error.
-pub fn receive_console_fd(console_socket: UnixSocket) -> ConmonResult<RemoteSocket> {
-    // Block on accept until we have some connection.
-    let remote = console_socket.accept()?;
-    if let Some(r) = remote {
-        // We actually do not care about the data received. We care only about fd.
-        let mut buf = [0u8; 8192];
-        match recv_data_and_fds(r.fd.as_raw_fd(), &mut buf) {
-            Ok(res) => {
-                let n = res.n;
-                if n > 0 {
-                    let received_fd = res.fds.first();
-                    if let Some(rfd) = received_fd {
-                        debug!("Received console fd {}", rfd);
-                        let owned_fd = unsafe { OwnedFd::from_raw_fd(*rfd) };
-                        let ret = RemoteSocket::new(SocketType::Terminal, owned_fd);
-                        return Ok(ret);
-                    }
-                } else {
+pub fn receive_console_fd(
+    console_socket: UnixSocket,
+    runtime_pid: i32,
+) -> ConmonResult<RemoteSocket> {
+    receive_console_fd_with_timeout(console_socket, runtime_pid, CONSOLE_SOCKET_WAIT_TIMEOUT)
+}
+
+fn receive_console_fd_with_timeout(
+    console_socket: UnixSocket,
+    runtime_pid: i32,
+    timeout: Duration,
+) -> ConmonResult<RemoteSocket> {
+    let listen_fd = console_socket.fd().ok_or_else(|| {
+        ConmonError::new(
+            "Cannot receive console socket file descriptor without console socket.",
+            1,
+        )
+    })?;
+
+    let deadline = Instant::now() + timeout;
+
+    // Phase 1: wait for and accept the console-socket connection.
+    let remote = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ConmonError::new(
+                "Timed out waiting for runtime to connect on console socket",
+                1,
+            ));
+        }
+
+        if let Some(remote) = accept_if_ready(
+            &console_socket,
+            listen_fd.as_fd(),
+            deadline,
+            CONSOLE_SOCKET_POLL_INTERVAL,
+        )? {
+            break remote;
+        }
+
+        if let Some(status) = runtime_exit_status(runtime_pid)? {
+            // Important race handling: even after observing runtime exit, do one last
+            // non-blocking accept attempt in case the connection is already queued.
+            if let Some(remote) =
+                accept_if_ready(&console_socket, listen_fd.as_fd(), deadline, Duration::ZERO)?
+            {
+                break remote;
+            }
+
+            return Err(ConmonError::new(
+                format!("Runtime process exited with status {status} before sending console fd"),
+                1,
+            ));
+        }
+    };
+
+    // Phase 2: wait for and receive the passed terminal fd.
+    let conn_fd = &remote.fd;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ConmonError::new(
+                "Timed out waiting for console fd over console socket",
+                1,
+            ));
+        }
+
+        if !poll_until(conn_fd.as_fd(), deadline, CONSOLE_SOCKET_POLL_INTERVAL)? {
+            continue;
+        }
+
+        let mut buf = [0u8; 1];
+        match recv_data_and_fds(conn_fd.as_raw_fd(), &mut buf) {
+            Ok(res) if res.n > 0 => {
+                let Some(rfd) = res.fds.first() else {
                     return Err(ConmonError::new(
                         "No file descriptor received using console socket.",
                         1,
                     ));
-                }
+                };
+
+                debug!("Received console fd {}", rfd);
+                let owned_fd = unsafe { OwnedFd::from_raw_fd(*rfd) };
+                return Ok(RemoteSocket::new(SocketType::Terminal, owned_fd));
             }
+            Ok(_) => {
+                return Err(ConmonError::new(
+                    "Console socket closed before file descriptor was received.",
+                    1,
+                ));
+            }
+            #[allow(unreachable_patterns)] // EAGAIN and EWOULDBLOCK are distinct on some platforms.
+            Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => continue,
+            Err(e) => {
+                return Err(ConmonError::new(
+                    format!("Error receiving file descriptor using console socket: {e}"),
+                    1,
+                ));
+            }
+        }
+    }
+}
+
+/// Checks whether the runtime child process has exited without blocking.
+///
+/// Uses non-blocking `waitid(WNOHANG | WNOWAIT | WEXITED)` so callers can detect
+/// early runtime failure without reaping the child.
+///
+/// # Returns
+///
+/// * `Some(status)` when the runtime has exited or been signaled.
+/// * `None` when the runtime is still running, or when no PID was provided.
+///
+/// # Arguments
+///
+/// * `runtime_pid` - PID of the runtime child (e.g. crun/runc), or a non-positive
+///   value to skip the check.
+///
+/// # Errors
+///
+/// * [`ConmonError`] if `waitid` fails unexpectedly.
+fn runtime_exit_status(runtime_pid: i32) -> ConmonResult<Option<i32>> {
+    if runtime_pid <= 0 {
+        return Ok(None);
+    }
+
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
+
+    loop {
+        match waitid(Id::Pid(Pid::from_raw(runtime_pid)), flags) {
+            Ok(WaitStatus::Exited(_, status)) => return Ok(Some(status)),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(Some(128 + sig as i32)),
+            Ok(_) | Err(Errno::ECHILD) => return Ok(None),
+            Err(Errno::EINTR) => continue,
+            Err(e) => {
+                return Err(ConmonError::new(
+                    format!("waitid({runtime_pid}) failed: {e}"),
+                    1,
+                ));
+            }
+        }
+    }
+}
+
+/// If `fd` becomes ready before `deadline`, try to `accept()` a console-socket
+/// connection.
+///
+/// This is used to handle the case where the runtime may have connected
+/// (and queued the connection) but conmon detects runtime exit between loop
+/// iterations.
+///
+/// # Returns
+///
+/// * `Ok(Some(remote))` when a connection was accepted.
+/// * `Ok(None)` when `fd` did not become ready within `max_wait` (bounded
+///   by `deadline`).
+///
+/// # Errors
+///
+/// * [`ConmonError`] when `poll_until` indicates the socket is ready but
+///   `accept()` returned `None`, or when `accept()` fails.
+fn accept_if_ready(
+    console_socket: &UnixSocket,
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+    max_wait: Duration,
+) -> ConmonResult<Option<RemoteSocket>> {
+    if !poll_until(fd, deadline, max_wait)? {
+        return Ok(None);
+    }
+
+    match console_socket.accept()? {
+        Some(remote) => Ok(Some(remote)),
+        None => Err(ConmonError::new(
+            "Console socket ready but accept returned no connection",
+            1,
+        )),
+    }
+}
+
+/// Polls `fd` until it becomes readable or the deadline expires.
+///
+/// Returns `true` for readiness events that indicate progress is possible
+/// (readable, hangup, error) or the fd is no longer valid (POLLNVAL).
+///
+/// # Returns
+///
+/// * `Ok(true)` if the poll indicates readiness.
+/// * `Ok(false)` if the deadline is reached without a readiness event.
+///
+/// # Errors
+///
+/// * [`ConmonError`] if `poll()` fails (other than EINTR, which is retried).
+fn poll_until(fd: BorrowedFd<'_>, deadline: Instant, max_wait: Duration) -> ConmonResult<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        let wait = remaining.min(max_wait);
+        let timeout_ms = wait.as_millis().min(u16::MAX as u128) as u16;
+
+        let mut pollfds = [PollFd::new(fd, PollFlags::POLLIN)];
+        match poll(&mut pollfds, timeout_ms) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                if let Some(revents) = pollfds[0].revents() {
+                    if revents.intersects(
+                        PollFlags::POLLIN
+                            | PollFlags::POLLHUP
+                            | PollFlags::POLLERR
+                            | PollFlags::POLLNVAL,
+                    ) {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+            Err(Errno::EINTR) => continue,
             Err(e) => {
                 return Err(ConmonError::new(
                     format!(
-                        "Error receiving file descriptor using console socket: {}",
-                        e
+                        "poll() failed while waiting for console socket: {}",
+                        io::Error::from_raw_os_error(e as i32)
                     ),
                     1,
                 ));
             }
         }
     }
-    Err(ConmonError::new(
-        "Cannot receive console socket file descriptor without console socket.",
-        1,
-    ))
 }
 
 /// Handles incomming data on fds and forwards them to right destination.
@@ -414,10 +616,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unix_socket::{SocketType, UnixSocket};
     use nix::sys::socket::{
         AddressFamily, ControlMessage, SockFlag, SockType, sendmsg, socketpair,
     };
+    use nix::sys::stat::Mode;
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+    use nix::unistd::{ForkResult, fork};
     use std::io::IoSlice;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
+
+    fn wait_exited_nowait(child: Pid) -> ConmonResult<()> {
+        let wait_flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
+        loop {
+            match waitid(Id::Pid(child), wait_flags)? {
+                WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => return Ok(()),
+                WaitStatus::StillAlive => thread::sleep(Duration::from_millis(10)),
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    fn spawn_send_terminal_fd(listen_path: PathBuf) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let client = UnixStream::connect(listen_path).unwrap();
+            let (r, w) = pipe2(OFlag::O_CLOEXEC).unwrap();
+            drop(w);
+            let iov = [IoSlice::new(b"x")];
+            let cmsg = ControlMessage::ScmRights(&[r.as_raw_fd()]);
+            sendmsg::<()>(client.as_raw_fd(), &iov, &[cmsg], MsgFlags::empty(), None).unwrap();
+        })
+    }
+
+    fn test_console_socket() -> ConmonResult<UnixSocket> {
+        let mut console_socket = UnixSocket::new(
+            SocketType::Terminal,
+            false,
+            PathBuf::from("/tmp"),
+            None,
+            None,
+        );
+        console_socket.bind(
+            None,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            Mode::from_bits_truncate(0o700),
+        )?;
+        console_socket.listen()?;
+        Ok(console_socket)
+    }
 
     fn send_fds(count: usize, payload: &[u8]) -> ConmonResult<(OwnedFd, Vec<(OwnedFd, OwnedFd)>)> {
         let (sender, receiver) = socketpair(
@@ -463,6 +713,103 @@ mod tests {
         let mut buf = [0u8; 16];
         let recv = recv_data_and_fds(receiver.as_raw_fd(), &mut buf);
         assert_eq!(recv.err(), Some(Errno::ENOBUFS));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_exit_status_does_not_reap_child() -> ConmonResult<()> {
+        match unsafe { fork() }? {
+            ForkResult::Parent { child } => {
+                wait_exited_nowait(child)?;
+
+                let status = runtime_exit_status(child.as_raw())?;
+                assert_eq!(status, Some(42));
+
+                match waitpid(child, None)? {
+                    WaitStatus::Exited(pid, code) => {
+                        assert_eq!(pid, child);
+                        assert_eq!(code, 42);
+                    }
+                    other => panic!("unexpected wait status: {other:?}"),
+                }
+            }
+            ForkResult::Child => std::process::exit(42),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn receive_console_fd_times_out_without_connection() -> ConmonResult<()> {
+        let console_socket = test_console_socket()?;
+        let result =
+            receive_console_fd_with_timeout(console_socket, -1, Duration::from_millis(200));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.msg.contains("Timed out waiting for runtime"));
+        Ok(())
+    }
+
+    #[test]
+    fn receive_console_fd_gets_passed_fd() -> ConmonResult<()> {
+        let console_socket = test_console_socket()?;
+        let listen_path = console_socket.path().unwrap().clone();
+
+        let server = spawn_send_terminal_fd(listen_path);
+
+        let terminal = receive_console_fd_with_timeout(console_socket, -1, Duration::from_secs(5))?;
+        assert_eq!(terminal.socket_type, SocketType::Terminal);
+        server.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn receive_console_fd_accepts_queued_connection_after_runtime_exit() -> ConmonResult<()> {
+        let console_socket = test_console_socket()?;
+        let listen_path = console_socket.path().unwrap().clone();
+
+        match unsafe { fork() }? {
+            ForkResult::Parent { child } => {
+                wait_exited_nowait(child)?;
+
+                let sender = spawn_send_terminal_fd(listen_path);
+                sender.join().unwrap();
+
+                let terminal = receive_console_fd_with_timeout(
+                    console_socket,
+                    child.as_raw(),
+                    Duration::from_secs(5),
+                )?;
+                assert_eq!(terminal.socket_type, SocketType::Terminal);
+                let status = waitpid(child, None)?;
+                assert_eq!(status, WaitStatus::Exited(child, 42));
+            }
+            ForkResult::Child => {
+                std::process::exit(42);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn receive_console_fd_fails_when_runtime_exits() -> ConmonResult<()> {
+        let console_socket = test_console_socket()?;
+
+        match unsafe { fork() }? {
+            ForkResult::Parent { child } => {
+                let result = receive_console_fd_with_timeout(
+                    console_socket,
+                    child.as_raw(),
+                    Duration::from_secs(5),
+                );
+                let _ = waitpid(child, None);
+                assert!(result.is_err());
+                let err = result.unwrap_err();
+                assert!(err.msg.contains("Runtime process exited"));
+            }
+            ForkResult::Child => {
+                std::process::exit(42);
+            }
+        }
         Ok(())
     }
 }
