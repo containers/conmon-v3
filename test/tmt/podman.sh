@@ -8,7 +8,7 @@ uname -r
 dnf install -y podman-tests bats
 
 # Show installed package versions
-rpm -q conmon-v3 podman containers-common-extra crun runc
+rpm -q conmon-v3 podman containers-common-extra crun runc || true
 
 # Verify conmon-v3 is installed and is version 3.x
 /usr/bin/conmon-v3 --version | grep -qE '^conmon version 3(\.|$)'
