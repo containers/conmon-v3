@@ -8,7 +8,6 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::{Pid, getpgid};
 use nix::{
     errno::Errno,
-    libc,
     sys::{
         socket::{SockFlag, SockType},
         stat::Mode,
@@ -26,7 +25,7 @@ use crate::{
     runtime::{
         args::{RuntimeArgsGenerator, generate_runtime_args},
         ctl::{setup_console_fifo, setup_terminal_control_fifo},
-        process::RuntimeProcess,
+        process::{RuntimeProcess, is_running_process, proc_state, try_wait_process},
         stdio::{create_pipe, handle_stdio, read_pipe, receive_console_fd},
     },
     unix_socket::{RemoteSocket, SocketType, UnixSocket},
@@ -557,6 +556,24 @@ impl RuntimeSession {
         Ok(())
     }
 
+    /// Records a `waitpid` result for the tracked container PID and decides
+    /// whether the event loop should stop.
+    fn handle_container_wait_status(&mut self, status: WaitStatus) -> ConmonResult<bool> {
+        match status {
+            WaitStatus::Exited(_, code) => {
+                self.container_status = code;
+                info!("Container exited: {}", self.container_status);
+                Ok(false)
+            }
+            WaitStatus::Signaled(_, signal, _) => {
+                self.container_status = 128 + signal as i32;
+                info!("Container killed with signal: {}", self.container_status);
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
     /// Function executed periodically during the event-loop execuction.
     ///
     /// This function monitors the signal-fd, all the children processes and
@@ -631,31 +648,31 @@ impl RuntimeSession {
             // no more child processes
             Err(Errno::ECHILD) => {
                 // Before quitting, probe the container_pid.
-                // It might not be a direct child.
+                // It might not be a direct child (see containers/conmon#545).
                 if self.container_pid > 0 {
-                    // Nix kill function does not support 0 signal, so we have to use libc one.
-                    let rc = unsafe { libc::kill(self.container_pid, 0) };
-                    if rc == 0 {
-                        info!(
-                            "Container process {} is still alive but not a direct child",
-                            self.container_pid
-                        );
-                        // Do not quit main loop yet...
-                        return Ok(true);
-                    } else if Errno::last() == Errno::ESRCH {
-                        // Process exited.
-                        info!(
-                            "Container process {} has exited (detected via kill probe)",
-                            self.container_pid
-                        );
-                        // We cannot get real exit status.
-                        self.container_status = 0;
-                        self.container_pid = -1;
-                        return Ok(false);
-                    } else {
-                        info!("No more child processes.");
-                        return Ok(false);
+                    let pid = self.container_pid;
+
+                    // Reap the container PID directly when subreaper owns it.
+                    if let Some(status) = try_wait_process(pid)? {
+                        return self.handle_container_wait_status(status);
                     }
+
+                    if is_running_process(pid) {
+                        info!(
+                            "Container process {pid} is still alive but not a direct child"
+                        );
+                        return Ok(true);
+                    }
+
+                    if proc_state(pid) == Some('Z') {
+                        info!("Container process {pid} is a zombie (detected via /proc)");
+                    } else {
+                        info!("Container process {pid} has exited (detected via /proc)");
+                    }
+                    // We cannot get the real exit status.
+                    self.container_status = 0;
+                    self.container_pid = -1;
+                    return Ok(false);
                 }
 
                 // If container has not started yet, keep running.
@@ -674,9 +691,7 @@ impl RuntimeSession {
             // Child exited, store the exit code.
             Ok(WaitStatus::Exited(p, code)) => {
                 if p == Pid::from_raw(self.container_pid) {
-                    self.container_status = code;
-                    info!("Container exited: {}", self.container_status);
-                    return Ok(false);
+                    return self.handle_container_wait_status(WaitStatus::Exited(p, code));
                 } else if p == Pid::from_raw(self.process.pid()) {
                     self.exit_code = code;
                     info!("Runtime exited: {}", self.exit_code);
@@ -688,14 +703,12 @@ impl RuntimeSession {
             }
 
             // Child killed with a signal, store it as exit code.
-            Ok(WaitStatus::Signaled(p, s, _)) => {
-                let code: i32 = s as i32;
+            Ok(WaitStatus::Signaled(p, s, coredump)) => {
                 if p == Pid::from_raw(self.container_pid) {
-                    self.container_status = 128 + code;
-                    info!("Container killed with signal: {}", self.container_status);
-                    return Ok(false);
+                    return self
+                        .handle_container_wait_status(WaitStatus::Signaled(p, s, coredump));
                 } else if p == Pid::from_raw(self.process.pid()) {
-                    self.exit_code = 128 + code;
+                    self.exit_code = 128 + s as i32;
                     info!("Runtime killed with signal: {}", self.exit_code);
                     return Ok(false);
                 } else {
