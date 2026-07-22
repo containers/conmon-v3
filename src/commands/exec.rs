@@ -35,6 +35,7 @@ impl Exec {
         runtime_session.wait_for_success(self.cfg.common.api_version, true)?;
 
         runtime_session.write_container_pid_file(&self.cfg.common)?;
+        runtime_session.reap_pending_children()?;
 
         // Run the eventloop to forward log messages to log plugin.
         runtime_session.run_event_loop(

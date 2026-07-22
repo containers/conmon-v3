@@ -31,6 +31,16 @@ use crate::{
     unix_socket::{RemoteSocket, SocketType, UnixSocket},
 };
 
+/// Result of a single non-blocking child-process poll during the event loop.
+enum PollChildrenResult {
+    /// Keep polling sockets and reaping children.
+    KeepRunning,
+    /// Stop the event loop (container or runtime finished).
+    StopEventLoop,
+    /// Reaped an unrelated child; call again to drain more zombies.
+    ReapedOther,
+}
+
 /// Represents Runtime session.
 /// Handles spawning of runtime process, reading its stdio, writing its
 /// pid and error code as well as the event loop to forward its log messages
@@ -476,7 +486,10 @@ impl RuntimeSession {
             let mut to_report = -1;
 
             if self.container_started {
-                to_report = self.container_status
+                if self.container_status < 0 {
+                    self.finalize_container_exit()?;
+                }
+                to_report = self.container_status;
             } else if write_exit_code && self.exit_code > 0 {
                 to_report = -self.exit_code;
             }
@@ -574,6 +587,141 @@ impl RuntimeSession {
         }
     }
 
+    /// Non-blocking wait for any child, mirroring conmon-v2's `check_child_processes`.
+    fn poll_children_once(&mut self) -> ConmonResult<PollChildrenResult> {
+        let res = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
+
+        match res {
+            Err(Errno::EINTR) => Ok(PollChildrenResult::KeepRunning),
+
+            Err(Errno::ECHILD) => {
+                if self.container_pid > 0 {
+                    let pid = self.container_pid;
+
+                    if let Some(status) = try_wait_process(pid)? {
+                        return if self.handle_container_wait_status(status)? {
+                            Ok(PollChildrenResult::KeepRunning)
+                        } else {
+                            Ok(PollChildrenResult::StopEventLoop)
+                        };
+                    }
+
+                    if is_running_process(pid) {
+                        info!("Container process {pid} is still alive but not a direct child");
+                        return Ok(PollChildrenResult::KeepRunning);
+                    }
+
+                    if proc_state(pid) == Some('Z') {
+                        info!("Container process {pid} is a zombie (detected via /proc)");
+                    } else {
+                        info!("Container process {pid} has exited (detected via /proc)");
+                    }
+                    self.container_status = 0;
+                    self.container_pid = -1;
+                    return Ok(PollChildrenResult::StopEventLoop);
+                }
+
+                if self.container_started {
+                    Ok(PollChildrenResult::KeepRunning)
+                } else {
+                    Ok(PollChildrenResult::StopEventLoop)
+                }
+            }
+
+            Err(e) => Err(ConmonError::new(
+                format!("Failed to read child process status: {e}"),
+                1,
+            )),
+
+            Ok(WaitStatus::StillAlive) => Ok(PollChildrenResult::KeepRunning),
+
+            Ok(WaitStatus::Exited(p, code)) => {
+                if p == Pid::from_raw(self.container_pid) {
+                    if self.handle_container_wait_status(WaitStatus::Exited(p, code))? {
+                        Ok(PollChildrenResult::KeepRunning)
+                    } else {
+                        Ok(PollChildrenResult::StopEventLoop)
+                    }
+                } else if p == Pid::from_raw(self.process.pid()) {
+                    self.exit_code = code;
+                    info!("Runtime exited: {}", self.exit_code);
+                    Ok(PollChildrenResult::StopEventLoop)
+                } else {
+                    info!("Uknown child {} exited", p);
+                    Ok(PollChildrenResult::ReapedOther)
+                }
+            }
+
+            Ok(WaitStatus::Signaled(p, s, coredump)) => {
+                if p == Pid::from_raw(self.container_pid) {
+                    if self.handle_container_wait_status(WaitStatus::Signaled(p, s, coredump))? {
+                        Ok(PollChildrenResult::KeepRunning)
+                    } else {
+                        Ok(PollChildrenResult::StopEventLoop)
+                    }
+                } else if p == Pid::from_raw(self.process.pid()) {
+                    self.exit_code = 128 + s as i32;
+                    info!("Runtime killed with signal: {}", self.exit_code);
+                    Ok(PollChildrenResult::StopEventLoop)
+                } else {
+                    info!("Uknown child {} exited", p);
+                    Ok(PollChildrenResult::ReapedOther)
+                }
+            }
+
+            Ok(
+                WaitStatus::Stopped(_, _)
+                | WaitStatus::Continued(_)
+                | WaitStatus::PtraceEvent(_, _, _)
+                | WaitStatus::PtraceSyscall(_),
+            ) => Ok(PollChildrenResult::KeepRunning),
+        }
+    }
+
+    /// Reap any children that already exited before the event loop runs.
+    ///
+    /// Exec processes can finish immediately after the PID is written to the sync pipe.
+    pub fn reap_pending_children(&mut self) -> ConmonResult<()> {
+        loop {
+            if self.container_status >= 0 {
+                return Ok(());
+            }
+            match self.poll_children_once()? {
+                PollChildrenResult::ReapedOther => continue,
+                PollChildrenResult::KeepRunning | PollChildrenResult::StopEventLoop => {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Ensure the container exit status is known before writing exit files.
+    pub fn finalize_container_exit(&mut self) -> ConmonResult<()> {
+        if self.container_status >= 0 {
+            return Ok(());
+        }
+
+        self.reap_pending_children()?;
+        if self.container_status >= 0 {
+            return Ok(());
+        }
+
+        if self.container_pid > 0 {
+            let pid = self.container_pid;
+            if let Some(status) = try_wait_process(pid)? {
+                let _ = self.handle_container_wait_status(status)?;
+                return Ok(());
+            }
+            if !is_running_process(pid) {
+                info!("Container process {pid} has exited (final probe)");
+                self.container_status = 0;
+                self.container_pid = -1;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Function executed periodically during the event-loop execuction.
     ///
     /// This function monitors the signal-fd, all the children processes and
@@ -638,94 +786,9 @@ impl RuntimeSession {
             return Ok(false);
         }
 
-        // Wait for any child to finish (non-blocking).
-        let res = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
-
-        match res {
-            // Interrupted by signal - retry.
-            Err(Errno::EINTR) => Ok(true),
-
-            // no more child processes
-            Err(Errno::ECHILD) => {
-                // Before quitting, probe the container_pid.
-                // It might not be a direct child (see containers/conmon#545).
-                if self.container_pid > 0 {
-                    let pid = self.container_pid;
-
-                    // Reap the container PID directly when subreaper owns it.
-                    if let Some(status) = try_wait_process(pid)? {
-                        return self.handle_container_wait_status(status);
-                    }
-
-                    if is_running_process(pid) {
-                        info!(
-                            "Container process {pid} is still alive but not a direct child"
-                        );
-                        return Ok(true);
-                    }
-
-                    if proc_state(pid) == Some('Z') {
-                        info!("Container process {pid} is a zombie (detected via /proc)");
-                    } else {
-                        info!("Container process {pid} has exited (detected via /proc)");
-                    }
-                    // We cannot get the real exit status.
-                    self.container_status = 0;
-                    self.container_pid = -1;
-                    return Ok(false);
-                }
-
-                // If container has not started yet, keep running.
-                Ok(!self.container_started)
-            }
-
-            // some other waitpid error
-            Err(e) => Err(ConmonError::new(
-                format!("Failed to read child process status: {e}"),
-                1,
-            )),
-
-            // No child has changed state.
-            Ok(WaitStatus::StillAlive) => Ok(true),
-
-            // Child exited, store the exit code.
-            Ok(WaitStatus::Exited(p, code)) => {
-                if p == Pid::from_raw(self.container_pid) {
-                    return self.handle_container_wait_status(WaitStatus::Exited(p, code));
-                } else if p == Pid::from_raw(self.process.pid()) {
-                    self.exit_code = code;
-                    info!("Runtime exited: {}", self.exit_code);
-                    return Ok(false);
-                } else {
-                    info!("Uknown child {} exited", p);
-                }
-                Ok(true)
-            }
-
-            // Child killed with a signal, store it as exit code.
-            Ok(WaitStatus::Signaled(p, s, coredump)) => {
-                if p == Pid::from_raw(self.container_pid) {
-                    return self
-                        .handle_container_wait_status(WaitStatus::Signaled(p, s, coredump));
-                } else if p == Pid::from_raw(self.process.pid()) {
-                    self.exit_code = 128 + s as i32;
-                    info!("Runtime killed with signal: {}", self.exit_code);
-                    return Ok(false);
-                } else {
-                    info!("Uknown child {} exited", p);
-                }
-                Ok(true)
-            }
-
-            Ok(
-                WaitStatus::Stopped(_, _)
-                | WaitStatus::Continued(_)
-                | WaitStatus::PtraceEvent(_, _, _)
-                | WaitStatus::PtraceSyscall(_),
-            ) => {
-                // Just continue with the event-loop.
-                Ok(true)
-            }
+        match self.poll_children_once()? {
+            PollChildrenResult::KeepRunning | PollChildrenResult::ReapedOther => Ok(true),
+            PollChildrenResult::StopEventLoop => Ok(false),
         }
     }
 
@@ -771,6 +834,7 @@ impl RuntimeSession {
                 signal_fd,
                 |signal_received| self.idle_callback(signal_received),
             )?;
+            self.finalize_container_exit()?;
             return Ok(());
         }
 
@@ -939,6 +1003,25 @@ mod tests {
                 .unwrap()
                 .contains("runc create failed")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_container_exit_probes_exited_pid() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_pid = nix::unistd::getpid().as_raw();
+        // Current process is alive; finalize should leave status unset.
+        sess.finalize_container_exit()?;
+        assert_eq!(sess.container_status, -1);
+
+        // A PID that no longer exists should be treated as exited.
+        sess.container_status = -1;
+        sess.container_pid = 999_999_999;
+        sess.finalize_container_exit()?;
+        assert_eq!(sess.container_status, 0);
+        assert_eq!(sess.container_pid, -1);
         Ok(())
     }
 

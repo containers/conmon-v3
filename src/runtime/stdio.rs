@@ -408,6 +408,12 @@ where
             }
         }
     }
+
+    // All remote sockets closed; probe for a container that exited while I/O drained.
+    let keep_running = idle_callback(false)?;
+    if !keep_running {
+        info!("idle_callback stopped the event loop after sockets closed.");
+    }
     Ok(())
 }
 
