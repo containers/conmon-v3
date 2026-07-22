@@ -446,6 +446,9 @@ impl RuntimeSession {
 
         // Read the container PID and store it.
         self.container_pid = self.read_container_pid(common)?;
+        // Preserve the PID for the sync pipe / OOM setup even if a cached exit
+        // status immediately clears `container_pid` (fast-exiting exec).
+        let reported_pid = self.container_pid;
         self.apply_exit_status_cache_for_container_pid();
 
         // We know the container started, so note it.
@@ -454,12 +457,12 @@ impl RuntimeSession {
         // Setup the out-of-mana (eh, *-memory) handler, so we can detect OOM event
         // and pass it to parent.
         self.oom_socket =
-            setup_oom_handling(self.container_pid, &common.persist_dir, &common.bundle)?;
+            setup_oom_handling(reported_pid, &common.persist_dir, &common.bundle)?;
 
         // Pass the container_pid to sync_pipe if there is one.
         if let Some(fd) = self.sync_pipe_fd.take() {
             self.sync_pipe_fd =
-                write_or_close_sync_fd(fd, self.container_pid, None, common.api_version, false)?;
+                write_or_close_sync_fd(fd, reported_pid, None, common.api_version, false)?;
         }
 
         Ok(())
@@ -616,7 +619,10 @@ impl RuntimeSession {
             return;
         }
         if let Some(status) = self.exit_status_cache.remove(&self.container_pid) {
-            info!("Applying cached exit status for container pid {}", self.container_pid);
+            info!(
+                "Applying cached exit status for container pid {}",
+                self.container_pid
+            );
             let _ = self.handle_container_wait_status(status);
         }
     }
@@ -675,10 +681,12 @@ impl RuntimeSession {
                     return Ok(PollChildrenResult::StopEventLoop);
                 }
 
-                if self.container_started {
-                    Ok(PollChildrenResult::KeepRunning)
-                } else {
+                // Container already reaped (status known, pid cleared) or never started.
+                // Do not keep the event loop alive forever on ECHILD.
+                if self.container_status >= 0 || !self.container_started {
                     Ok(PollChildrenResult::StopEventLoop)
+                } else {
+                    Ok(PollChildrenResult::KeepRunning)
                 }
             }
 
@@ -796,6 +804,12 @@ impl RuntimeSession {
     ///
     /// * [`ConmonError`] on any error.
     fn idle_callback(&mut self, signal_received: bool) -> ConmonResult<bool> {
+        // Fast-exiting exec processes may already have a recorded status before
+        // the event loop starts (or right after the first reap). Stop immediately.
+        if self.container_status >= 0 {
+            return Ok(false);
+        }
+
         // We received a signal.
         if signal_received {
             if let Some(signals) = &self.signals {
@@ -815,7 +829,7 @@ impl RuntimeSession {
                     Err(_) => return Ok(true),
                 }
             }
-            return Ok(true);
+            return Ok(self.container_status < 0);
         }
 
         // Stop the event-loop if we reach a timeout.
@@ -1113,6 +1127,32 @@ mod tests {
         sess.container_status = 137;
         sess.timed_out = true;
         assert_eq!(sess.container_exit_code(), -1);
+    }
+
+    #[test]
+    fn poll_children_stops_after_status_known_and_pid_cleared() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_status = 1;
+        sess.container_pid = -1;
+        // No children left: previously this returned KeepRunning forever.
+        assert!(matches!(
+            sess.poll_children_once()?,
+            PollChildrenResult::StopEventLoop
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn idle_callback_stops_when_container_already_exited() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_status = 0;
+        sess.container_pid = -1;
+        assert!(!sess.idle_callback(false)?);
+        Ok(())
     }
 
     #[test]

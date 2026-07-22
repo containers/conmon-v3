@@ -330,7 +330,10 @@ where
                     // If the POLLIN comes from the signal fd, run the idle_callback to handle
                     // the received signal.
                     if pfd.as_fd().as_raw_fd() == signal_fd {
-                        idle_callback(true)?;
+                        if !idle_callback(true)? {
+                            info!("idle_callback stopped the event loop after signal.");
+                            return Ok(());
+                        }
                         i += 1;
                         continue;
                     }
