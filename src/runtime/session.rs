@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
@@ -123,6 +124,10 @@ pub struct RuntimeSession {
 
     // Open file descriptor snapshot.
     open_files: OpenFilesSnapshot,
+
+    /// Exit statuses for children reaped before `container_pid` was registered.
+    /// Mirrors conmon-v2's `exit_status_cache` for fast-exiting exec processes.
+    exit_status_cache: HashMap<i32, WaitStatus>,
 }
 
 impl RuntimeSession {
@@ -154,7 +159,11 @@ impl RuntimeSession {
     ///
     /// * The exit code of container.
     pub fn container_exit_code(&self) -> i32 {
-        self.container_status
+        if self.timed_out {
+            -1
+        } else {
+            self.container_status
+        }
     }
 
     /// Reads and returns the container's PID.
@@ -432,8 +441,12 @@ impl RuntimeSession {
     ///
     /// * [`ConmonError`] on any error.
     pub fn write_container_pid_file(&mut self, common: &CommonCfg) -> ConmonResult<()> {
+        // Reap exec processes that exited while the runtime process was still running.
+        self.drain_exit_status_cache_from_children()?;
+
         // Read the container PID and store it.
         self.container_pid = self.read_container_pid(common)?;
+        self.apply_exit_status_cache_for_container_pid();
 
         // We know the container started, so note it.
         self.container_started = true;
@@ -485,7 +498,9 @@ impl RuntimeSession {
             // Prepare the exit code according to the `write_exit_code`.
             let mut to_report = -1;
 
-            if self.container_started {
+            if self.timed_out {
+                to_report = -1;
+            } else if self.container_started {
                 if self.container_status < 0 {
                     self.finalize_container_exit()?;
                 }
@@ -575,16 +590,56 @@ impl RuntimeSession {
         match status {
             WaitStatus::Exited(_, code) => {
                 self.container_status = code;
+                self.container_pid = -1;
                 info!("Container exited: {}", self.container_status);
                 Ok(false)
             }
             WaitStatus::Signaled(_, signal, _) => {
                 self.container_status = 128 + signal as i32;
+                self.container_pid = -1;
                 info!("Container killed with signal: {}", self.container_status);
                 Ok(false)
             }
             _ => Ok(true),
         }
+    }
+
+    /// Cache exit status for a child reaped before `container_pid` was registered.
+    fn cache_child_exit(&mut self, pid: i32, status: WaitStatus) {
+        info!("Caching exit status for child {pid}");
+        self.exit_status_cache.insert(pid, status);
+    }
+
+    /// Apply a previously cached exit status once `container_pid` is known.
+    fn apply_exit_status_cache_for_container_pid(&mut self) {
+        if self.container_pid <= 0 {
+            return;
+        }
+        if let Some(status) = self.exit_status_cache.remove(&self.container_pid) {
+            info!("Applying cached exit status for container pid {}", self.container_pid);
+            let _ = self.handle_container_wait_status(status);
+        }
+    }
+
+    /// Reap children that exited while the runtime process was still running.
+    fn drain_exit_status_cache_from_children(&mut self) -> ConmonResult<()> {
+        loop {
+            match self.poll_children_once()? {
+                PollChildrenResult::ReapedOther => continue,
+                PollChildrenResult::KeepRunning | PollChildrenResult::StopEventLoop => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// When the process is gone but its exit status is unknown, assume success only
+    /// if we never recorded a status (matches conmon-v2's ECHILD fallback).
+    fn assume_container_exited_without_status(&mut self) {
+        if self.container_status < 0 {
+            info!("Container process has exited with unknown status; assuming 0");
+            self.container_status = 0;
+        }
+        self.container_pid = -1;
     }
 
     /// Non-blocking wait for any child, mirroring conmon-v2's `check_child_processes`.
@@ -616,8 +671,7 @@ impl RuntimeSession {
                     } else {
                         info!("Container process {pid} has exited (detected via /proc)");
                     }
-                    self.container_status = 0;
-                    self.container_pid = -1;
+                    self.assume_container_exited_without_status();
                     return Ok(PollChildrenResult::StopEventLoop);
                 }
 
@@ -647,7 +701,9 @@ impl RuntimeSession {
                     info!("Runtime exited: {}", self.exit_code);
                     Ok(PollChildrenResult::StopEventLoop)
                 } else {
-                    info!("Uknown child {} exited", p);
+                    let pid = p.as_raw();
+                    info!("Unknown child {pid} exited");
+                    self.cache_child_exit(pid, WaitStatus::Exited(p, code));
                     Ok(PollChildrenResult::ReapedOther)
                 }
             }
@@ -664,7 +720,9 @@ impl RuntimeSession {
                     info!("Runtime killed with signal: {}", self.exit_code);
                     Ok(PollChildrenResult::StopEventLoop)
                 } else {
-                    info!("Uknown child {} exited", p);
+                    let pid = p.as_raw();
+                    info!("Unknown child {pid} exited");
+                    self.cache_child_exit(pid, WaitStatus::Signaled(p, s, coredump));
                     Ok(PollChildrenResult::ReapedOther)
                 }
             }
@@ -714,8 +772,7 @@ impl RuntimeSession {
             }
             if !is_running_process(pid) {
                 info!("Container process {pid} has exited (final probe)");
-                self.container_status = 0;
-                self.container_pid = -1;
+                self.assume_container_exited_without_status();
             }
         }
 
@@ -1023,6 +1080,39 @@ mod tests {
         assert_eq!(sess.container_status, 0);
         assert_eq!(sess.container_pid, -1);
         Ok(())
+    }
+
+    #[test]
+    fn finalize_container_exit_is_noop_when_status_known() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_status = 1;
+        sess.container_pid = 999_999_999;
+        sess.finalize_container_exit()?;
+        assert_eq!(sess.container_status, 1);
+        assert_eq!(sess.container_pid, 999_999_999);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_child_exit_is_applied_for_container_pid() {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.cache_child_exit(4242, WaitStatus::Exited(Pid::from_raw(4242), 7));
+        sess.container_pid = 4242;
+        sess.apply_exit_status_cache_for_container_pid();
+        assert_eq!(sess.container_status, 7);
+        assert_eq!(sess.container_pid, -1);
+    }
+
+    #[test]
+    fn container_exit_code_is_minus_one_after_timeout() {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_status = 137;
+        sess.timed_out = true;
+        assert_eq!(sess.container_exit_code(), -1);
     }
 
     #[test]
