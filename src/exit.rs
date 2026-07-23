@@ -5,11 +5,12 @@ use nix::errno::Errno;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 
+use std::io::Write;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::Duration;
-use std::{fs, thread};
 
 use nix::libc::{PR_SET_CHILD_SUBREAPER, close, prctl};
 
@@ -102,6 +103,29 @@ pub fn run_exit_command(
     Ok(())
 }
 
+/// Atomically write `contents` to `path` (temp file + rename).
+/// Matches conmon-v2 `g_file_set_contents` so inotify waiters never see
+/// a truncated/empty exit file.
+fn write_file_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("exit");
+    // Unique-enough name in the same directory so rename is atomic on the same fs.
+    let tmp_path = parent.join(format!(".{}.{}.tmp", file_name, std::process::id()));
+
+    let write_result = (|| {
+        let mut tmp = std::fs::File::create(&tmp_path)?;
+        tmp.write_all(contents.as_bytes())?;
+        tmp.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
 /// Writes exit files into persistent_path and exit_dir.
 pub fn write_exit_files(
     exit_status: i32,
@@ -114,7 +138,7 @@ pub fn write_exit_files(
     // Write the exit file to container persistent directory if it is specified
     if let Some(persist_path) = persist_path {
         let ctr_exit_file_path: PathBuf = persist_path.join("exit");
-        if let Err(e) = fs::write(&ctr_exit_file_path, &status_str) {
+        if let Err(e) = write_file_atomic(&ctr_exit_file_path, &status_str) {
             error!(
                 "Failed to write {} to container exit file {}: {}",
                 status_str,
@@ -129,7 +153,7 @@ pub fn write_exit_files(
     if let Some(exit_dir) = exit_dir {
         if let Some(cid) = cid {
             let exit_file_path: PathBuf = exit_dir.join(cid);
-            if let Err(e) = fs::write(&exit_file_path, &status_str) {
+            if let Err(e) = write_file_atomic(&exit_file_path, &status_str) {
                 error!(
                     "Failed to write {} to exit file {}: {}",
                     status_str,

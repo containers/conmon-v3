@@ -3,15 +3,17 @@ use crate::exit::set_subreaper;
 use crate::runtime::stdio::read_pipe;
 
 use log::{info, warn};
+use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::stat::Mode;
-use nix::sys::wait::{WaitStatus, waitpid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{
     ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, getpid, getppid, setsid,
 };
 
 use std::env;
+use std::fs;
 use std::io::{Error, Result as IoResult};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -22,6 +24,51 @@ use std::process::{Command, Stdio, exit};
 /// Convert a nix::Error into std::io::Error (for use inside pre_exec closure).
 fn io_err(e: nix::Error) -> Error {
     Error::from_raw_os_error(e as i32)
+}
+
+/// Parse the one-letter process state from the contents of `/proc/<pid>/stat`.
+fn state_from_proc_stat(contents: &str) -> Option<char> {
+    let rparen = contents.rfind(')')?;
+    contents.get(rparen + 2..)?.chars().next()
+}
+
+/// Reads the one-letter process state from `/proc/<pid>/stat`.
+///
+/// Returns `None` if the process does not exist or the stat file cannot be parsed.
+pub fn proc_state(pid: i32) -> Option<char> {
+    if pid <= 0 {
+        return None;
+    }
+    let contents = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    state_from_proc_stat(&contents)
+}
+
+/// Returns true when `pid` refers to a live, non-zombie process.
+///
+/// `kill(pid, 0)` also succeeds for zombie processes, so callers must not use
+/// that syscall alone to decide whether a container is still running.
+pub fn is_running_process(pid: i32) -> bool {
+    matches!(proc_state(pid), Some(s) if s != 'Z')
+}
+
+/// Non-blocking wait for a specific PID.
+///
+/// As subreaper, conmon may reap orphaned container processes this way even when
+/// they are not returned by `waitpid(-1, WNOHANG)`.
+pub fn try_wait_process(pid: i32) -> Result<Option<WaitStatus>, Errno> {
+    let pid = Pid::from_raw(pid);
+    loop {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => return Ok(None),
+            Ok(status @ (WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))) => {
+                return Ok(Some(status));
+            }
+            Ok(_) => return Ok(None),
+            Err(Errno::ECHILD) => return Ok(None),
+            Err(Errno::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Block signals in the parent before we spawn.
@@ -235,5 +282,27 @@ impl RuntimeProcess {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_from_proc_stat_parses_zombie() {
+        assert_eq!(state_from_proc_stat("42 (sh) Z 1 42 42"), Some('Z'));
+    }
+
+    #[test]
+    fn state_from_proc_stat_parses_running() {
+        assert_eq!(state_from_proc_stat("99 (sleep) S 1 99 99"), Some('S'));
+    }
+
+    #[test]
+    fn proc_state_for_current_process_is_not_zombie() {
+        let pid = std::process::id() as i32;
+        assert!(is_running_process(pid));
+        assert_ne!(proc_state(pid), Some('Z'));
     }
 }
