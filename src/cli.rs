@@ -1,3 +1,4 @@
+use crate::Cid;
 use crate::error::{ConmonError, ConmonResult};
 use crate::logging::plugin::LogPluginCfg;
 use std::fs;
@@ -224,10 +225,10 @@ pub enum Cmd {
     Restore(RestoreCfg),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct CommonCfg {
     pub api_version: i32,
-    pub cid: String,
+    pub cid: Cid,
     pub cuuid: Option<String>,
     pub runtime: PathBuf,
     pub runtime_args: Vec<String>,
@@ -253,24 +254,56 @@ pub struct CommonCfg {
     pub sdnotify_socket: Option<PathBuf>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct CreateCfg {
     pub common: CommonCfg,
     pub systemd_cgroup: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct ExecCfg {
     pub common: CommonCfg,
     pub exec_process_spec: PathBuf,
     pub attach: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct RestoreCfg {
     pub common: CommonCfg,
     pub restore_path: PathBuf,
     pub systemd_cgroup: bool,
+}
+
+/// Baseline [`CommonCfg`] for unit tests. Callers must pass an explicit `cid`.
+#[cfg(test)]
+pub fn test_common_cfg(cid: &str) -> CommonCfg {
+    CommonCfg {
+        api_version: 0,
+        cid: Cid::parse(cid).expect("test cid must be valid"),
+        cuuid: None,
+        runtime: PathBuf::new(),
+        runtime_args: Vec::new(),
+        runtime_opts: Vec::new(),
+        no_pivot: false,
+        no_new_keyring: false,
+        conmon_pidfile: None,
+        container_pidfile: PathBuf::new(),
+        bundle: PathBuf::new(),
+        full_attach: false,
+        socket_dir_path: PathBuf::new(),
+        stdin: false,
+        leave_stdin_open: false,
+        terminal: false,
+        timeout: None,
+        replace_listen_pid: false,
+        persist_dir: None,
+        exit_dir: None,
+        name: None,
+        no_sync_log: false,
+        logging_passthrough: false,
+        sync_flag: false,
+        sdnotify_socket: None,
+    }
 }
 
 /// Try to detect "executable" bit.
@@ -294,6 +327,7 @@ pub fn determine_cmd(mut opts: Opts, logging_passthrough: bool) -> ConmonResult<
         .cid
         .take()
         .ok_or_else(|| ConmonError::new("Container ID not provided. Use --cid", 1))?;
+    let cid = Cid::try_from(cid)?;
     let runtime = opts
         .runtime
         .take()
@@ -677,7 +711,7 @@ mod tests {
         match cmd {
             Cmd::Exec(cfg) => {
                 assert_eq!(cfg.common.api_version, 1);
-                assert_eq!(cfg.common.cid, "abc");
+                assert_eq!(cfg.common.cid.as_str(), "abc");
                 assert!(cfg.attach);
                 assert_eq!(cfg.exec_process_spec, PathBuf::from("proc.json"));
             }
@@ -718,7 +752,7 @@ mod tests {
         let cmd = determine_cmd(o, false).expect("ok");
         match cmd {
             Cmd::Restore(cfg) => {
-                assert_eq!(cfg.common.cid, "abc");
+                assert_eq!(cfg.common.cid.as_str(), "abc");
                 assert_eq!(cfg.restore_path, PathBuf::from("checkpoint"));
             }
             _ => panic!("expected Restore"),

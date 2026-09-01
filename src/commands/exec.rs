@@ -83,7 +83,8 @@ impl RuntimeArgsGenerator for Exec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::CommonCfg;
+    use crate::Cid;
+    use crate::cli::{CommonCfg, test_common_cfg};
     use std::path::PathBuf;
 
     fn mk_common(
@@ -96,13 +97,13 @@ mod tests {
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
-            cid: cid.to_string(),
+            cid: Cid::parse(cid).unwrap(),
             runtime_args: runtime_args.into_iter().map(|s| s.to_string()).collect(),
             runtime_opts: runtime_opts.into_iter().map(|s| s.to_string()).collect(),
             no_pivot,
             no_new_keyring,
             container_pidfile: PathBuf::from(pidfile),
-            ..Default::default()
+            ..test_common_cfg(cid)
         }
     }
 
@@ -110,7 +111,7 @@ mod tests {
         ExecCfg {
             exec_process_spec: PathBuf::from(proc_spec),
             common,
-            ..Default::default()
+            attach: false,
         }
     }
 

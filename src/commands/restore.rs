@@ -89,7 +89,8 @@ impl RuntimeArgsGenerator for Restore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::CommonCfg;
+    use crate::Cid;
+    use crate::cli::{CommonCfg, test_common_cfg};
     use crate::runtime::args::generate_runtime_args;
     use std::path::PathBuf;
 
@@ -104,14 +105,14 @@ mod tests {
     ) -> CommonCfg {
         CommonCfg {
             runtime: PathBuf::from("./runtime"),
-            cid: cid.to_string(),
+            cid: Cid::parse(cid).unwrap(),
             runtime_args: runtime_args.into_iter().map(|s| s.to_string()).collect(),
             runtime_opts: runtime_opts.into_iter().map(|s| s.to_string()).collect(),
             no_pivot,
             no_new_keyring,
             container_pidfile: PathBuf::from(pidfile),
             bundle: PathBuf::from(bundle),
-            ..Default::default()
+            ..test_common_cfg(cid)
         }
     }
 
@@ -119,7 +120,7 @@ mod tests {
         RestoreCfg {
             systemd_cgroup,
             common,
-            ..Default::default()
+            restore_path: PathBuf::new(),
         }
     }
 

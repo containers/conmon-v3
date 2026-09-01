@@ -4,6 +4,7 @@ use ::log::debug;
 use ::log::error;
 use ::log::info;
 use clap::Parser;
+use conmon::Cid;
 use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin};
 use conmon::commands::create::Create;
 use conmon::commands::exec::Exec;
@@ -74,6 +75,9 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     opts.cid
         .as_ref()
         .ok_or_else(|| ConmonError::new("Container ID not provided. Use --cid", 1))?;
+    if let Some(ref cid) = opts.cid {
+        Cid::parse(cid)?;
+    }
     let api_version = opts.api_version.unwrap_or(0);
     let cuuid_required = !opts.exec || api_version >= 1;
     if cuuid_required && opts.cuuid.is_none() {
@@ -136,7 +140,16 @@ fn main() -> ExitCode {
     let exit_command_delay = opts.exit_delay;
     let exit_dir = opts.exit_dir.clone();
     let persist_dir = opts.persist_dir.clone();
-    let cid = opts.cid.clone();
+    let cid: Option<Cid> = match &opts.cid {
+        None => None,
+        Some(s) => match Cid::parse(s) {
+            Ok(cid) => Some(cid),
+            Err(e) => {
+                error!("{}", e.msg);
+                None
+            }
+        },
+    };
 
     // Run the conmon.
     let raw_code = match run_conmon(opts) {

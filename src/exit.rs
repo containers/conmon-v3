@@ -1,3 +1,4 @@
+use crate::Cid;
 use crate::error::{ConmonError, ConmonResult};
 
 use atomic_write_file::AtomicWriteFile;
@@ -115,14 +116,9 @@ fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Returns true if `cid` is safe to use as a single path component under `exit_dir`.
-///
-/// Rejects empty strings, `.`, `..`, and values containing `/` or NUL, which would
-/// allow escaping `exit_dir` or confusing path APIs. Other characters (including
-/// `+`, `:`, and non-ASCII) are accepted so historically valid container IDs keep
-/// working.
-fn is_safe_container_id(cid: &str) -> bool {
-    !cid.is_empty() && cid != "." && cid != ".." && !cid.contains('/') && !cid.contains('\0')
+/// Returns true when `path` is a direct child of `base`.
+fn path_stays_under(base: &Path, path: &Path) -> bool {
+    path.starts_with(base) && path.parent() == Some(base)
 }
 
 /// Writes exit files into persistent_path and exit_dir.
@@ -130,7 +126,7 @@ pub fn write_exit_files(
     exit_status: i32,
     persist_path: Option<&PathBuf>,
     exit_dir: Option<&PathBuf>,
-    cid: Option<&String>,
+    cid: Option<&Cid>,
 ) {
     let status_str: String = exit_status.to_string();
 
@@ -151,12 +147,16 @@ pub fn write_exit_files(
     // all container exits using inotify.
     if let Some(exit_dir) = exit_dir {
         if let Some(cid) = cid {
-            if !is_safe_container_id(cid) {
-                error!("Invalid container ID {:?}", cid);
+            let exit_file_path = exit_dir.join(cid.as_str());
+            if !path_stays_under(exit_dir, &exit_file_path) {
+                error!(
+                    "Exit file path {} escapes exit directory {}",
+                    exit_file_path.display(),
+                    exit_dir.display()
+                );
                 return;
             }
 
-            let exit_file_path = exit_dir.join(cid);
             if let Err(e) = write_file_atomic(&exit_file_path, &status_str) {
                 error!(
                     "Failed to write {} to exit file {}: {}",
@@ -261,6 +261,7 @@ pub fn close_all_except_stdio(snap: &OpenFilesSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Cid;
     use std::io;
     use std::thread;
     use tempfile::tempdir;
@@ -329,11 +330,11 @@ mod tests {
     fn write_exit_files_to_exit_dir_uses_cid_name() -> io::Result<()> {
         let dir = tempdir()?;
         let exit_dir = dir.path().to_path_buf();
-        let cid = String::from("abc123");
+        let cid = Cid::parse("abc123").unwrap();
 
         write_exit_files(9, None, Some(&exit_dir), Some(&cid));
 
-        assert_eq!(std::fs::read_to_string(exit_dir.join(&cid))?, "9");
+        assert_eq!(std::fs::read_to_string(exit_dir.join(cid.as_str()))?, "9");
         Ok(())
     }
 
@@ -365,27 +366,14 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_container_id_rejects_unsafe_ids() {
-        assert!(!is_safe_container_id(""));
-        assert!(!is_safe_container_id("."));
-        assert!(!is_safe_container_id(".."));
-        assert!(!is_safe_container_id("foo/bar"));
-        assert!(!is_safe_container_id("../outside"));
-        assert!(!is_safe_container_id("foo\0bar"));
-        assert!(!is_safe_container_id("\0"));
-    }
+    fn path_stays_under_rejects_prefix_sibling_paths() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("exit");
+        std::fs::create_dir_all(&base).unwrap();
+        let sibling = dir.path().join("exit-extra").join("file");
 
-    #[test]
-    fn is_safe_container_id_accepts_hex_and_extended_ids() {
-        assert!(is_safe_container_id("abc123"));
-        assert!(is_safe_container_id(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        ));
-        assert!(is_safe_container_id("my-container_1.0"));
-        assert!(is_safe_container_id("sha256:deadbeef"));
-        assert!(is_safe_container_id("ctr+with+plus"));
-        assert!(is_safe_container_id("café"));
-        assert!(is_safe_container_id("容器"));
+        assert!(path_stays_under(&base, &base.join("container1")));
+        assert!(!path_stays_under(&base, &sibling));
     }
 
     #[test]
@@ -396,7 +384,11 @@ mod tests {
         let outside = dir.path().join("outside");
 
         for bad_cid in ["", ".", "..", "foo/bar", "../outside", "foo\0bar"] {
-            write_exit_files(42, None, Some(&exit_dir), Some(&bad_cid.to_string()));
+            assert!(
+                Cid::parse(bad_cid).is_err(),
+                "expected {bad_cid:?} to be rejected"
+            );
+            write_exit_files(42, None, Some(&exit_dir), None);
             assert!(
                 !outside.exists(),
                 "rejected cid {bad_cid:?} must not create {outside:?}"
@@ -413,9 +405,10 @@ mod tests {
         let dir = tempdir()?;
         let exit_dir = dir.path().to_path_buf();
 
-        for cid in ["sha256:deadbeef", "ctr+with+plus", "café", "容器"] {
-            write_exit_files(3, None, Some(&exit_dir), Some(&cid.to_string()));
-            assert_eq!(std::fs::read_to_string(exit_dir.join(cid))?, "3");
+        for cid_str in ["sha256:deadbeef", "ctr+with+plus", "café", "容器"] {
+            let cid = Cid::parse(cid_str).unwrap();
+            write_exit_files(3, None, Some(&exit_dir), Some(&cid));
+            assert_eq!(std::fs::read_to_string(exit_dir.join(cid_str))?, "3");
         }
         Ok(())
     }
@@ -425,7 +418,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let exit_dir = dir.path().to_path_buf();
 
-        write_exit_files(7, None, Some(&exit_dir), Some(&"container1".to_string()));
+        let cid = Cid::parse("container1").unwrap();
+        write_exit_files(7, None, Some(&exit_dir), Some(&cid));
 
         let exit_file = exit_dir.join("container1");
         assert_eq!(std::fs::read_to_string(exit_file).unwrap(), "7");
@@ -442,7 +436,8 @@ mod tests {
         std::fs::write(&outside, "original").unwrap();
         symlink(&outside, exit_dir.join("container1")).unwrap();
 
-        write_exit_files(99, None, Some(&exit_dir), Some(&"container1".to_string()));
+        let cid = Cid::parse("container1").unwrap();
+        write_exit_files(99, None, Some(&exit_dir), Some(&cid));
 
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
         assert_eq!(
@@ -460,7 +455,8 @@ mod tests {
         std::fs::write(&outside, "original").unwrap();
         std::fs::hard_link(&outside, exit_dir.join("container1")).unwrap();
 
-        write_exit_files(42, None, Some(&exit_dir), Some(&"container1".to_string()));
+        let cid = Cid::parse("container1").unwrap();
+        write_exit_files(42, None, Some(&exit_dir), Some(&cid));
 
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
         assert_eq!(
@@ -479,7 +475,8 @@ mod tests {
         let fifo_path = exit_dir.join("container1");
         mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
 
-        write_exit_files(13, None, Some(&exit_dir), Some(&"container1".to_string()));
+        let cid = Cid::parse("container1").unwrap();
+        write_exit_files(13, None, Some(&exit_dir), Some(&cid));
 
         let meta = std::fs::metadata(&fifo_path).unwrap();
         assert!(meta.is_file());
