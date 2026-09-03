@@ -69,7 +69,7 @@ pub struct Opts {
     pub exit_args: Vec<String>,
 
     /// Delay before invoking the exit command (in seconds)
-    #[arg(long = "exit-delay", value_parser = clap::value_parser!(i32))]
+    #[arg(long = "exit-delay", value_parser = clap::value_parser!(i32), allow_negative_numbers = true)]
     pub exit_delay: Option<i32>,
 
     /// Path to the directory where exit files are written
@@ -89,11 +89,11 @@ pub struct Opts {
     pub log_path: Vec<PathBuf>,
 
     /// Maximum size of log file
-    #[arg(long = "log-size-max", value_parser = clap::value_parser!(i64))]
+    #[arg(long = "log-size-max", value_parser = clap::value_parser!(i64), allow_negative_numbers = true)]
     pub log_size_max: Option<i64>,
 
     /// Maximum size of all log files
-    #[arg(long = "log-global-size-max", value_parser = clap::value_parser!(i64))]
+    #[arg(long = "log-global-size-max", value_parser = clap::value_parser!(i64), allow_negative_numbers = true)]
     pub log_global_size_max: Option<i64>,
 
     /// Additional tag to use for logging
@@ -185,7 +185,7 @@ pub struct Opts {
     pub terminal: bool,
 
     /// Kill container after specified timeout in seconds
-    #[arg(long = "timeout", short = 'T', value_parser = clap::value_parser!(i32))]
+    #[arg(long = "timeout", short = 'T', value_parser = clap::value_parser!(i32), allow_negative_numbers = true)]
     pub timeout: Option<i32>,
 
     /// Print the version and exit (matches C behavior; not clap's -V)
@@ -209,7 +209,7 @@ pub struct Opts {
     pub log_rotate: bool,
 
     /// Number of backup log files to keep (default: 1)
-    #[arg(long = "log-max-files", value_parser = clap::value_parser!(i64), allow_hyphen_values = true, default_value_t = 1)]
+    #[arg(long = "log-max-files", value_parser = clap::value_parser!(i64), allow_negative_numbers = true, default_value_t = 1)]
     pub log_max_files: i64,
 
     /// Allowed log directory (can be specified multiple times)
@@ -243,7 +243,8 @@ pub struct CommonCfg {
     pub stdin: bool,
     pub leave_stdin_open: bool,
     pub terminal: bool,
-    pub timeout: Option<i32>,
+    /// Container kill timeout in seconds. `None` means no timeout.
+    pub timeout: Option<u64>,
     pub replace_listen_pid: bool,
     pub persist_dir: Option<PathBuf>,
     pub exit_dir: Option<PathBuf>,
@@ -315,6 +316,42 @@ fn is_executable(p: &Path) -> bool {
     false
 }
 
+/// Convert a CLI log-size value to an internal limit.
+///
+/// Negatives (including `-1`, the historical CRI-O / conmon-v2 default) mean
+/// unlimited and map to `0`. Positive values use a checked conversion to `usize`.
+fn log_size_limit(name: &str, value: Option<i64>) -> ConmonResult<usize> {
+    match value {
+        None => Ok(0),
+        Some(v) if v < 0 => Ok(0),
+        Some(v) => {
+            usize::try_from(v).map_err(|_| ConmonError::new(format!("{name} out of range"), 1))
+        }
+    }
+}
+
+/// Reject negative second counts. `0` and positive values are returned as `u64`.
+fn non_negative_secs(name: &str, value: Option<i32>) -> ConmonResult<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(v) if v < 0 => Err(ConmonError::new(
+            format!("{name} must be greater than or equal to 0"),
+            1,
+        )),
+        Some(v) => Ok(Some(
+            u64::try_from(v).expect("non-negative i32 fits in u64"),
+        )),
+    }
+}
+
+/// Timeout seconds: negatives are rejected; `0` means disabled (matches conmon-v2).
+fn timeout_secs(value: Option<i32>) -> ConmonResult<Option<u64>> {
+    match non_negative_secs("timeout", value)? {
+        None | Some(0) => Ok(None),
+        Some(secs) => Ok(Some(secs)),
+    }
+}
+
 pub fn determine_cmd(mut opts: Opts, logging_passthrough: bool) -> ConmonResult<Cmd> {
     let api_version = opts.api_version.unwrap_or(0);
 
@@ -369,6 +406,15 @@ pub fn determine_cmd(mut opts: Opts, logging_passthrough: bool) -> ConmonResult<
         ));
     }
 
+    // Reject negative delays early (matches conmon-v2); avoid wrapping casts later.
+    if opts.exit_delay.is_some_and(|d| d < 0) {
+        return Err(ConmonError::new(
+            "Delay before invoking exit command must be greater than or equal to 0",
+            1,
+        ));
+    }
+    let timeout = timeout_secs(opts.timeout)?;
+
     let cwd = std::env::current_dir()
         .map_err(|e| ConmonError::new(format!("Failed to get working directory: {e}"), 1))?;
 
@@ -403,7 +449,7 @@ pub fn determine_cmd(mut opts: Opts, logging_passthrough: bool) -> ConmonResult<
         stdin: opts.stdin,
         leave_stdin_open: opts.leave_stdin_open,
         terminal: opts.terminal,
-        timeout: opts.timeout,
+        timeout,
         replace_listen_pid: opts.replace_listen_pid,
         persist_dir: opts.persist_dir,
         exit_dir: opts.exit_dir,
@@ -467,6 +513,9 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
     }
     let max_files = raw_max_files as i32;
 
+    let max_size = log_size_limit("log-size-max", opts.log_size_max)?;
+    let global_max_size = log_size_limit("log-global-size-max", opts.log_global_size_max)?;
+
     // Base config from non-path options (shared by all plugin instances).
     let base_cfg = LogPluginCfg {
         path: PathBuf::new(),
@@ -477,8 +526,8 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
         no_container_partial_message: opts.no_container_partial_message,
         name: opts.name.clone(),
         no_sync: opts.no_sync_log,
-        max_size: opts.log_size_max.unwrap_or(0) as usize,
-        global_max_size: opts.log_global_size_max.unwrap_or(0) as usize,
+        max_size,
+        global_max_size,
         max_files,
         allowlist_dirs: if opts.log_allowlist_dir.is_empty() {
             None
@@ -908,6 +957,159 @@ mod tests {
             err.to_string()
                 .contains("log-max-files must be non-negative")
         );
+    }
+
+    #[test]
+    fn log_size_max_negative_means_unlimited() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            log_size_max: Some(-1),
+            log_global_size_max: Some(-5),
+            ..Default::default()
+        };
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries[0].1.max_size, 0);
+        assert_eq!(entries[0].1.global_max_size, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn clap_accepts_space_separated_negative_numeric_options() {
+        // Podman/CRI-O pass forms like `--log-size-max -1`; allow_negative_numbers
+        // must accept these without treating `-1` as an unknown flag.
+        let opts = Opts::try_parse_from([
+            "conmon",
+            "--log-size-max",
+            "-1",
+            "--log-global-size-max",
+            "-1",
+            "--timeout",
+            "-1",
+            "--exit-delay",
+            "-1",
+            "--log-max-files",
+            "-1",
+        ])
+        .expect("clap should accept space-separated negative numbers");
+        assert_eq!(opts.log_size_max, Some(-1));
+        assert_eq!(opts.log_global_size_max, Some(-1));
+        assert_eq!(opts.timeout, Some(-1));
+        assert_eq!(opts.exit_delay, Some(-1));
+        assert_eq!(opts.log_max_files, -1);
+    }
+
+    #[test]
+    fn clap_rejects_hyphen_prefixed_non_numeric_for_numeric_options() {
+        // allow_negative_numbers must not swallow arbitrary hyphen tokens the way
+        // allow_hyphen_values would.
+        let err = Opts::try_parse_from(["conmon", "--log-size-max", "--bogus"])
+            .expect_err("non-numeric hyphen token must not be a log-size-max value");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected argument") || msg.contains("invalid value"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn log_size_max_zero_and_positive_are_preserved() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("/var/log/my.log")],
+            log_size_max: Some(0),
+            log_global_size_max: Some(4096),
+            ..Default::default()
+        };
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries[0].1.max_size, 0);
+        assert_eq!(entries[0].1.global_max_size, 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn log_size_limit_checked_conversion_boundaries() -> ConmonResult<()> {
+        assert_eq!(log_size_limit("log-size-max", None)?, 0);
+        assert_eq!(log_size_limit("log-size-max", Some(-1))?, 0);
+        assert_eq!(log_size_limit("log-size-max", Some(i64::MIN))?, 0);
+        assert_eq!(log_size_limit("log-size-max", Some(0))?, 0);
+        assert_eq!(log_size_limit("log-size-max", Some(1))?, 1);
+        // i64::MAX always fits in usize on 64-bit; on 32-bit it must error.
+        match log_size_limit("log-size-max", Some(i64::MAX)) {
+            Ok(v) => assert_eq!(v, usize::try_from(i64::MAX).unwrap()),
+            Err(err) => assert!(err.to_string().contains("out of range")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_negative_is_rejected() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            timeout: Some(-1),
+            ..Default::default()
+        };
+        let err = determine_cmd(o, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("timeout must be greater than or equal to 0")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_zero_means_disabled() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            timeout: Some(0),
+            ..Default::default()
+        };
+        let cmd = determine_cmd(o, false)?;
+        match cmd {
+            Cmd::Create(cfg) => assert_eq!(cfg.common.timeout, None),
+            other => panic!("expected Create, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_positive_is_preserved() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            timeout: Some(30),
+            ..Default::default()
+        };
+        let cmd = determine_cmd(o, false)?;
+        match cmd {
+            Cmd::Create(cfg) => assert_eq!(cfg.common.timeout, Some(30)),
+            other => panic!("expected Create, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exit_delay_negative_is_rejected() -> ConmonResult<()> {
+        let runtime = make_temp_file_with_mode(0o700);
+        let o = Opts {
+            cid: Some("abc".into()),
+            cuuid: Some("u1".into()),
+            runtime: Some(runtime.path().to_path_buf()),
+            exit_delay: Some(-1),
+            ..Default::default()
+        };
+        let err = determine_cmd(o, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Delay before invoking exit command must be greater than or equal to 0")
+        );
+        Ok(())
     }
 
     #[test]

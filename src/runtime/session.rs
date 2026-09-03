@@ -347,10 +347,13 @@ impl RuntimeSession {
             self.sdnotify_socket_path = common.sdnotify_socket.clone();
         }
 
-        // Set the timeout if --timeout is used.
+        // Set the timeout if --timeout is used (already validated as > 0 seconds).
         if let Some(t) = common.timeout {
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            self.timeout = now.as_secs() + t as u64;
+            self.timeout = now
+                .as_secs()
+                .checked_add(t)
+                .ok_or_else(|| ConmonError::new("Timeout overflow", 1))?;
         }
 
         // Generate the list of arguments for runtime.

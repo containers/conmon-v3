@@ -81,9 +81,17 @@ pub fn run_exit_command(
         return Ok(());
     }
 
-    // Wait for a delay if used.
+    // Wait for a delay if used. Reject negatives so `as u64` never wraps.
     if let Some(delay) = exit_command_delay {
-        thread::sleep(Duration::from_secs(delay as u64));
+        let secs = u64::try_from(delay).map_err(|_| {
+            ConmonError::new(
+                "Delay before invoking exit command must be greater than or equal to 0",
+                1,
+            )
+        })?;
+        if secs > 0 {
+            thread::sleep(Duration::from_secs(secs));
+        }
     }
 
     // Build and spawn the exit command.
@@ -336,6 +344,21 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(exit_dir.join(cid.as_str()))?, "9");
         Ok(())
+    }
+
+    #[test]
+    fn run_exit_command_rejects_negative_delay_without_sleeping() {
+        let start = std::time::Instant::now();
+        let err =
+            run_exit_command(Some(PathBuf::from("/bin/true")), Vec::new(), Some(-1)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Delay before invoking exit command must be greater than or equal to 0")
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "negative exit-delay must not sleep"
+        );
     }
 
     #[test]

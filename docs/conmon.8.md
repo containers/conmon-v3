@@ -118,8 +118,9 @@ once.
 
 **--timeout**, **-T**=_SECONDS_
 
-: Kill the container after the specified timeout in seconds. If unset, conmon
-  does not impose a timeout on the container.
+: Kill the container after the specified timeout in seconds. If unset or **0**,
+  conmon does not impose a timeout on the container. Negative values are
+  rejected.
 
 **--sync**
 
@@ -198,6 +199,7 @@ once.
 **--exit-delay**=_SECONDS_
 
 : Delay, in seconds, before invoking the exit command after container exit.
+  The value must be greater than or equal to **0**.
 
 ## Logging options
 
@@ -229,12 +231,15 @@ once.
 **--log-size-max**=_BYTES_
 
 : Maximum size in bytes of a single container log file before rotation or
-  truncation is considered. If unset, the default is 0 (no size-based limit).
+  truncation is considered. If unset or **0**, there is no size-based limit.
+  Negative values (including **-1**, the historical CRI-O default) also mean
+  unlimited.
 
 **--log-global-size-max**=_BYTES_
 
 : Maximum total size in bytes of all log files managed by the log plugin. If
-  unset, the default is 0 (no global size limit).
+  unset or **0**, there is no global size limit. Negative values (including
+  **-1**) also mean unlimited.
 
 **--log-tag**=_STRING_
 
