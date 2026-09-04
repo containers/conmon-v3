@@ -10,6 +10,7 @@ use nix::{
     fcntl::OFlag,
     libc::{SHUT_RD, shutdown},
     poll::{PollFd, PollFlags, poll},
+    sys::signalfd::SignalFd,
     sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg},
     sys::wait::{Id, WaitPidFlag, WaitStatus, waitid},
     unistd::{Pid, pipe2, read},
@@ -318,11 +319,11 @@ pub fn handle_stdio<F>(
     notify_host_path: Option<PathBuf>,
     stdin_attached: bool,
     leave_stdin_open: bool,
-    signal_fd: i32,
+    signal_fd: Option<SignalFd>,
     mut idle_callback: F,
 ) -> ConmonResult<()>
 where
-    F: FnMut(bool) -> ConmonResult<bool>,
+    F: FnMut(Option<&SignalFd>) -> ConmonResult<bool>,
 {
     debug!("Starting event loop");
     let mut sockets: Vec<Socket> = Vec::new();
@@ -376,10 +377,9 @@ where
     }
 
     // Signal FD to receive UNIX signals.
-    // It is owned by the RuntimeSession and borrowed raw
-    // here only for polling.
-    if signal_fd > 0 {
-        info!("SignalFD: {}", signal_fd);
+    // It is owned by the RuntimeSession and borrowed here only for polling.
+    if let Some(signal_fd) = signal_fd {
+        info!("SignalFD: {}", signal_fd.as_raw_fd());
         sockets.push(Socket::Signal(signal_fd));
     }
 
@@ -409,10 +409,7 @@ where
                     };
                     PollFd::new(remote.fd.as_fd(), events)
                 }
-                // The signal fd is only borrowed by its raw value here.
-                Socket::Signal(fd) => {
-                    PollFd::new(unsafe { BorrowedFd::borrow_raw(*fd) }, PollFlags::POLLIN)
-                }
+                Socket::Signal(fd) => PollFd::new(fd.as_fd(), PollFlags::POLLIN),
             })
             .collect();
 
@@ -434,7 +431,7 @@ where
 
         // We have no fd to read from, so execute the idle function.
         if n == 0 {
-            let keep_running = idle_callback(false)?;
+            let keep_running = idle_callback(None)?;
             if !keep_running {
                 info!("idle_callback stopped the event loop.");
                 return Ok(());
@@ -452,10 +449,10 @@ where
 
             if let Some(events) = revents[i] {
                 if events.contains(PollFlags::POLLIN) {
-                    // If the POLLIN comes from the signal fd, run the idle_callback to
-                    // handle the received signal.
-                    if matches!(sockets[i], Socket::Signal(_)) {
-                        if !idle_callback(true)? {
+                    // If the POLLIN comes from the signal fd, hand the signal fd to
+                    // the idle_callback so it can read and forward the signal.
+                    if let Socket::Signal(signal_fd) = &sockets[i] {
+                        if !idle_callback(Some(signal_fd))? {
                             info!("idle_callback stopped the event loop after signal.");
                             return Ok(());
                         }
@@ -520,7 +517,7 @@ where
     }
 
     // All remote sockets closed; probe for a container that exited while I/O drained.
-    let keep_running = idle_callback(false)?;
+    let keep_running = idle_callback(None)?;
     if !keep_running {
         info!("idle_callback stopped the event loop after sockets closed.");
     }

@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
 
@@ -770,7 +770,7 @@ impl RuntimeSession {
     /// # Errors
     ///
     /// * [`ConmonError`] on any error.
-    fn idle_callback(&mut self, signal_received: bool) -> ConmonResult<bool> {
+    fn idle_callback(&mut self, signals: Option<&SignalFd>) -> ConmonResult<bool> {
         // Fast-exiting exec processes may already have a recorded status before
         // the event loop starts (or right after the first reap). Stop immediately.
         if self.container_status.is_some() {
@@ -778,23 +778,21 @@ impl RuntimeSession {
         }
 
         // We received a signal.
-        if signal_received {
-            if let Some(signals) = &self.signals {
-                // Read the signal.
-                match signals.read_signal() {
-                    Ok(Some(info)) => {
-                        if let Ok(sig) = Signal::try_from(info.ssi_signo as i32) {
-                            // Forward the signal the container if it's running.
-                            info!("Received signal: {:?}", sig);
-                            if let Some(raw_pid) = self.container_pid {
-                                let pid = Pid::from_raw(raw_pid);
-                                kill(pid, sig)?;
-                            }
+        if let Some(signals) = signals {
+            // Read the signal.
+            match signals.read_signal() {
+                Ok(Some(info)) => {
+                    if let Ok(sig) = Signal::try_from(info.ssi_signo as i32) {
+                        // Forward the signal the container if it's running.
+                        info!("Received signal: {:?}", sig);
+                        if let Some(raw_pid) = self.container_pid {
+                            let pid = Pid::from_raw(raw_pid);
+                            kill(pid, sig)?;
                         }
                     }
-                    Ok(None) => return Ok(true),
-                    Err(_) => return Ok(true),
                 }
+                Ok(None) => return Ok(true),
+                Err(_) => return Ok(true),
             }
             return Ok(self.container_status.is_none());
         }
@@ -851,10 +849,9 @@ impl RuntimeSession {
     ) -> ConmonResult<()> {
         #[allow(clippy::collapsible_if)]
         if let Some(mainfd_err) = self.mainfd_stderr.take() {
-            let mut signal_fd: i32 = -1;
-            if let Some(signals) = &self.signals {
-                signal_fd = signals.as_fd().as_raw_fd();
-            }
+            // Hand the signal-fd to the event loop, which owns it while polling and
+            // lends it back to `idle_callback` when a signal arrives.
+            let signal_fd = self.signals.take();
             handle_stdio(
                 log_plugin,
                 self.mainfd_stdout.take(),
@@ -870,7 +867,7 @@ impl RuntimeSession {
                 stdin_attached,
                 leave_stdin_open,
                 signal_fd,
-                |signal_received| self.idle_callback(signal_received),
+                |signals| self.idle_callback(signals),
             )?;
             self.finalize_container_exit()?;
             return Ok(());
@@ -1110,7 +1107,7 @@ mod tests {
         // (write_container_pid_file registers PID, then reap_pending_children).
         // End-to-end coverage for this path is the TMT `/podman` system suite.
         sess.handle_container_wait_status(WaitStatus::Exited(Pid::from_raw(4242), 5));
-        assert!(!sess.idle_callback(false)?);
+        assert!(!sess.idle_callback(None)?);
         assert_eq!(sess.container_exit_code(), Some(5));
         Ok(())
     }
@@ -1179,7 +1176,7 @@ mod tests {
         sess.container_started = true;
         sess.container_status = Some(0);
         sess.container_pid = None;
-        assert!(!sess.idle_callback(false)?);
+        assert!(!sess.idle_callback(None)?);
         Ok(())
     }
 

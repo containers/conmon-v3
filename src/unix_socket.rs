@@ -23,7 +23,7 @@ use crate::{
 use std::{
     ffi::OsStr,
     io,
-    os::fd::{AsRawFd, FromRawFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::ffi::OsStrExt,
 };
 
@@ -31,6 +31,7 @@ use nix::{
     NixPath,
     fcntl::{AT_FDCWD, open},
     sys::{
+        signalfd::SignalFd,
         socket::{
             AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket,
         },
@@ -789,7 +790,7 @@ fn filter_notify_payload(data: &[u8]) -> Vec<u8> {
 pub enum Socket {
     Unix(UnixSocket),
     Remote(RemoteSocket),
-    Signal(RawFd),
+    Signal(SignalFd),
 }
 
 impl Socket {
