@@ -62,6 +62,8 @@ pub fn generate_runtime_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Cid;
+    use crate::cli::test_common_cfg;
     use crate::error::{ConmonError, ConmonResult};
 
     struct OkGen {
@@ -103,12 +105,12 @@ mod tests {
     fn orders_runtime_args_correctly() {
         let common = CommonCfg {
             runtime: "./runtime".into(),
-            cid: "abc123".into(),
+            cid: Cid::parse("abc123").unwrap(),
             runtime_args: vec!["--root".into(), "/var/lib/runc".into()],
             runtime_opts: vec!["--optA".into(), "x".into()],
             no_pivot: true,
             no_new_keyring: true,
-            ..Default::default()
+            ..test_common_cfg("abc123")
         };
 
         let args_gen = OkGen {
@@ -139,12 +141,12 @@ mod tests {
     fn propagates_error_from_add_global_args() {
         let common = CommonCfg {
             runtime: "./runtime".into(),
-            cid: "cid".into(),
+            cid: Cid::parse("cid").unwrap(),
             runtime_args: vec![],
             runtime_opts: vec![],
             no_pivot: false,
             no_new_keyring: false,
-            ..Default::default()
+            ..test_common_cfg("cid")
         };
 
         let err = generate_runtime_args(&common, &FailGlobal, None).unwrap_err();
@@ -155,12 +157,12 @@ mod tests {
     fn propagates_error_from_add_subcommand_args() {
         let common = CommonCfg {
             runtime: "./runtime".into(),
-            cid: "cid".into(),
+            cid: Cid::parse("cid").unwrap(),
             runtime_args: vec!["--ra".into()],
             runtime_opts: vec!["--ro".into()],
             no_pivot: false,
             no_new_keyring: false,
-            ..Default::default()
+            ..test_common_cfg("cid")
         };
 
         let err = generate_runtime_args(&common, &FailSub, None).unwrap_err();
