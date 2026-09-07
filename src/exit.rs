@@ -52,7 +52,7 @@ pub fn set_subreaper(enabled: bool) -> ConmonResult<()> {
 pub fn run_exit_command(
     exit_command: Option<PathBuf>,
     exit_command_args: Vec<String>,
-    exit_command_delay: Option<i32>,
+    exit_command_delay: Option<u64>,
 ) -> ConmonResult<()> {
     // Stop being a subreaper.
     let r = set_subreaper(false);
@@ -81,14 +81,8 @@ pub fn run_exit_command(
         return Ok(());
     }
 
-    // Wait for a delay if used. Reject negatives so `as u64` never wraps.
-    if let Some(delay) = exit_command_delay {
-        let secs = u64::try_from(delay).map_err(|_| {
-            ConmonError::new(
-                "Delay before invoking exit command must be greater than or equal to 0",
-                1,
-            )
-        })?;
+    // Wait for a delay if used (parsed as non-negative u64 by clap).
+    if let Some(secs) = exit_command_delay {
         if secs > 0 {
             thread::sleep(Duration::from_secs(secs));
         }
@@ -347,17 +341,13 @@ mod tests {
     }
 
     #[test]
-    fn run_exit_command_rejects_negative_delay_without_sleeping() {
+    fn run_exit_command_zero_delay_does_not_sleep() {
         let start = std::time::Instant::now();
-        let err =
-            run_exit_command(Some(PathBuf::from("/bin/true")), Vec::new(), Some(-1)).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Delay before invoking exit command must be greater than or equal to 0")
-        );
+        run_exit_command(Some(PathBuf::from("/bin/true")), Vec::new(), Some(0))
+            .expect("zero delay should succeed");
         assert!(
             start.elapsed() < Duration::from_secs(1),
-            "negative exit-delay must not sleep"
+            "zero exit-delay must not sleep"
         );
     }
 

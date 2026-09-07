@@ -20,8 +20,10 @@ pub struct LogPluginCfg {
     pub no_container_partial_message: bool,
     pub name: Option<String>,
     pub no_sync: bool,
-    pub max_size: usize,
-    pub global_max_size: usize,
+    /// Per-file size limit in bytes. `None` means unlimited.
+    pub max_size: Option<usize>,
+    /// Aggregate size limit in bytes. `None` means unlimited.
+    pub global_max_size: Option<usize>,
     pub max_files: i32,
     pub allowlist_dirs: Option<Vec<PathBuf>>,
     pub rotate: bool,
