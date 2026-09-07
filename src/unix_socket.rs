@@ -324,8 +324,10 @@ impl RemoteSocket {
     ///
     /// # Returns
     ///
-    /// * The number of bytes read.
-    pub fn read(&mut self) -> ConmonResult<usize> {
+    /// * `Ok(Some(n))` — `n` bytes were read (`n == 0` is EOF).
+    /// * `Ok(None)` — non-blocking FD would block (`EAGAIN`/`EWOULDBLOCK`);
+    ///   the caller should return to `poll` instead of retrying immediately.
+    pub fn read(&mut self) -> ConmonResult<Option<usize>> {
         // Ensure there is a space. If we are full, try compacting first.
         if !self.buf.make_space() {
             return Err(ConmonError::new("line too long for buffer", 1));
@@ -342,9 +344,11 @@ impl RemoteSocket {
                 | SocketType::Inotify
                 | SocketType::ConsoleFifo => match read(self.fd.as_fd(), dst) {
                     Ok(n) => break n,
-                    Err(err) if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN => {
-                        continue;
+                    // yield to poll; do not busy-loop.
+                    Err(err) if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK => {
+                        return Ok(None);
                     }
+                    Err(Errno::EINTR) => continue,
                     Err(err) => {
                         return Err(ConmonError::new(
                             format!("read failed: {}", io::Error::from_raw_os_error(err as i32)),
@@ -354,9 +358,10 @@ impl RemoteSocket {
                 },
                 _ => match recvfrom::<SockaddrStorage>(self.fd.as_fd().as_raw_fd(), dst) {
                     Ok((n, _addr)) => break n,
-                    Err(err) if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN => {
-                        continue;
+                    Err(err) if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK => {
+                        return Ok(None);
                     }
+                    Err(Errno::EINTR) => continue,
                     Err(err) => {
                         return Err(ConmonError::new(
                             format!(
@@ -372,7 +377,7 @@ impl RemoteSocket {
         };
 
         self.buf.advance_by(n);
-        Ok(n)
+        Ok(Some(n))
     }
 
     /// Returns the next newline-terminated control line as owned UTF-8 text.
@@ -826,7 +831,11 @@ impl Socket {
             Socket::Remote(r) => {
                 // Client socket. Read what has been sent to it.
                 let bytes_read = match r.read() {
-                    Ok(n) => n,
+                    Ok(None) => {
+                        // EAGAIN after poll: keep the socket and wait for the next poll.
+                        return Ok(true);
+                    }
+                    Ok(Some(n)) => n,
                     Err(e) => {
                         r.clear_buffer();
                         error!("read error: {e}");
@@ -1117,5 +1126,59 @@ mod next_line_tests {
         // Invalid line was consumed; later valid lines remain available.
         assert_eq!(socket.next_line().unwrap().as_deref(), Some("later\n"));
         assert!(socket.next_line().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod remote_socket_read_tests {
+    use super::*;
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn read_returns_none_quickly_on_eagain_stream() -> ConmonResult<()> {
+        let (r, _w) = nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
+        let mut socket = RemoteSocket::new(SocketType::ConsoleFifo, r);
+
+        let start = Instant::now();
+        let result = socket.read()?;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "EAGAIN must not busy-loop; elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(result, None);
+        assert!(socket.buf.data().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn read_returns_none_quickly_on_eagain_datagram() -> ConmonResult<()> {
+        let (a, _b) = socketpair(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut socket = RemoteSocket::new(SocketType::Notify, a);
+
+        let start = Instant::now();
+        let result = socket.read()?;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "EAGAIN must not busy-loop; elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(result, None);
+        Ok(())
+    }
+
+    #[test]
+    fn read_returns_some_zero_on_eof() -> ConmonResult<()> {
+        let (r, w) = nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
+        drop(w);
+        let mut socket = RemoteSocket::new(SocketType::Stdout, r);
+        assert_eq!(socket.read()?, Some(0));
+        Ok(())
     }
 }
