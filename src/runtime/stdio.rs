@@ -1,7 +1,7 @@
 use crate::{
     error::{ConmonError, ConmonResult},
     logging::plugin::LogPlugin,
-    unix_socket::{RemoteSocket, Socket, SocketType, UnixSocket},
+    unix_socket::{ATTACH_WRITE_TIMEOUT, RemoteSocket, Socket, SocketType, UnixSocket},
 };
 
 use nix::{
@@ -400,13 +400,16 @@ where
                     PollFlags::POLLIN,
                 ),
                 Socket::Remote(remote) => {
-                    // A socket whose read side reached EOF is no longer polled,
-                    // but stays alive for writing.
-                    let events = if remote.read_closed {
+                    // A socket whose read side reached EOF is no longer polled for
+                    // input, but stays alive for writing (and POLLOUT when pending).
+                    let mut events = if remote.read_closed {
                         PollFlags::empty()
                     } else {
                         PollFlags::POLLIN
                     };
+                    if remote.needs_pollout() {
+                        events |= PollFlags::POLLOUT;
+                    }
                     PollFd::new(remote.fd.as_fd(), events)
                 }
                 Socket::Signal(fd) => PollFd::new(fd.as_fd(), PollFlags::POLLIN),
@@ -429,6 +432,27 @@ where
         let mut revents: Vec<Option<PollFlags>> = pollfds.iter().map(|pfd| pfd.revents()).collect();
         drop(pollfds);
 
+        // Expire attach peers that have been blocked on write too long.
+        // Also runs on poll timeout (n == 0) so a never-readable client is dropped.
+        let now = Instant::now();
+        for socket in sockets.iter_mut() {
+            if let Socket::Remote(remote) = socket {
+                remote.expire_attach_write_timeout(now, ATTACH_WRITE_TIMEOUT);
+            }
+        }
+        // Drop failed peers while keeping revents index-aligned.
+        let mut i = 0;
+        while i < sockets.len() {
+            let failed = matches!(&sockets[i], Socket::Remote(r) if r.write_failed);
+            if failed {
+                let socket = sockets.swap_remove(i);
+                info!("Removing socket {:?}", socket);
+                revents.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
         // We have no fd to read from, so execute the idle function.
         if n == 0 {
             let keep_running = idle_callback(None)?;
@@ -448,6 +472,13 @@ where
             let mut continue_reading = true;
 
             if let Some(events) = revents[i] {
+                // Flush queued attach output before handling new input on this FD.
+                if events.contains(PollFlags::POLLOUT)
+                    && let Socket::Remote(remote) = &mut sockets[i]
+                {
+                    remote.flush_pending_attach_writes();
+                }
+
                 if events.contains(PollFlags::POLLIN) {
                     // If the POLLIN comes from the signal fd, hand the signal fd to
                     // the idle_callback so it can read and forward the signal.
@@ -514,6 +545,12 @@ where
                 // Do NOT increment the `i`, since it now points to swapped fd.
             }
         }
+
+        // Drop attach clients whose writes failed during POLLOUT flush / handle_data.
+        sockets.retain(|s| match s {
+            Socket::Remote(r) => !r.write_failed,
+            _ => true,
+        });
     }
 
     // All remote sockets closed; probe for a container that exited while I/O drained.
