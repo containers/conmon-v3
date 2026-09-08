@@ -58,6 +58,17 @@ pub enum SocketType {
 
 type RemoteSocketHandler = Box<dyn FnMut(&[u8]) -> bool + Send + 'static>;
 
+/// Outcome of a single non-blocking [`RemoteSocket::read`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadResult {
+    /// Peer closed the stream (`read`/`recvfrom` returned 0).
+    Eof,
+    /// No data available right now; return to `poll` instead of retrying.
+    WouldBlock,
+    /// `n` bytes were appended to the socket buffer (`n > 0`).
+    Read(usize),
+}
+
 // Do not change the buffer size. It is in sync with podman and other
 // parent apps. We use SOCK_SEQPACKET and if we cannot fit whole packet
 // received from parent in a single `recvfrom`, the remaining data is lost.
@@ -321,11 +332,7 @@ impl RemoteSocket {
     }
 
     /// Reads some bytes into the rolling buffer, without dispatching yet.
-    ///
-    /// # Returns
-    ///
-    /// * The number of bytes read.
-    pub fn read(&mut self) -> ConmonResult<usize> {
+    pub fn read(&mut self) -> ConmonResult<ReadResult> {
         // Ensure there is a space. If we are full, try compacting first.
         if !self.buf.make_space() {
             return Err(ConmonError::new("line too long for buffer", 1));
@@ -342,9 +349,11 @@ impl RemoteSocket {
                 | SocketType::Inotify
                 | SocketType::ConsoleFifo => match read(self.fd.as_fd(), dst) {
                     Ok(n) => break n,
-                    Err(err) if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN => {
-                        continue;
+                    // yield to poll; do not busy-loop.
+                    Err(err) if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK => {
+                        return Ok(ReadResult::WouldBlock);
                     }
+                    Err(Errno::EINTR) => continue,
                     Err(err) => {
                         return Err(ConmonError::new(
                             format!("read failed: {}", io::Error::from_raw_os_error(err as i32)),
@@ -354,9 +363,10 @@ impl RemoteSocket {
                 },
                 _ => match recvfrom::<SockaddrStorage>(self.fd.as_fd().as_raw_fd(), dst) {
                     Ok((n, _addr)) => break n,
-                    Err(err) if err == Errno::EWOULDBLOCK || err == Errno::EAGAIN => {
-                        continue;
+                    Err(err) if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK => {
+                        return Ok(ReadResult::WouldBlock);
                     }
+                    Err(Errno::EINTR) => continue,
                     Err(err) => {
                         return Err(ConmonError::new(
                             format!(
@@ -371,8 +381,11 @@ impl RemoteSocket {
             }
         };
 
+        if n == 0 {
+            return Ok(ReadResult::Eof);
+        }
         self.buf.advance_by(n);
-        Ok(n)
+        Ok(ReadResult::Read(n))
     }
 
     /// Returns the next newline-terminated control line as owned UTF-8 text.
@@ -825,16 +838,18 @@ impl Socket {
             }
             Socket::Remote(r) => {
                 // Client socket. Read what has been sent to it.
-                let bytes_read = match r.read() {
-                    Ok(n) => n,
+                match r.read() {
+                    Ok(ReadResult::WouldBlock) => {
+                        // EAGAIN after poll: keep the socket and wait for the next poll.
+                        return Ok(true);
+                    }
+                    Ok(ReadResult::Eof) => return Ok(false),
+                    Ok(ReadResult::Read(_)) => {}
                     Err(e) => {
                         r.clear_buffer();
                         error!("read error: {e}");
                         return Ok(true);
                     }
-                };
-                if bytes_read == 0 {
-                    return Ok(false);
                 }
 
                 // If the Socket has a handler, call the handler directly and return.
@@ -1117,5 +1132,59 @@ mod next_line_tests {
         // Invalid line was consumed; later valid lines remain available.
         assert_eq!(socket.next_line().unwrap().as_deref(), Some("later\n"));
         assert!(socket.next_line().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod remote_socket_read_tests {
+    use super::*;
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn read_returns_would_block_quickly_on_eagain_stream() -> ConmonResult<()> {
+        let (r, _w) = nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
+        let mut socket = RemoteSocket::new(SocketType::ConsoleFifo, r);
+
+        let start = Instant::now();
+        let result = socket.read()?;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "EAGAIN must not busy-loop; elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(result, ReadResult::WouldBlock);
+        assert!(socket.buf.data().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn read_returns_would_block_quickly_on_eagain_datagram() -> ConmonResult<()> {
+        let (a, _b) = socketpair(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut socket = RemoteSocket::new(SocketType::Notify, a);
+
+        let start = Instant::now();
+        let result = socket.read()?;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "EAGAIN must not busy-loop; elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(result, ReadResult::WouldBlock);
+        Ok(())
+    }
+
+    #[test]
+    fn read_returns_eof_when_peer_closed() -> ConmonResult<()> {
+        let (r, w) = nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
+        drop(w);
+        let mut socket = RemoteSocket::new(SocketType::Stdout, r);
+        assert_eq!(socket.read()?, ReadResult::Eof);
+        Ok(())
     }
 }
