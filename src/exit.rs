@@ -52,7 +52,7 @@ pub fn set_subreaper(enabled: bool) -> ConmonResult<()> {
 pub fn run_exit_command(
     exit_command: Option<PathBuf>,
     exit_command_args: Vec<String>,
-    exit_command_delay: Option<i32>,
+    exit_command_delay: Option<u64>,
 ) -> ConmonResult<()> {
     // Stop being a subreaper.
     let r = set_subreaper(false);
@@ -81,9 +81,11 @@ pub fn run_exit_command(
         return Ok(());
     }
 
-    // Wait for a delay if used.
-    if let Some(delay) = exit_command_delay {
-        thread::sleep(Duration::from_secs(delay as u64));
+    // Wait for a delay if used (parsed as non-negative u64 by clap).
+    if let Some(secs) = exit_command_delay {
+        if secs > 0 {
+            thread::sleep(Duration::from_secs(secs));
+        }
     }
 
     // Build and spawn the exit command.
@@ -336,6 +338,17 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(exit_dir.join(cid.as_str()))?, "9");
         Ok(())
+    }
+
+    #[test]
+    fn run_exit_command_zero_delay_does_not_sleep() {
+        let start = std::time::Instant::now();
+        run_exit_command(Some(PathBuf::from("/bin/true")), Vec::new(), Some(0))
+            .expect("zero delay should succeed");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "zero exit-delay must not sleep"
+        );
     }
 
     #[test]

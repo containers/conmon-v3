@@ -33,8 +33,8 @@ pub struct FileLogger {
     stdout_has_partial: bool,
     stderr_has_partial: bool,
     no_sync: bool,
-    max_size: u64,
-    global_max_size: u64,
+    max_size: Option<u64>,
+    global_max_size: Option<u64>,
     bytes_written: u64,
     total_bytes_written: u64,
     path: PathBuf,
@@ -71,8 +71,10 @@ impl FileLogger {
             stdout_has_partial: false,
             stderr_has_partial: false,
             no_sync: cfg.no_sync,
-            max_size: cfg.max_size as u64,
-            global_max_size: cfg.global_max_size as u64,
+            max_size: cfg.max_size.map(|n| u64::try_from(n).unwrap_or(u64::MAX)),
+            global_max_size: cfg
+                .global_max_size
+                .map(|n| u64::try_from(n).unwrap_or(u64::MAX)),
             bytes_written: metadata.len(),
             total_bytes_written: metadata.len(),
             path: cfg.path.clone(),
@@ -635,10 +637,10 @@ impl FileLogger {
 
     /// Rotates a log when configured so and next record would push us over `self.max_size`.
     fn rotate_if_needed(&mut self, bytes_to_be_written: u64) -> ConmonResult<()> {
-        if self.max_size > 0
-            && self.bytes_written.saturating_add(bytes_to_be_written) >= self.max_size
-        {
-            self.rotate()?;
+        if let Some(max_size) = self.max_size {
+            if self.bytes_written.saturating_add(bytes_to_be_written) >= max_size {
+                self.rotate()?;
+            }
         }
         Ok(())
     }
@@ -681,11 +683,10 @@ impl LogPlugin for FileLogger {
 
             // bytes: timestamp + "F\n"
             let bytes_to_be_written = ts_len as u64 + 2;
-            if self.global_max_size > 0
-                && self.total_bytes_written.saturating_add(bytes_to_be_written)
-                    >= self.global_max_size
-            {
-                return Ok(());
+            if let Some(global_max) = self.global_max_size {
+                if self.total_bytes_written.saturating_add(bytes_to_be_written) >= global_max {
+                    return Ok(());
+                }
             }
             self.rotate_if_needed(bytes_to_be_written)?;
 
@@ -725,11 +726,10 @@ impl LogPlugin for FileLogger {
             }
 
             // Enforce global max before writing.
-            if self.global_max_size > 0
-                && self.total_bytes_written.saturating_add(bytes_to_be_written)
-                    >= self.global_max_size
-            {
-                break;
+            if let Some(global_max) = self.global_max_size {
+                if self.total_bytes_written.saturating_add(bytes_to_be_written) >= global_max {
+                    break;
+                }
             }
 
             // Rotate if needed before writing this record.

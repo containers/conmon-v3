@@ -51,7 +51,11 @@ pub fn process_winsz_ctrl_line(stdout_fd: i32, line: &str) -> ConmonResult<()> {
     }
 
     unsafe {
-        resize_winsz(stdout_fd, height as u16, width as u16);
+        resize_winsz(
+            stdout_fd,
+            u16::try_from(height).expect("height validated to 0..=1000"),
+            u16::try_from(width).expect("width validated to 0..=1000"),
+        );
     }
 
     Ok(())
