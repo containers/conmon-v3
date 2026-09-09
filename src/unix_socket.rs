@@ -852,9 +852,12 @@ impl Socket {
                     }
                 }
 
-                // If the Socket has a handler, call the handler directly and return.
-                if let Some(handler) = r.handler.as_mut() {
-                    return Ok(handler(r.buf.data()));
+                // If the Socket has a handler, call it and drain the buffer.
+                // Handlers (e.g. OOM inotify) typically ignore payload bytes; without
+                // clearing, events accumulate until make_space() fails at capacity.
+                if let Some(keep) = r.handler.as_mut().map(|handler| handler(r.buf.data())) {
+                    r.clear_buffer();
+                    return Ok(keep);
                 }
 
                 match r.socket_type {
@@ -1185,6 +1188,54 @@ mod remote_socket_read_tests {
         drop(w);
         let mut socket = RemoteSocket::new(SocketType::Stdout, r);
         assert_eq!(socket.read()?, ReadResult::Eof);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod handler_buffer_tests {
+    use super::*;
+    use crate::logging::none_logger::NoneLogger;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn handler_path_clears_buffer_so_reads_stay_bounded() -> ConmonResult<()> {
+        let (reader, writer) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
+        let mut remote = RemoteSocket::new(SocketType::Inotify, reader);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = Arc::clone(&calls);
+        remote.set_handler(move |_data| {
+            calls_for_handler.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+
+        let mut sockets = vec![Socket::Remote(remote)];
+        let mut new_sockets = Vec::new();
+        let mut log = NoneLogger;
+        let chunk = vec![0u8; 4096];
+        let rounds = (SOCKET_BUFFER_SIZE / chunk.len()) + 2;
+
+        for _ in 0..rounds {
+            assert_eq!(write(writer.as_fd(), &chunk)?, chunk.len());
+            assert!(Socket::handle_data(
+                &mut sockets,
+                0,
+                &mut log,
+                &mut new_sockets,
+                None,
+                &None,
+            )?);
+            let Socket::Remote(remote) = &sockets[0] else {
+                panic!("expected remote socket");
+            };
+            assert!(
+                remote.buf.data().is_empty(),
+                "handler path must drain the rolling buffer"
+            );
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), rounds);
         Ok(())
     }
 }
