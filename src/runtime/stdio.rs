@@ -290,6 +290,70 @@ fn on_peer_read_eof(
     }
 }
 
+/// True when any attach peer still has queued stdout/stderr to deliver.
+fn attach_output_pending(sockets: &[Socket]) -> bool {
+    sockets
+        .iter()
+        .any(|s| matches!(s, Socket::Remote(r) if r.needs_pollout()))
+}
+
+/// Whether `idle_callback` asking to stop should end `handle_stdio`.
+///
+/// Stop is deferred while attach peers still have pending writes so final
+/// container output is not discarded on exit.
+fn should_stop_stdio_loop(idle_says_stop: bool, sockets: &[Socket]) -> bool {
+    idle_says_stop && !attach_output_pending(sockets)
+}
+
+/// Remove peers marked `write_failed`.
+///
+/// Removing the FD ends the whole attach connection (input and output), so for
+/// `SocketType::Console` peers we apply the same stdin policy as read-EOF via
+/// [`on_peer_read_eof`] before the socket is dropped.
+fn remove_write_failed_peers(
+    sockets: &mut Vec<Socket>,
+    mut revents: Option<&mut Vec<Option<PollFlags>>>,
+    stdin_attached: bool,
+    leave_stdin_open: bool,
+    workerfd_stdin: &mut Option<OwnedFd>,
+) {
+    let mut i = 0;
+    while i < sockets.len() {
+        let failed = matches!(&sockets[i], Socket::Remote(r) if r.write_failed);
+        if !failed {
+            i += 1;
+            continue;
+        }
+        on_peer_read_eof(
+            &sockets[i],
+            stdin_attached,
+            leave_stdin_open,
+            workerfd_stdin,
+        );
+        let socket = sockets.swap_remove(i);
+        info!("Removing write-failed socket {:?}", socket);
+        if let Some(revents) = revents.as_mut() {
+            revents.swap_remove(i);
+        }
+    }
+}
+
+/// True when the FD must leave the poll set *before* any read.
+///
+/// `POLLNVAL` is always immediate. `POLLERR` / `POLLHUP` without `POLLIN` are
+/// also immediate (nothing left to drain). `POLLIN | POLLERR` and
+/// `POLLIN | POLLHUP` are *not* immediate — readable data is handled first.
+fn poll_fd_is_immediately_fatal(events: PollFlags) -> bool {
+    if events.contains(PollFlags::POLLNVAL) {
+        return true;
+    }
+    if events.contains(PollFlags::POLLIN) {
+        return false;
+    }
+    events.contains(PollFlags::POLLERR)
+        || (events.contains(PollFlags::POLLHUP) && !events.contains(PollFlags::POLLOUT))
+}
+
 /// Handles incoming data on fds and forwards them to right destination.
 /// This function blocks until the container is running.
 /// # Arguments
@@ -432,7 +496,7 @@ where
         let mut revents: Vec<Option<PollFlags>> = pollfds.iter().map(|pfd| pfd.revents()).collect();
         drop(pollfds);
 
-        // Expire attach peers that have been blocked on write too long.
+        // Expire attach peers that have made no write progress for too long.
         // Also runs on poll timeout (n == 0) so a never-readable client is dropped.
         let now = Instant::now();
         for socket in sockets.iter_mut() {
@@ -440,25 +504,23 @@ where
                 remote.expire_attach_write_timeout(now, ATTACH_WRITE_TIMEOUT);
             }
         }
-        // Drop failed peers while keeping revents index-aligned.
-        let mut i = 0;
-        while i < sockets.len() {
-            let failed = matches!(&sockets[i], Socket::Remote(r) if r.write_failed);
-            if failed {
-                let socket = sockets.swap_remove(i);
-                info!("Removing socket {:?}", socket);
-                revents.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
+        remove_write_failed_peers(
+            &mut sockets,
+            Some(&mut revents),
+            stdin_attached,
+            leave_stdin_open,
+            &mut workerfd_stdin,
+        );
 
-        // We have no fd to read from, so execute the idle function.
+        // We have no fd ready, so execute the idle function.
         if n == 0 {
             let keep_running = idle_callback(None)?;
-            if !keep_running {
+            if should_stop_stdio_loop(!keep_running, &sockets) {
                 info!("idle_callback stopped the event loop.");
                 return Ok(());
+            }
+            if !keep_running {
+                debug!("deferring idle stop; attach output still pending");
             }
             continue;
         }
@@ -470,28 +532,45 @@ where
             let mut keep_socket = true;
             // if `false`, we close the read side of the socket.
             let mut continue_reading = true;
+            // Full remove due to peer disconnect (HUP/ERR) — may close stdin.
+            let mut peer_disconnected = false;
 
             if let Some(events) = revents[i] {
-                // Flush queued attach output before handling new input on this FD.
+                // Flush queued attach output when writable (including HUP+POLLOUT).
                 if events.contains(PollFlags::POLLOUT)
                     && let Socket::Remote(remote) = &mut sockets[i]
                 {
                     remote.flush_pending_attach_writes();
                 }
 
-                if events.contains(PollFlags::POLLIN) {
+                if poll_fd_is_immediately_fatal(events) {
+                    // NVAL, or ERR/HUP with no readable data: drop before we can
+                    // busy-loop. Flush already ran above if POLLOUT.
+                    debug!("fatal poll events {events:?} on {:?}", sockets[i]);
+                    if let Socket::Remote(remote) = &mut sockets[i] {
+                        if !remote.write_failed {
+                            remote.mark_write_failed("poll reported socket error");
+                        }
+                    }
+                    keep_socket = false;
+                    peer_disconnected = true;
+                } else if events.contains(PollFlags::POLLIN) {
                     // If the POLLIN comes from the signal fd, hand the signal fd to
                     // the idle_callback so it can read and forward the signal.
                     if let Socket::Signal(signal_fd) = &sockets[i] {
-                        if !idle_callback(Some(signal_fd))? {
+                        let keep_running = idle_callback(Some(signal_fd))?;
+                        if should_stop_stdio_loop(!keep_running, &sockets) {
                             info!("idle_callback stopped the event loop after signal.");
                             return Ok(());
+                        }
+                        if !keep_running {
+                            debug!("deferring signal-idle stop; attach output still pending");
                         }
                         i += 1;
                         continue;
                     }
 
-                    // Handle the received data.
+                    // Handle the received data (including final bytes on ERR/HUP).
                     continue_reading = Socket::handle_data(
                         &mut sockets,
                         i,
@@ -508,10 +587,23 @@ where
                         sockets.push(Socket::Remote(n_s));
                         revents.push(None);
                     }
+
+                    // After draining readable data, POLLERR means the FD is done.
+                    if events.contains(PollFlags::POLLERR) {
+                        debug!("POLLERR after read on {:?}", sockets[i]);
+                        if let Socket::Remote(remote) = &mut sockets[i] {
+                            if !remote.write_failed {
+                                remote.mark_write_failed("poll reported socket error after read");
+                            }
+                        }
+                        keep_socket = false;
+                        peer_disconnected = true;
+                    }
                 } else if events.contains(PollFlags::POLLHUP) {
-                    // On HUP, close the socket.
+                    // HUP with POLLOUT already flushed above; peer is going away.
                     debug!("HUP on {:?}", sockets[i]);
                     keep_socket = false;
+                    peer_disconnected = true;
                 }
             }
 
@@ -537,6 +629,14 @@ where
                 // Go to next socket in case we want to keep this one.
                 i += 1;
             } else {
+                if peer_disconnected {
+                    on_peer_read_eof(
+                        &sockets[i],
+                        stdin_attached,
+                        leave_stdin_open,
+                        &mut workerfd_stdin,
+                    );
+                }
                 // Remove the fd completely.
                 let socket = sockets.swap_remove(i);
                 info!("Removing socket {:?}", socket);
@@ -547,10 +647,13 @@ where
         }
 
         // Drop attach clients whose writes failed during POLLOUT flush / handle_data.
-        sockets.retain(|s| match s {
-            Socket::Remote(r) => !r.write_failed,
-            _ => true,
-        });
+        remove_write_failed_peers(
+            &mut sockets,
+            None,
+            stdin_attached,
+            leave_stdin_open,
+            &mut workerfd_stdin,
+        );
     }
 
     // All remote sockets closed; probe for a container that exited while I/O drained.
@@ -564,7 +667,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unix_socket::{SocketType, UnixSocket};
+    use crate::unix_socket::{
+        ATTACH_PENDING_MAX_BYTES, ATTACH_WRITE_TIMEOUT, SocketType, UnixSocket,
+    };
     use nix::sys::socket::{
         AddressFamily, ControlMessage, SockFlag, SockType, sendmsg, socketpair,
     };
@@ -574,7 +679,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn test_console_socket() -> ConmonResult<(tempfile::TempDir, UnixSocket)> {
@@ -743,6 +848,264 @@ mod tests {
             workerfd_stdin.is_none(),
             "container stdin is closed when the attach client EOFs"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn write_failed_attach_removal_closes_stdin_when_attached() -> ConmonResult<()> {
+        let (attach_r, _attach_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+
+        let mut peer = RemoteSocket::new(SocketType::Console, attach_r);
+        peer.write_failed = true;
+        let mut sockets = vec![Socket::Remote(peer)];
+        let mut workerfd_stdin = Some(stdin_w);
+
+        remove_write_failed_peers(&mut sockets, None, true, false, &mut workerfd_stdin);
+
+        assert!(
+            sockets.is_empty(),
+            "write-failed attach peer must be removed"
+        );
+        assert!(
+            workerfd_stdin.is_none(),
+            "full attach disconnect must close container stdin"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_failed_attach_removal_keeps_stdin_when_leave_open() -> ConmonResult<()> {
+        let (attach_r, _attach_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+
+        let mut peer = RemoteSocket::new(SocketType::Console, attach_r);
+        peer.write_failed = true;
+        let mut sockets = vec![Socket::Remote(peer)];
+        let mut workerfd_stdin = Some(stdin_w);
+
+        remove_write_failed_peers(&mut sockets, None, true, true, &mut workerfd_stdin);
+
+        assert!(sockets.is_empty());
+        assert!(
+            workerfd_stdin.is_some(),
+            "leave_stdin_open must keep container stdin after attach drop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_failed_attach_removal_keeps_stdin_when_not_attached() -> ConmonResult<()> {
+        let (attach_r, _attach_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+
+        let mut peer = RemoteSocket::new(SocketType::Console, attach_r);
+        peer.write_failed = true;
+        let mut sockets = vec![Socket::Remote(peer)];
+        let mut workerfd_stdin = Some(stdin_w);
+
+        remove_write_failed_peers(&mut sockets, None, false, false, &mut workerfd_stdin);
+
+        assert!(sockets.is_empty());
+        assert!(
+            workerfd_stdin.is_some(),
+            "stdin stays open when stdin was never attached"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queue_overflow_disconnect_closes_stdin_like_eof() -> ConmonResult<()> {
+        let (srv, _cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.push_pending_for_test(vec![b'x'; ATTACH_PENDING_MAX_BYTES]);
+        peer.push_pending_for_test(b"over".to_vec());
+        assert!(peer.write_failed);
+
+        let mut sockets = vec![Socket::Remote(peer)];
+        let mut workerfd_stdin = Some(stdin_w);
+        remove_write_failed_peers(&mut sockets, None, true, false, &mut workerfd_stdin);
+
+        assert!(sockets.is_empty());
+        assert!(workerfd_stdin.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn write_timeout_disconnect_closes_stdin_like_eof() -> ConmonResult<()> {
+        let (srv, _cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.push_pending_for_test(b"\x02stuck".to_vec());
+        peer.set_pending_since_for_test(
+            Instant::now() - ATTACH_WRITE_TIMEOUT - Duration::from_millis(1),
+        );
+        peer.expire_attach_write_timeout(Instant::now(), ATTACH_WRITE_TIMEOUT);
+        assert!(peer.write_failed);
+
+        let mut sockets = vec![Socket::Remote(peer)];
+        let mut workerfd_stdin = Some(stdin_w);
+        remove_write_failed_peers(&mut sockets, None, true, false, &mut workerfd_stdin);
+
+        assert!(sockets.is_empty());
+        assert!(workerfd_stdin.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn write_failed_non_console_removal_does_not_close_stdin() -> ConmonResult<()> {
+        let (stdout_r, _stdout_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+
+        let mut peer = RemoteSocket::new(SocketType::Stdout, stdout_r);
+        peer.write_failed = true;
+        let mut sockets = vec![Socket::Remote(peer)];
+        let mut workerfd_stdin = Some(stdin_w);
+
+        remove_write_failed_peers(&mut sockets, None, true, false, &mut workerfd_stdin);
+
+        assert!(sockets.is_empty());
+        assert!(
+            workerfd_stdin.is_some(),
+            "non-console write_failed peers must not close container stdin"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_failed_one_of_many_attach_peers_closes_stdin() -> ConmonResult<()> {
+        // Established policy (same as on_peer_read_eof): any Console disconnect
+        // closes stdin when attached and leave_stdin_open is false — including
+        // when another attach peer is still present.
+        let (a_r, _a_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let (b_r, _b_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+
+        let mut failed = RemoteSocket::new(SocketType::Console, a_r);
+        failed.write_failed = true;
+        let healthy = RemoteSocket::new(SocketType::Console, b_r);
+        let mut sockets = vec![Socket::Remote(failed), Socket::Remote(healthy)];
+        let mut workerfd_stdin = Some(stdin_w);
+
+        remove_write_failed_peers(&mut sockets, None, true, false, &mut workerfd_stdin);
+
+        assert_eq!(sockets.len(), 1);
+        assert!(matches!(&sockets[0], Socket::Remote(r) if !r.write_failed));
+        assert!(
+            workerfd_stdin.is_none(),
+            "stdin closes when any stdin-attached Console peer is fully removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn poll_fd_is_immediately_fatal_respects_readable_err() {
+        // Immediate removal.
+        assert!(poll_fd_is_immediately_fatal(PollFlags::POLLNVAL));
+        assert!(poll_fd_is_immediately_fatal(PollFlags::POLLERR));
+        assert!(poll_fd_is_immediately_fatal(PollFlags::POLLHUP));
+        assert!(poll_fd_is_immediately_fatal(
+            PollFlags::POLLERR | PollFlags::POLLHUP
+        ));
+
+        // Drain readable data first (including with ERR/HUP).
+        assert!(!poll_fd_is_immediately_fatal(PollFlags::POLLIN));
+        assert!(!poll_fd_is_immediately_fatal(PollFlags::POLLOUT));
+        assert!(!poll_fd_is_immediately_fatal(
+            PollFlags::POLLIN | PollFlags::POLLHUP
+        ));
+        assert!(!poll_fd_is_immediately_fatal(
+            PollFlags::POLLIN | PollFlags::POLLERR
+        ));
+        assert!(!poll_fd_is_immediately_fatal(
+            PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP
+        ));
+        // HUP with POLLOUT: flush first via the POLLOUT path, then HUP branch.
+        assert!(!poll_fd_is_immediately_fatal(
+            PollFlags::POLLOUT | PollFlags::POLLHUP
+        ));
+        // NVAL wins even alongside POLLIN.
+        assert!(poll_fd_is_immediately_fatal(
+            PollFlags::POLLIN | PollFlags::POLLNVAL
+        ));
+    }
+
+    #[test]
+    fn idle_stop_deferred_while_final_attach_output_queued() -> ConmonResult<()> {
+        let (srv, _cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        // Simulate final container output queued after EAGAIN, just before exit.
+        peer.push_pending_for_test(b"\x02final\n".to_vec());
+        let sockets = vec![Socket::Remote(peer)];
+
+        assert!(
+            attach_output_pending(&sockets),
+            "queued attach output must be visible to the event loop"
+        );
+        assert!(
+            !should_stop_stdio_loop(true, &sockets),
+            "must not exit while final attach output is still queued"
+        );
+
+        // After the queue drains, idle stop is allowed.
+        let (srv, _cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let drained = vec![Socket::Remote(RemoteSocket::new(SocketType::Console, srv))];
+        assert!(!attach_output_pending(&drained));
+        assert!(should_stop_stdio_loop(true, &drained));
+        assert!(!should_stop_stdio_loop(false, &drained));
+        Ok(())
+    }
+
+    #[test]
+    fn idle_stop_allowed_after_timeout_clears_stalled_pending() -> ConmonResult<()> {
+        let (srv, _cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.push_pending_for_test(b"\x02stuck".to_vec());
+        peer.set_pending_since_for_test(
+            Instant::now() - ATTACH_WRITE_TIMEOUT - Duration::from_millis(1),
+        );
+        peer.expire_attach_write_timeout(Instant::now(), ATTACH_WRITE_TIMEOUT);
+        assert!(peer.write_failed);
+
+        let mut sockets = vec![Socket::Remote(peer)];
+        remove_write_failed_peers(&mut sockets, None, true, false, &mut None);
+        assert!(sockets.is_empty());
+        assert!(should_stop_stdio_loop(true, &sockets));
         Ok(())
     }
 }

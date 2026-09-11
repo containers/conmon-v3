@@ -81,11 +81,22 @@ const SOCKET_BUFFER_SIZE: usize = 32768;
 // package and some data would be lost. See SOCKET_BUFFER_SIZE.
 const CONMON_CLIENT_BUFFER_SIZE: usize = 8192;
 
-/// How long an attach (`Console`) peer may stay blocked on write before we drop it.
+/// How long an attach (`Console`) peer may go without a successful queued write
+/// before we disconnect it. Independent of [`ATTACH_PENDING_MAX_BYTES`]: a peer
+/// can still be making slow progress under the byte cap and must be timed out
+/// separately, and a burst can hit the byte cap before this deadline.
 pub(crate) const ATTACH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Max queued attach datagrams while waiting for `POLLOUT` (prefix + chunk each).
-const ATTACH_PENDING_MAX: usize = 16;
+/// Cap queued attach output per client (1 MiB of SEQPACKET payloads).
+/// Independent of [`ATTACH_WRITE_TIMEOUT`]: overflow disconnects a slow
+/// consumer even if occasional writes are still succeeding.
+pub(crate) const ATTACH_PENDING_MAX_BYTES: usize = 1024 * 1024;
+
+/// Max bytes flushed to one attach peer in a single `flush_pending_attach_writes`
+/// call. Whole datagrams only — never splits a queued SEQPACKET message.
+/// Production attach payloads are ~`CONMON_CLIENT_BUFFER_SIZE + 1` (~8 KiB), so
+/// this budget already limits a flush to a handful of full-sized datagrams.
+pub(crate) const ATTACH_FLUSH_BUDGET_BYTES: usize = 64 * 1024;
 
 /// A fixed-capacity rolling read buffer for socket data.
 struct SocketBuffer<const N: usize> {
@@ -302,7 +313,14 @@ pub struct RemoteSocket {
     /// Attach datagrams waiting for `POLLOUT` (each is one SEQPACKET message).
     pending_writes: VecDeque<Vec<u8>>,
 
-    /// When the pending queue became non-empty; used for attach write timeout.
+    /// Total bytes across [`Self::pending_writes`].
+    pending_bytes: usize,
+
+    /// Deadline clock for "no successful write progress".
+    ///
+    /// Set when the queue first becomes nonempty; refreshed after each successful
+    /// queued send while more remains; cleared when empty. [`ATTACH_WRITE_TIMEOUT`]
+    /// and [`ATTACH_PENDING_MAX_BYTES`] are independent disconnect conditions.
     pending_since: Option<Instant>,
 }
 
@@ -314,6 +332,7 @@ impl fmt::Debug for RemoteSocket {
             // avoid dumping the whole 8K buffer
             .field("buf_len", &self.buf.capacity())
             .field("pending_writes", &self.pending_writes.len())
+            .field("pending_bytes", &self.pending_bytes)
             .field("write_failed", &self.write_failed)
             .finish()
     }
@@ -330,6 +349,7 @@ impl RemoteSocket {
             read_closed: false,
             write_failed: false,
             pending_writes: VecDeque::new(),
+            pending_bytes: 0,
             pending_since: None,
         }
     }
@@ -346,7 +366,35 @@ impl RemoteSocket {
         self.pending_writes.len()
     }
 
-    /// Drop the peer if attach writes have been blocked longer than `timeout`.
+    #[cfg(test)]
+    pub(crate) fn pending_bytes_for_test(&self) -> usize {
+        self.pending_bytes
+    }
+
+    fn clear_pending_writes(&mut self) {
+        self.pending_writes.clear();
+        self.pending_bytes = 0;
+        self.pending_since = None;
+    }
+
+    /// Mark this peer failed and discard any queued attach output.
+    pub(crate) fn mark_write_failed(&mut self, reason: &str) {
+        if self.write_failed {
+            return;
+        }
+        warn!(
+            "dropping {:?} fd {}: {reason}",
+            self.socket_type,
+            self.fd.as_raw_fd()
+        );
+        self.write_failed = true;
+        self.clear_pending_writes();
+    }
+
+    /// Drop the peer if attach writes have made no progress for longer than `timeout`.
+    ///
+    /// This is independent of the byte-queue overflow check in
+    /// [`Self::enqueue_attach_datagram`].
     pub(crate) fn expire_attach_write_timeout(&mut self, now: Instant, timeout: Duration) {
         if self.write_failed || self.socket_type != SocketType::Console {
             return;
@@ -357,73 +405,77 @@ impl RemoteSocket {
         if now.saturating_duration_since(since) < timeout {
             return;
         }
-        warn!(
-            "attach client {} write blocked for {:?}; dropping peer",
-            self.fd.as_raw_fd(),
-            timeout
-        );
-        self.write_failed = true;
-        self.pending_writes.clear();
-        self.pending_since = None;
+        self.mark_write_failed(&format!("no write progress for {timeout:?}; slow consumer"));
     }
 
     /// Try to send queued attach datagrams; leave remainder pending on `EAGAIN`.
+    ///
+    /// Stops after [`ATTACH_FLUSH_BUDGET_BYTES`] so one writable peer cannot
+    /// monopolize a poll iteration. Always attempts at least one complete
+    /// SEQPACKET datagram; never splits a queued message.
     pub(crate) fn flush_pending_attach_writes(&mut self) {
         if self.write_failed || self.socket_type != SocketType::Console {
             return;
         }
+        let mut flushed_bytes = 0usize;
         while let Some(msg) = self.pending_writes.front() {
+            if flushed_bytes > 0 && flushed_bytes + msg.len() > ATTACH_FLUSH_BUDGET_BYTES {
+                debug!(
+                    "attach client {} flush budget reached ({flushed_bytes} bytes); deferring remainder",
+                    self.fd.as_raw_fd()
+                );
+                break;
+            }
             match write(self.fd.as_fd(), msg) {
                 Ok(_) => {
+                    let len = msg.len();
                     self.pending_writes.pop_front();
-                }
-                Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => return,
-                Err(Errno::EINTR) => continue,
-                Err(e) => {
-                    warn!(
-                        "write to attach client {} failed: {e}; dropping peer",
-                        self.fd.as_raw_fd()
+                    debug_assert!(
+                        self.pending_bytes >= len,
+                        "pending_bytes underflows queue accounting"
                     );
-                    self.write_failed = true;
-                    self.pending_writes.clear();
-                    self.pending_since = None;
-                    return;
+                    self.pending_bytes -= len;
+                    flushed_bytes += len;
+                    self.note_attach_write_progress();
+                }
+                Err(Errno::EINTR) => continue,
+                Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => break,
+                Err(e) => {
+                    self.mark_write_failed(&format!("write failed: {e}"));
+                    break;
                 }
             }
-        }
-        if self.pending_writes.is_empty() {
-            self.pending_since = None;
         }
     }
 
     fn enqueue_attach_datagram(&mut self, msg: Vec<u8>) {
-        if self.pending_writes.len() >= ATTACH_PENDING_MAX {
-            warn!(
-                "attach client {} pending queue full ({ATTACH_PENDING_MAX}); dropping peer",
-                self.fd.as_raw_fd()
-            );
-            self.write_failed = true;
-            self.pending_writes.clear();
-            self.pending_since = None;
+        let Some(new_size) = self.pending_bytes.checked_add(msg.len()) else {
+            self.mark_write_failed("pending queue size overflow");
+            return;
+        };
+        if new_size > ATTACH_PENDING_MAX_BYTES {
+            self.mark_write_failed(&format!(
+                "pending queue would exceed {ATTACH_PENDING_MAX_BYTES} bytes; slow consumer"
+            ));
             return;
         }
         if self.pending_writes.is_empty() {
             self.pending_since = Some(Instant::now());
         }
+        self.pending_bytes = new_size;
         self.pending_writes.push_back(msg);
     }
 
     /// Forward one attach datagram (stream prefix + chunk), queuing on `EAGAIN`.
+    ///
+    /// Queued output is flushed only on `POLLOUT`; this path never bypasses an
+    /// existing pending queue. The successful immediate-write path is
+    /// allocation-free (`writev` of the caller's slices).
     pub(crate) fn write_attach_datagram(&mut self, prefix: &[u8], chunk: &[u8]) {
         if self.write_failed || self.socket_type != SocketType::Console {
             return;
         }
 
-        // Preserve message order: drain the queue before a new direct write.
-        self.flush_pending_attach_writes();
-        if self.write_failed {
-            return;
-        }
         if !self.pending_writes.is_empty() {
             let mut msg = Vec::with_capacity(prefix.len() + chunk.len());
             msg.extend_from_slice(prefix);
@@ -432,28 +484,26 @@ impl RemoteSocket {
             return;
         }
 
-        let iov = [
-            std::io::IoSlice::new(prefix),
-            std::io::IoSlice::new(chunk),
-        ];
-        match writev(self.fd.as_fd(), &iov) {
-            Ok(_) => {}
-            Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => {
-                debug!(
-                    "attach client {} would block; queueing write",
-                    self.fd.as_raw_fd()
-                );
-                let mut msg = Vec::with_capacity(prefix.len() + chunk.len());
-                msg.extend_from_slice(prefix);
-                msg.extend_from_slice(chunk);
-                self.enqueue_attach_datagram(msg);
-            }
-            Err(e) => {
-                warn!(
-                    "write to attach client {} failed: {e}; dropping peer",
-                    self.fd.as_raw_fd()
-                );
-                self.write_failed = true;
+        let iov = [std::io::IoSlice::new(prefix), std::io::IoSlice::new(chunk)];
+        loop {
+            match writev(self.fd.as_fd(), &iov) {
+                Ok(_) => break,
+                Err(Errno::EINTR) => continue,
+                Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => {
+                    debug!(
+                        "attach client {} would block; queueing write",
+                        self.fd.as_raw_fd()
+                    );
+                    let mut msg = Vec::with_capacity(prefix.len() + chunk.len());
+                    msg.extend_from_slice(prefix);
+                    msg.extend_from_slice(chunk);
+                    self.enqueue_attach_datagram(msg);
+                    break;
+                }
+                Err(e) => {
+                    self.mark_write_failed(&format!("write failed: {e}"));
+                    break;
+                }
             }
         }
     }
@@ -461,6 +511,25 @@ impl RemoteSocket {
     #[cfg(test)]
     pub(crate) fn set_pending_since_for_test(&mut self, since: Instant) {
         self.pending_since = Some(since);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_since_for_test(&self) -> Option<Instant> {
+        self.pending_since
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_pending_for_test(&mut self, msg: Vec<u8>) {
+        self.enqueue_attach_datagram(msg);
+    }
+
+    /// Update the no-progress deadline after a queued datagram was sent.
+    fn note_attach_write_progress(&mut self) {
+        if self.pending_writes.is_empty() {
+            self.pending_since = None;
+        } else {
+            self.pending_since = Some(Instant::now());
+        }
     }
 
     /// Attach a handler to this socket.
@@ -586,6 +655,7 @@ impl From<UnixSocket> for RemoteSocket {
             read_closed: false,
             write_failed: false,
             pending_writes: VecDeque::new(),
+            pending_bytes: 0,
             pending_since: None,
         }
     }
@@ -1427,6 +1497,292 @@ mod attach_nonblock_tests {
     }
 
     #[test]
+    fn attach_pending_byte_accounting_and_flush_to_zero() -> ConmonResult<()> {
+        let (srv, cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.push_pending_for_test(b"\x02abc".to_vec());
+        peer.push_pending_for_test(b"\x02defg".to_vec());
+        assert_eq!(peer.pending_write_count(), 2);
+        assert_eq!(peer.pending_bytes_for_test(), 4 + 5);
+
+        peer.flush_pending_attach_writes();
+        assert_eq!(peer.pending_write_count(), 0);
+        assert_eq!(peer.pending_bytes_for_test(), 0);
+        assert!(peer.pending_since_for_test().is_none());
+
+        let mut got = [0u8; 16];
+        assert_eq!(read(cli.as_fd(), &mut got)?, 4);
+        assert_eq!(read(cli.as_fd(), &mut got)?, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn many_small_packets_hit_byte_limit() -> ConmonResult<()> {
+        let (srv, _cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        let pkt = vec![b'x'; 4096];
+        let mut queued = 0usize;
+        while queued + pkt.len() <= ATTACH_PENDING_MAX_BYTES {
+            peer.push_pending_for_test(pkt.clone());
+            if peer.write_failed {
+                break;
+            }
+            queued += pkt.len();
+        }
+        assert!(!peer.write_failed);
+        assert_eq!(peer.pending_bytes_for_test(), queued);
+        // One more packet must overflow and disconnect only this peer.
+        peer.push_pending_for_test(pkt);
+        assert!(peer.write_failed);
+        assert_eq!(peer.pending_bytes_for_test(), 0);
+        assert_eq!(peer.pending_write_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn one_large_packet_hits_byte_limit() -> ConmonResult<()> {
+        let (srv, _cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.push_pending_for_test(vec![b'y'; ATTACH_PENDING_MAX_BYTES]);
+        assert!(!peer.write_failed);
+        assert_eq!(peer.pending_bytes_for_test(), ATTACH_PENDING_MAX_BYTES);
+        peer.push_pending_for_test(b"z".to_vec());
+        assert!(peer.write_failed);
+        assert_eq!(peer.pending_bytes_for_test(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn queue_overflow_disconnects_only_slow_client() -> ConmonResult<()> {
+        let (slow_srv, _slow_cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let (ok_srv, ok_cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut slow = RemoteSocket::new(SocketType::Console, slow_srv);
+        let mut ok = RemoteSocket::new(SocketType::Console, ok_srv);
+        slow.push_pending_for_test(vec![b'x'; ATTACH_PENDING_MAX_BYTES]);
+        slow.push_pending_for_test(b"over".to_vec());
+        assert!(slow.write_failed);
+
+        ok.write_attach_datagram(&[2], b"alive");
+        assert!(!ok.write_failed);
+        let mut got = [0u8; 16];
+        let n = read(ok_cli.as_fd(), &mut got)?;
+        assert_eq!(&got[..n], b"\x02alive");
+        Ok(())
+    }
+
+    #[test]
+    fn write_attach_datagram_immediate_success_is_prefixed() -> ConmonResult<()> {
+        let (srv, cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.write_attach_datagram(&[2], b"hello");
+        assert!(!peer.write_failed);
+        assert_eq!(peer.pending_write_count(), 0);
+        assert_eq!(peer.pending_bytes_for_test(), 0);
+
+        let mut got = [0u8; 16];
+        let n = read(cli.as_fd(), &mut got)?;
+        assert_eq!(&got[..n], b"\x02hello");
+        Ok(())
+    }
+
+    #[test]
+    fn write_attach_datagram_eagain_queues_prefixed_datagram() -> ConmonResult<()> {
+        let (srv, cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        fill_until_would_block(&srv);
+
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.write_attach_datagram(&[3], b"queued");
+        assert!(!peer.write_failed);
+        assert_eq!(peer.pending_write_count(), 1);
+        assert_eq!(peer.pending_bytes_for_test(), 1 + b"queued".len());
+        assert!(peer.needs_pollout());
+
+        // Free space and flush; the queued message must be the full prefix+chunk.
+        let mut discard = [0u8; 4096];
+        loop {
+            match read(cli.as_fd(), &mut discard) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => break,
+                Err(e) => return Err(ConmonError::new(e.to_string(), 1)),
+            }
+        }
+        peer.flush_pending_attach_writes();
+        assert_eq!(peer.pending_write_count(), 0);
+        assert_eq!(peer.pending_bytes_for_test(), 0);
+
+        let mut got = [0u8; 16];
+        let n = read(cli.as_fd(), &mut got)?;
+        assert_eq!(&got[..n], b"\x03queued");
+        Ok(())
+    }
+
+    #[test]
+    fn write_attach_datagram_does_not_bypass_existing_queue() -> ConmonResult<()> {
+        let (srv, cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.push_pending_for_test(b"\x02first".to_vec());
+        peer.write_attach_datagram(&[2], b"second");
+        assert_eq!(peer.pending_write_count(), 2);
+        assert_eq!(
+            peer.pending_bytes_for_test(),
+            b"\x02first".len() + b"\x02second".len()
+        );
+
+        peer.flush_pending_attach_writes();
+        let mut got = [0u8; 16];
+        let n1 = read(cli.as_fd(), &mut got)?;
+        assert_eq!(&got[..n1], b"\x02first");
+        let n2 = read(cli.as_fd(), &mut got)?;
+        assert_eq!(&got[..n2], b"\x02second");
+        assert_eq!(peer.pending_bytes_for_test(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn flush_byte_budget_leaves_remainder_pending_in_order() -> ConmonResult<()> {
+        let (srv, cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+
+        // Realistic attach-sized datagrams (~8 KiB); more than one flush budget.
+        let pkt_len = CONMON_CLIENT_BUFFER_SIZE + 1;
+        let pkt_a = {
+            let mut v = vec![0u8; pkt_len];
+            v[0] = 2;
+            v[1] = b'A';
+            v
+        };
+        let pkt_b = {
+            let mut v = vec![0u8; pkt_len];
+            v[0] = 2;
+            v[1] = b'B';
+            v
+        };
+        let n = (ATTACH_FLUSH_BUDGET_BYTES / pkt_len) + 3;
+        for i in 0..n {
+            // Alternate markers so order can be checked after multi-pass flush.
+            if i % 2 == 0 {
+                peer.push_pending_for_test(pkt_a.clone());
+            } else {
+                peer.push_pending_for_test(pkt_b.clone());
+            }
+        }
+        let total_bytes = n * pkt_len;
+        assert_eq!(peer.pending_write_count(), n);
+        assert_eq!(peer.pending_bytes_for_test(), total_bytes);
+
+        peer.flush_pending_attach_writes();
+        let remaining = peer.pending_write_count();
+        assert!(
+            remaining > 0,
+            "byte budget must leave some datagrams pending"
+        );
+        assert!(
+            peer.pending_bytes_for_test() <= total_bytes - pkt_len,
+            "at least one complete datagram must be flushed"
+        );
+        // Flushed amount should not exceed budget by more than one datagram
+        // (the mandatory first whole message can finish over the soft remainder).
+        let flushed_bytes = total_bytes - peer.pending_bytes_for_test();
+        assert!(
+            flushed_bytes <= ATTACH_FLUSH_BUDGET_BYTES + pkt_len,
+            "flush exceeded byte budget plus one datagram: flushed={flushed_bytes}"
+        );
+        assert!(peer.needs_pollout());
+        assert!(!peer.write_failed);
+
+        // New output must append behind remaining queue, not bypass it.
+        peer.write_attach_datagram(&[2], b"tail");
+        assert!(peer.pending_write_count() > remaining);
+        assert!(!peer.write_failed);
+
+        // Subsequent flushes drain everything in order.
+        let mut seen = Vec::new();
+        let mut rounds = 0;
+        while peer.pending_write_count() > 0 && rounds < 32 {
+            peer.flush_pending_attach_writes();
+            loop {
+                let mut got = vec![0u8; pkt_len + 8];
+                match read(cli.as_fd(), &mut got) {
+                    Ok(0) => break,
+                    Ok(nread) => {
+                        got.truncate(nread);
+                        seen.push(got);
+                    }
+                    Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => break,
+                    Err(e) => return Err(ConmonError::new(e.to_string(), 1)),
+                }
+            }
+            rounds += 1;
+        }
+        assert_eq!(peer.pending_write_count(), 0);
+        assert_eq!(peer.pending_bytes_for_test(), 0);
+        assert!(!peer.needs_pollout());
+
+        // First flushed messages preserve A/B alternation from the original queue.
+        assert!(seen.len() >= 2);
+        assert_eq!(seen[0][1], b'A');
+        assert_eq!(seen[1][1], b'B');
+        // The late "tail" datagram is last among received SEQPACKET messages that
+        // match its size (prefix+chunk), after the large pending payloads.
+        let tail = seen.iter().find(|m| m.as_slice() == b"\x02tail");
+        assert!(
+            tail.is_some(),
+            "appended datagram must eventually be delivered"
+        );
+        assert_eq!(
+            seen.last().map(|m| m.as_slice()),
+            Some(b"\x02tail".as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn accept_returns_nonblocking_cloexec_client() -> ConmonResult<()> {
         let tmp = tempdir().map_err(|e| ConmonError::new(e.to_string(), 1))?;
         let mut listener = UnixSocket::new(
@@ -1493,14 +1849,8 @@ mod attach_nonblock_tests {
         let mut new_sockets = Vec::new();
 
         let start = Instant::now();
-        let keep = Socket::handle_data(
-            &mut sockets,
-            2,
-            &mut logger,
-            &mut new_sockets,
-            None,
-            &None,
-        )?;
+        let keep =
+            Socket::handle_data(&mut sockets, 2, &mut logger, &mut new_sockets, None, &None)?;
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "stalled attach peer must not block stdio forwarding; elapsed {:?}",
@@ -1532,6 +1882,7 @@ mod attach_nonblock_tests {
         if let Socket::Remote(peer) = &mut sockets[0] {
             peer.flush_pending_attach_writes();
             assert_eq!(peer.pending_write_count(), 0);
+            assert_eq!(peer.pending_bytes_for_test(), 0);
             assert!(!peer.write_failed);
         }
         let n = read(stalled_cli.as_fd(), &mut got)?;
@@ -1558,14 +1909,7 @@ mod attach_nonblock_tests {
         let mut logger = NoneLogger::new(&LogPluginCfg::default())?;
         let mut new_sockets = Vec::new();
 
-        Socket::handle_data(
-            &mut sockets,
-            1,
-            &mut logger,
-            &mut new_sockets,
-            None,
-            &None,
-        )?;
+        Socket::handle_data(&mut sockets, 1, &mut logger, &mut new_sockets, None, &None)?;
 
         let Socket::Remote(peer) = &mut sockets[0] else {
             panic!("expected remote");
@@ -1577,8 +1921,76 @@ mod attach_nonblock_tests {
         peer.expire_attach_write_timeout(Instant::now(), ATTACH_WRITE_TIMEOUT);
         assert!(peer.write_failed);
         assert_eq!(peer.pending_write_count(), 0);
+        assert_eq!(peer.pending_bytes_for_test(), 0);
 
         let _ = stalled_cli;
+        Ok(())
+    }
+
+    #[test]
+    fn attach_write_progress_resets_timeout_deadline() -> ConmonResult<()> {
+        use nix::sys::socket::{setsockopt, sockopt};
+
+        let (srv, cli) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        // Keep kernel queues small so we can free space for only one datagram.
+        setsockopt(&srv, sockopt::SndBuf, &1024)?;
+        setsockopt(&cli, sockopt::RcvBuf, &1024)?;
+
+        let fill = [0u8; 256];
+        loop {
+            match write(srv.as_fd(), &fill) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e == Errno::EAGAIN || e == Errno::EWOULDBLOCK => break,
+                Err(Errno::EINTR) => continue,
+                Err(e) => panic!("unexpected fill error: {e}"),
+            }
+        }
+
+        let mut peer = RemoteSocket::new(SocketType::Console, srv);
+        peer.push_pending_for_test(b"\x02one".to_vec());
+        peer.push_pending_for_test(vec![b'x'; 512]);
+        assert_eq!(peer.pending_write_count(), 2);
+
+        let stale = Instant::now() - ATTACH_WRITE_TIMEOUT - Duration::from_secs(1);
+        peer.set_pending_since_for_test(stale);
+
+        // Free a single filled datagram so only the small pending message fits.
+        let mut discard = [0u8; 256];
+        let n = read(cli.as_fd(), &mut discard)?;
+        assert_eq!(n, 256);
+        peer.flush_pending_attach_writes();
+
+        assert!(!peer.write_failed);
+        assert_eq!(
+            peer.pending_write_count(),
+            1,
+            "larger second datagram should still be pending"
+        );
+        let since = peer
+            .pending_since_for_test()
+            .expect("deadline after progress");
+        assert!(
+            since > stale,
+            "successful write must refresh pending_since; since={since:?} stale={stale:?}"
+        );
+
+        peer.expire_attach_write_timeout(Instant::now(), ATTACH_WRITE_TIMEOUT);
+        assert!(
+            !peer.write_failed,
+            "peer must not expire while writes are making progress"
+        );
+
+        peer.set_pending_since_for_test(
+            Instant::now() - ATTACH_WRITE_TIMEOUT - Duration::from_millis(1),
+        );
+        peer.expire_attach_write_timeout(Instant::now(), ATTACH_WRITE_TIMEOUT);
+        assert!(peer.write_failed);
         Ok(())
     }
 
@@ -1610,14 +2022,7 @@ mod attach_nonblock_tests {
         let mut logger = NoneLogger::new(&LogPluginCfg::default())?;
         let mut new_sockets = Vec::new();
 
-        Socket::handle_data(
-            &mut sockets,
-            2,
-            &mut logger,
-            &mut new_sockets,
-            None,
-            &None,
-        )?;
+        Socket::handle_data(&mut sockets, 2, &mut logger, &mut new_sockets, None, &None)?;
 
         assert!(
             matches!(&sockets[0], Socket::Remote(r) if r.write_failed),
