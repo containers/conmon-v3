@@ -65,6 +65,10 @@ pub enum ReadResult {
     Eof,
     /// No data available right now; return to `poll` instead of retrying.
     WouldBlock,
+    /// PTY master returned `EIO` because no slave is open. Transient: pause
+    /// reads and retry later (same as terminal `POLLHUP`); do not treat as
+    /// [`WouldBlock`], or a readable master without `POLLHUP` busy-loops.
+    TerminalHungUp,
     /// `n` bytes were appended to the socket buffer (`n > 0`).
     Read(usize),
 }
@@ -352,6 +356,11 @@ impl RemoteSocket {
                     // yield to poll; do not busy-loop.
                     Err(err) if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK => {
                         return Ok(ReadResult::WouldBlock);
+                    }
+                    // PTY master returns EIO when no slave is open; transient
+                    // (matches conmon-v2: keep the fd, pause and retry like HUP).
+                    Err(Errno::EIO) if self.socket_type == SocketType::Terminal => {
+                        return Ok(ReadResult::TerminalHungUp);
                     }
                     Err(Errno::EINTR) => continue,
                     Err(err) => {
@@ -843,6 +852,9 @@ impl Socket {
                         // EAGAIN after poll: keep the socket and wait for the next poll.
                         return Ok(true);
                     }
+                    // Transient PTY EIO: stop reading this wake so the event loop
+                    // can pause and schedule the same HUP retry (keep the master fd).
+                    Ok(ReadResult::TerminalHungUp) => return Ok(false),
                     Ok(ReadResult::Eof) => return Ok(false),
                     Ok(ReadResult::Read(_)) => {}
                     Err(e) => {
@@ -1188,6 +1200,105 @@ mod remote_socket_read_tests {
         drop(w);
         let mut socket = RemoteSocket::new(SocketType::Stdout, r);
         assert_eq!(socket.read()?, ReadResult::Eof);
+        Ok(())
+    }
+
+    /// Open a PTY master, open+close the slave so the master yields EIO on read.
+    fn pty_master_after_slave_closed() -> ConmonResult<OwnedFd> {
+        use std::ffi::CStr;
+        use std::os::fd::FromRawFd;
+
+        unsafe {
+            let master = nix::libc::posix_openpt(
+                nix::libc::O_RDWR | nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK,
+            );
+            if master < 0 {
+                return Err(ConmonError::new("posix_openpt failed", 1));
+            }
+            if nix::libc::grantpt(master) != 0 || nix::libc::unlockpt(master) != 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("grantpt/unlockpt failed", 1));
+            }
+            let name = nix::libc::ptsname(master);
+            if name.is_null() {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("ptsname failed", 1));
+            }
+            let path = CStr::from_ptr(name);
+            let slave = nix::libc::open(path.as_ptr(), nix::libc::O_RDWR | nix::libc::O_NOCTTY);
+            if slave < 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("open pty slave failed", 1));
+            }
+            let _ = nix::libc::close(slave);
+            Ok(OwnedFd::from_raw_fd(master))
+        }
+    }
+
+    #[test]
+    fn read_maps_pty_eio_to_terminal_hung_up_not_would_block() -> ConmonResult<()> {
+        let master = pty_master_after_slave_closed()?;
+        let mut socket = RemoteSocket::new(SocketType::Terminal, master);
+
+        let start = Instant::now();
+        let result = socket.read()?;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "Terminal EIO must not busy-loop; elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            result,
+            ReadResult::TerminalHungUp,
+            "PTY EIO must be distinguishable from EAGAIN/WouldBlock"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_preserves_would_block_for_terminal_eagain() -> ConmonResult<()> {
+        // Master with no slave ever opened: non-blocking read is EAGAIN, not EIO.
+        use std::os::fd::FromRawFd;
+        let master = unsafe {
+            let fd = nix::libc::posix_openpt(
+                nix::libc::O_RDWR | nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK,
+            );
+            assert!(fd >= 0);
+            assert_eq!(nix::libc::grantpt(fd), 0);
+            assert_eq!(nix::libc::unlockpt(fd), 0);
+            OwnedFd::from_raw_fd(fd)
+        };
+        let mut socket = RemoteSocket::new(SocketType::Terminal, master);
+        assert_eq!(socket.read()?, ReadResult::WouldBlock);
+        Ok(())
+    }
+
+    #[test]
+    fn handle_data_pauses_on_terminal_hung_up_without_pollhup() -> ConmonResult<()> {
+        // POLLIN path with EIO and no POLLHUP must stop reading (continue_reading=false)
+        // so the event loop schedules the HUP retry instead of spinning on WouldBlock.
+        let master = pty_master_after_slave_closed()?;
+        let mut sockets = vec![Socket::Remote(RemoteSocket::new(
+            SocketType::Terminal,
+            master,
+        ))];
+        let mut new_sockets = Vec::new();
+        struct NopLog;
+        impl crate::logging::plugin::LogPlugin for NopLog {
+            fn write(&mut self, _: bool, _: &[u8]) -> ConmonResult<()> {
+                Ok(())
+            }
+            fn reopen(&mut self) -> ConmonResult<()> {
+                Ok(())
+            }
+        }
+        let mut log = NopLog;
+        let continue_reading =
+            Socket::handle_data(&mut sockets, 0, &mut log, &mut new_sockets, None, &None)?;
+        assert!(
+            !continue_reading,
+            "TerminalHungUp must request a read pause (false), not WouldBlock keep-alive (true)"
+        );
         Ok(())
     }
 }
