@@ -4,6 +4,7 @@ use crate::error::{ConmonError, ConmonResult};
 use atomic_write_file::AtomicWriteFile;
 use log::{error, info, warn};
 use nix::errno::Errno;
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 
@@ -12,9 +13,49 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::libc::{PR_SET_CHILD_SUBREAPER, close, prctl};
+
+/// Signals blocked for the runtime spawn window and for signalfd during the
+/// event loop. Must be unblocked before teardown so systemd can SIGTERM the
+/// conmon scope when tearing down a pod slice (matches conmon-v2).
+fn lifecycle_signal_set() -> SigSet {
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGTERM);
+    mask.add(Signal::SIGQUIT);
+    mask.add(Signal::SIGINT);
+    mask.add(Signal::SIGHUP);
+    mask
+}
+
+/// Unblock lifecycle signals after the event loop so systemd scope stop can
+/// deliver SIGTERM while we write exit files / run `--exit-command`.
+///
+/// conmon-v2 installs handlers then restores the process mask before its main
+/// loop; we keep TERM/QUIT/INT blocked only while signalfd owns them. Leaving
+/// them blocked through exit lets `StopUnit` on `libpod-conmon-*.scope` (and
+/// thus the parent pod slice) stall or leave the unit loaded, which races with
+/// the next `StartTransientUnit` (`Unit ... was already loaded or has a fragment file`).
+pub fn unblock_lifecycle_signals() {
+    let mask = lifecycle_signal_set();
+    if let Err(e) = pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None) {
+        warn!("Failed to unblock lifecycle signals before exit: {e}");
+    }
+}
+
+/// Focused teardown diagnostics for correlating conmon exit with pod-slice races.
+pub fn log_exit_path(cid: Option<&Cid>, exit_code: i32, stage: &str) {
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let cid = cid.map(|c| c.as_str()).unwrap_or("-");
+    info!(
+        "lifecycle exit: stage={stage} cid={cid} conmon_pid={} exit_code={exit_code} unix_ms={ts_ms}",
+        std::process::id()
+    );
+}
 
 /// Sets this process as subreaper.
 ///
@@ -494,5 +535,33 @@ mod tests {
         let meta = std::fs::metadata(&fifo_path).unwrap();
         assert!(meta.is_file());
         assert_eq!(std::fs::read_to_string(&fifo_path).unwrap(), "13");
+    }
+
+    #[test]
+    fn unblock_lifecycle_signals_clears_blocked_term() {
+        let mut prior = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_SETMASK, None, Some(&mut prior)).unwrap();
+
+        let mut mask = SigSet::empty();
+        mask.add(Signal::SIGTERM);
+        mask.add(Signal::SIGQUIT);
+        mask.add(Signal::SIGINT);
+        mask.add(Signal::SIGHUP);
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None).unwrap();
+
+        unblock_lifecycle_signals();
+
+        let mut pending = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_SETMASK, None, Some(&mut pending)).unwrap();
+        let ok = !pending.contains(Signal::SIGTERM)
+            && !pending.contains(Signal::SIGQUIT)
+            && !pending.contains(Signal::SIGINT)
+            && !pending.contains(Signal::SIGHUP);
+        // Restore whatever the test harness had before we touched the mask.
+        let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&prior), None);
+        assert!(
+            ok,
+            "SIGTERM/QUIT/INT/HUP must be deliverable during exit so systemd can stop the conmon scope"
+        );
     }
 }

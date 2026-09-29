@@ -11,8 +11,10 @@ use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
 use conmon::commands::version::Version;
 use conmon::error::{ConmonError, ConmonResult};
+use conmon::exit::log_exit_path;
 use conmon::exit::run_exit_command;
 use conmon::exit::snapshot_open_fds;
+use conmon::exit::unblock_lifecycle_signals;
 use conmon::exit::write_exit_files;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugins;
@@ -171,6 +173,12 @@ fn main() -> ExitCode {
         }
     };
 
+    // Event-loop / spawn paths block lifecycle signals for signalfd and the
+    // fork window. Unblock before teardown so systemd can SIGTERM this process
+    // while the exit file / exit-command run (pod stop -t0 → removePodCgroup).
+    unblock_lifecycle_signals();
+    log_exit_path(cid.as_ref(), raw_code, "after_event_loop");
+
     // Write the exit files into persistent path. The podman has inotify
     // set for that directory and uses it to detect the conmon exit.
     write_exit_files(
@@ -179,10 +187,12 @@ fn main() -> ExitCode {
         exit_dir.as_ref(),
         cid.as_ref(),
     );
+    log_exit_path(cid.as_ref(), raw_code, "after_exit_files");
 
     // Run the exit command if defined by podman. We do not care about the exit
     // code here.
     let _ = run_exit_command(exit_command, exit_command_args, exit_command_delay);
+    log_exit_path(cid.as_ref(), raw_code, "after_exit_command");
 
     // Return the exit code from the run_conmon function.
     info!("Exiting with status {}", raw_code);
