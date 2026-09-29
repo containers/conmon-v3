@@ -11,6 +11,7 @@ use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
 use conmon::commands::version::Version;
 use conmon::error::{ConmonError, ConmonResult};
+use conmon::exit::install_teardown_exit_on_lifecycle_signals;
 use conmon::exit::log_exit_path;
 use conmon::exit::run_exit_command;
 use conmon::exit::snapshot_open_fds;
@@ -173,14 +174,10 @@ fn main() -> ExitCode {
         }
     };
 
-    // Event-loop / spawn paths block lifecycle signals for signalfd and the
-    // fork window. Unblock before teardown so systemd can SIGTERM this process
-    // while the exit file / exit-command run (pod stop -t0 → removePodCgroup).
-    unblock_lifecycle_signals();
     log_exit_path(cid.as_ref(), raw_code, "after_event_loop");
 
-    // Write the exit files into persistent path. The podman has inotify
-    // set for that directory and uses it to detect the conmon exit.
+    // Write exit files while lifecycle signals are still blocked so a pending
+    // SIGTERM from systemctl stop cannot interrupt the inotify-visible status.
     write_exit_files(
         raw_code,
         persist_dir.as_ref(),
@@ -188,6 +185,13 @@ fn main() -> ExitCode {
         cid.as_ref(),
     );
     log_exit_path(cid.as_ref(), raw_code, "after_exit_files");
+
+    // Unblock so systemd can SIGTERM us during --exit-command (pod stop -t0 →
+    // removePodCgroup). Handlers exit with raw_code so Type=notify units keep
+    // Result=exit-code (failed when non-zero) instead of death-by-KillSignal
+    // (ActiveState=inactive).
+    install_teardown_exit_on_lifecycle_signals(raw_code);
+    unblock_lifecycle_signals();
 
     // Run the exit command if defined by podman. We do not care about the exit
     // code here.
