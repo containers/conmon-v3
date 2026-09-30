@@ -883,7 +883,10 @@ mod tests {
         }
 
         assert!(saw_busy_poll, "stderr must keep poll busy during the wait");
-        assert!(rearmed, "terminal must re-arm even when poll never returns 0");
+        assert!(
+            rearmed,
+            "terminal must re-arm even when poll never returns 0"
+        );
 
         let slave = unsafe {
             nix::libc::open(slave_path.as_ptr(), nix::libc::O_RDWR | nix::libc::O_NOCTTY)

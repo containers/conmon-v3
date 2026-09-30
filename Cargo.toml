@@ -27,6 +27,7 @@ log = { version = "0.4", features = ["std"] }
 chrono = "0.4"
 systemd = { version = "0.10.1", default-features = false, features = ["journal"] }
 atomic-write-file = "0.3"
+arrayvec = "0.7"
 
 [dev-dependencies]
 tempfile = "3"
