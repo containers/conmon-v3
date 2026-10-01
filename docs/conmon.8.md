@@ -220,6 +220,10 @@ once.
     Dashes in the plugin name are normalized to underscores (for example,
     `k8s-file` becomes `k8s_file`).
   * `journald` - Use the **journald** logging plugin.
+  * `syslog` - Use the **syslog** logging plugin (writes container output to
+    the system syslog via **openlog(3)**/**syslog(3)**). Because **openlog(3)**
+    configures a process-global destination, **syslog** may appear at most
+    once among **--log-path** values; a second **syslog** entry is rejected.
   * `passthrough` - Use the **passthrough** logging plugin (no additional file
     path).
   * `path` - Any other non-empty value is treated as a file path for the

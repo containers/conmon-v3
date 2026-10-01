@@ -546,11 +546,10 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
             if !plug.is_empty() {
                 plugin = plug.replace("-", "_");
             }
-        } else if s == "journald" {
-            plugin = "journald".to_string();
-        } else if s == "passthrough" {
-            plugin = "passthrough".to_string();
-        } else if s == "none" || s == "null" || s == "off" {
+        } else if matches!(
+            s.as_ref(),
+            "journald" | "syslog" | "passthrough" | "none" | "null" | "off"
+        ) {
             // Bare driver names (no ':') must not be treated as file paths.
             // Matches conmon-v2: `--log-path none` disables logging.
             plugin = s.to_string();
@@ -577,6 +576,15 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
     if passthrough_count > 0 && entries.len() > 1 {
         return Err(ConmonError::new(
             "passthrough log driver cannot be combined with other log drivers",
+            1,
+        ));
+    }
+
+    // openlog(3) is process-global; more than one syslog driver is unsupported.
+    let syslog_count = entries.iter().filter(|(name, _)| name == "syslog").count();
+    if syslog_count > 1 {
+        return Err(ConmonError::new(
+            "syslog log driver can only be used once",
             1,
         ));
     }
@@ -921,6 +929,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_syslog_and_journald_are_drivers_not_paths() -> ConmonResult<()> {
+        for name in ["syslog", "journald"] {
+            let o = Opts {
+                log_path: vec![PathBuf::from(name)],
+                cid: Some("0123456789abcdef".into()),
+                ..Default::default()
+            };
+            let entries = determine_log_plugin(&o)?;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, name);
+            assert!(entries[0].1.path.as_os_str().is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn null_plugin_alias_is_parsed() -> ConmonResult<()> {
         let o = Opts {
             log_path: vec![PathBuf::from("null:/var/log/null.log")],
@@ -1171,6 +1195,20 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("passthrough log driver cannot be combined")
+        );
+    }
+
+    #[test]
+    fn multiple_syslog_drivers_are_rejected() {
+        let o = Opts {
+            log_path: vec![PathBuf::from("syslog"), PathBuf::from("syslog")],
+            ..Default::default()
+        };
+
+        let err = determine_log_plugin(&o).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("syslog log driver can only be used once")
         );
     }
 }

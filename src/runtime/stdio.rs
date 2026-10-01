@@ -31,6 +31,88 @@ const CONSOLE_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Max SCM_RIGHTS descriptors accepted in one `recvmsg`.
 const MAX_SCM_RIGHTS_FDS: usize = 4;
 
+/// Delay before re-arming terminal PTY reads after temporary HUP/EIO.
+/// Matches conmon-v2's 100ms `tty_hup_timeout_cb` re-add.
+const TERMINAL_HUP_RETRY: Duration = Duration::from_millis(100);
+/// Event-loop `poll` timeout. Short enough that a 100ms terminal retry is
+/// noticed within one tick when the deadline is checked each iteration.
+const STDIO_POLL_MS: u16 = 10;
+
+fn is_terminal_remote(socket: &Socket) -> bool {
+    matches!(
+        socket,
+        Socket::Remote(r) if r.socket_type == SocketType::Terminal
+    )
+}
+
+/// Re-arm terminal sockets paused after HUP/EIO once `resume_at` is due.
+///
+/// Must run on every event-loop iteration (not only when `poll` returns 0);
+/// another readable fd can otherwise keep the loop busy and strand the PTY.
+fn resume_paused_terminals(sockets: &mut [Socket], resume_at: &mut Option<Instant>) {
+    let Some(when) = *resume_at else {
+        return;
+    };
+    if Instant::now() < when {
+        return;
+    }
+    for socket in sockets.iter_mut() {
+        if let Socket::Remote(remote) = socket {
+            if remote.socket_type == SocketType::Terminal && remote.read_closed {
+                debug!(
+                    "Re-arming terminal fd {} after HUP/EIO pause",
+                    remote.fd.as_raw_fd()
+                );
+                remote.read_closed = false;
+            }
+        }
+    }
+    *resume_at = None;
+}
+
+/// Pause terminal reads and schedule a retry; keep the PTY master fd open.
+fn pause_terminal_reads(remote: &mut RemoteSocket, resume_at: &mut Option<Instant>) {
+    remote.read_closed = true;
+    *resume_at = Some(Instant::now() + TERMINAL_HUP_RETRY);
+}
+
+/// Fill `pollfds` from `sockets`, recording which socket index each entry maps to.
+///
+/// Read-closed remotes (including HUP-paused terminals) are omitted: clearing
+/// `POLLIN` alone is not enough, because `poll` still reports `POLLHUP` and
+/// would reset the retry deadline every iteration.
+fn build_stdio_pollfds<'a>(
+    sockets: &'a [Socket],
+    pollfds: &mut Vec<PollFd<'a>>,
+    poll_to_socket: &mut Vec<usize>,
+) {
+    pollfds.clear();
+    poll_to_socket.clear();
+    for (i, socket) in sockets.iter().enumerate() {
+        match socket {
+            Socket::Unix(listener) => {
+                poll_to_socket.push(i);
+                pollfds.push(PollFd::new(
+                    listener
+                        .fd()
+                        .expect("listening socket must have an fd")
+                        .as_fd(),
+                    PollFlags::POLLIN,
+                ));
+            }
+            Socket::Remote(remote) if remote.read_closed => {}
+            Socket::Remote(remote) => {
+                poll_to_socket.push(i);
+                pollfds.push(PollFd::new(remote.fd.as_fd(), PollFlags::POLLIN));
+            }
+            Socket::Signal(fd) => {
+                poll_to_socket.push(i);
+                pollfds.push(PollFd::new(fd.as_fd(), PollFlags::POLLIN));
+            }
+        }
+    }
+}
+
 /// Creates new pipe and return read/write fds.
 ///
 /// # Returns
@@ -328,6 +410,8 @@ where
     debug!("Starting event loop");
     let mut sockets: Vec<Socket> = Vec::new();
     let mut new_sockets: Vec<RemoteSocket> = Vec::new();
+    // When set, Terminal sockets paused after POLLHUP/EIO are re-armed at this time.
+    let mut terminal_hup_resume_at: Option<Instant> = None;
 
     // Optional attach socket.
     // WARN: The attach socket must come before stdout and stderr, otherwise the
@@ -387,34 +471,18 @@ where
     // Iterates as long as we have some RemoteSocket to read from or
     // as long as `idle_callback` returns `true`.
     while sockets.iter().any(|s| matches!(s, Socket::Remote(_))) {
-        // Build the poll set each iteration by borrowing the fds owned by
-        // `sockets`.
-        let mut pollfds: Vec<PollFd> = sockets
-            .iter()
-            .map(|socket| match socket {
-                Socket::Unix(listener) => PollFd::new(
-                    listener
-                        .fd()
-                        .expect("listening socket must have an fd")
-                        .as_fd(),
-                    PollFlags::POLLIN,
-                ),
-                Socket::Remote(remote) => {
-                    // A socket whose read side reached EOF is no longer polled,
-                    // but stays alive for writing.
-                    let events = if remote.read_closed {
-                        PollFlags::empty()
-                    } else {
-                        PollFlags::POLLIN
-                    };
-                    PollFd::new(remote.fd.as_fd(), events)
-                }
-                Socket::Signal(fd) => PollFd::new(fd.as_fd(), PollFlags::POLLIN),
-            })
-            .collect();
+        // Re-arm before building the poll set so a due deadline is honored even
+        // when another fd keeps returning events (never idle).
+        resume_paused_terminals(&mut sockets, &mut terminal_hup_resume_at);
 
-        // Run poll to get informed about new fd events.
-        let n = poll(&mut pollfds, 10_u16).map_err(|e| {
+        // Build the poll set each iteration by borrowing the fds owned by
+        // `sockets`. Read-closed remotes (including HUP-paused terminals) are
+        // omitted so lingering POLLHUP cannot reset the retry deadline.
+        let mut pollfds: Vec<PollFd> = Vec::with_capacity(sockets.len());
+        let mut poll_to_socket: Vec<usize> = Vec::with_capacity(sockets.len());
+        build_stdio_pollfds(&sockets, &mut pollfds, &mut poll_to_socket);
+
+        let n = poll(&mut pollfds, STDIO_POLL_MS).map_err(|e| {
             ConmonError::new(
                 format!(
                     "handle_stdio poll() failed: {}",
@@ -424,10 +492,14 @@ where
             )
         })?;
 
-        // Snapshot the results so the borrow of `sockets` is released before it
-        // is mutated below. `revents` stays index-aligned with `sockets`.
-        let mut revents: Vec<Option<PollFlags>> = pollfds.iter().map(|pfd| pfd.revents()).collect();
+        // Snapshot results into a sockets-aligned vector (None = not polled /
+        // no events) so later mutation can use socket indices.
+        let mut revents: Vec<Option<PollFlags>> = vec![None; sockets.len()];
+        for (poll_i, &sock_i) in poll_to_socket.iter().enumerate() {
+            revents[sock_i] = pollfds[poll_i].revents();
+        }
         drop(pollfds);
+        drop(poll_to_socket);
 
         // We have no fd to read from, so execute the idle function.
         if n == 0 {
@@ -477,29 +549,54 @@ where
                         sockets.push(Socket::Remote(n_s));
                         revents.push(None);
                     }
-                } else if events.contains(PollFlags::POLLHUP) {
-                    // On HUP, close the socket.
-                    debug!("HUP on {:?}", sockets[i]);
-                    keep_socket = false;
+                }
+
+                if events.contains(PollFlags::POLLHUP) {
+                    if is_terminal_remote(&sockets[i]) {
+                        // Transient: no slave open. Keep the master; pause and retry.
+                        // Paused terminals are omitted from the next poll set, so this
+                        // path only runs for an armed terminal.
+                        if let Socket::Remote(remote) = &mut sockets[i] {
+                            debug!(
+                                "Terminal HUP on fd {}; pausing reads (v2 tty_hup behavior)",
+                                remote.fd.as_raw_fd()
+                            );
+                            pause_terminal_reads(remote, &mut terminal_hup_resume_at);
+                        }
+                        continue_reading = true;
+                    } else if !events.contains(PollFlags::POLLIN) {
+                        // Pipe HUP without input is final.
+                        debug!("HUP on {:?}", sockets[i]);
+                        keep_socket = false;
+                    }
                 }
             }
 
             if !continue_reading {
-                // Close the read part of the socket and stop polling it for
-                // input; it may still be a write target (e.g. attach client).
-                if let Socket::Remote(remote) = &mut sockets[i] {
-                    let raw = remote.fd.as_raw_fd();
-                    debug!("Shutdown {}", raw);
-                    unsafe { shutdown(raw, SHUT_RD) };
-                    remote.read_closed = true;
+                // Stop polling this fd for input; it may still be a write target.
+                if is_terminal_remote(&sockets[i]) {
+                    // EOF/EIO on the PTY: pause and retry; never SHUT_RD the master.
+                    if let Socket::Remote(remote) = &mut sockets[i] {
+                        debug!(
+                            "Terminal read pause on fd {} (EOF/EIO)",
+                            remote.fd.as_raw_fd()
+                        );
+                        pause_terminal_reads(remote, &mut terminal_hup_resume_at);
+                    }
+                } else {
+                    if let Socket::Remote(remote) = &mut sockets[i] {
+                        let raw = remote.fd.as_raw_fd();
+                        debug!("Shutdown {}", raw);
+                        unsafe { shutdown(raw, SHUT_RD) };
+                        remote.read_closed = true;
+                    }
+                    on_peer_read_eof(
+                        &sockets[i],
+                        stdin_attached,
+                        leave_stdin_open,
+                        &mut workerfd_stdin,
+                    );
                 }
-
-                on_peer_read_eof(
-                    &sockets[i],
-                    stdin_attached,
-                    leave_stdin_open,
-                    &mut workerfd_stdin,
-                );
             }
 
             if keep_socket {
@@ -534,10 +631,11 @@ mod tests {
     use nix::sys::stat::Mode;
     use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
     use std::io::IoSlice;
+    use std::os::fd::{AsFd, FromRawFd};
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn test_console_socket() -> ConmonResult<(tempfile::TempDir, UnixSocket)> {
@@ -706,6 +804,164 @@ mod tests {
             workerfd_stdin.is_none(),
             "container stdin is closed when the attach client EOFs"
         );
+        Ok(())
+    }
+
+    /// Open a PTY master with the slave closed (master yields EIO/HUP).
+    fn pty_master_slave_closed() -> ConmonResult<(OwnedFd, std::ffi::CString)> {
+        use std::ffi::CStr;
+        unsafe {
+            let master = nix::libc::posix_openpt(
+                nix::libc::O_RDWR | nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK,
+            );
+            if master < 0 {
+                return Err(ConmonError::new("posix_openpt failed", 1));
+            }
+            if nix::libc::grantpt(master) != 0 || nix::libc::unlockpt(master) != 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("grantpt/unlockpt failed", 1));
+            }
+            let name = nix::libc::ptsname(master);
+            if name.is_null() {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("ptsname failed", 1));
+            }
+            let path = std::ffi::CString::from(CStr::from_ptr(name));
+            let slave = nix::libc::open(path.as_ptr(), nix::libc::O_RDWR | nix::libc::O_NOCTTY);
+            if slave < 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("open pty slave failed", 1));
+            }
+            let _ = nix::libc::close(slave);
+            Ok((OwnedFd::from_raw_fd(master), path))
+        }
+    }
+
+    #[test]
+    fn terminal_rearms_while_other_fd_keeps_poll_busy() -> ConmonResult<()> {
+        // Re-arm must not depend on poll idle (n==0), and the master must stay
+        // open so a later slave reopen delivers data.
+        let (master, slave_path) = pty_master_slave_closed()?;
+        let (err_r, err_w) = pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
+        let _ = nix::unistd::write(err_w.as_fd(), b"x")?;
+
+        let mut sockets = vec![
+            Socket::Remote(RemoteSocket::new(SocketType::Stderr, err_r)),
+            Socket::Remote(RemoteSocket::new(SocketType::Terminal, master)),
+        ];
+        let mut resume_at = Some(Instant::now() + Duration::from_millis(40));
+        if let Socket::Remote(term) = &mut sockets[1] {
+            term.read_closed = true;
+        }
+
+        let mut rearmed = false;
+        let mut saw_busy_poll = false;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            resume_paused_terminals(&mut sockets, &mut resume_at);
+            if let Socket::Remote(term) = &sockets[1] {
+                if !term.read_closed {
+                    rearmed = true;
+                    break;
+                }
+            }
+
+            let mut pollfds = Vec::new();
+            let mut poll_to_socket = Vec::new();
+            build_stdio_pollfds(&sockets, &mut pollfds, &mut poll_to_socket);
+            let n = poll(&mut pollfds, STDIO_POLL_MS).unwrap();
+            if n > 0 {
+                if let Some(stderr_poll_i) = poll_to_socket.iter().position(|&i| i == 0) {
+                    if pollfds[stderr_poll_i]
+                        .revents()
+                        .is_some_and(|ev| ev.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
+                    {
+                        saw_busy_poll = true;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_busy_poll, "stderr must keep poll busy during the wait");
+        assert!(
+            rearmed,
+            "terminal must re-arm even when poll never returns 0"
+        );
+
+        let slave = unsafe {
+            nix::libc::open(slave_path.as_ptr(), nix::libc::O_RDWR | nix::libc::O_NOCTTY)
+        };
+        assert!(slave >= 0);
+        let marker = b"rearm-ok";
+        unsafe {
+            let _ = nix::libc::write(slave, marker.as_ptr() as *const _, marker.len());
+        }
+        if let Socket::Remote(term) = &sockets[1] {
+            let mut pfd = [PollFd::new(term.fd.as_fd(), PollFlags::POLLIN)];
+            let _ = poll(&mut pfd, 200u16).unwrap();
+            let mut buf = [0u8; 64];
+            let n = read(term.fd.as_fd(), &mut buf)
+                .map_err(|e| ConmonError::new(format!("read after re-arm: {e}"), 1))?;
+            assert!(n > 0, "expected terminal data after re-arm");
+            assert!(
+                buf[..n].windows(marker.len()).any(|w| w == marker),
+                "master must stay open across pause; got {:?}",
+                &buf[..n]
+            );
+        }
+        unsafe {
+            let _ = nix::libc::close(slave);
+        }
+        drop(err_w);
+        Ok(())
+    }
+
+    #[test]
+    fn paused_terminal_with_closed_slave_does_not_spin_or_postpone_deadline() -> ConmonResult<()> {
+        // Empty-events poll still reports POLLHUP on a master with no slave; the
+        // paused fd must be omitted from the poll set so the deadline is not reset.
+        let (master, _path) = pty_master_slave_closed()?;
+        {
+            let mut pfd = [PollFd::new(master.as_fd(), PollFlags::empty())];
+            let n = poll(&mut pfd, 0u16).unwrap();
+            assert!(
+                n > 0
+                    && pfd[0]
+                        .revents()
+                        .is_some_and(|r| r.contains(PollFlags::POLLHUP)),
+                "precondition: empty events still surface POLLHUP"
+            );
+        }
+
+        let mut sockets = vec![Socket::Remote(RemoteSocket::new(
+            SocketType::Terminal,
+            master,
+        ))];
+        let scheduled = Instant::now() + Duration::from_secs(60);
+        let mut resume_at = Some(scheduled);
+        if let Socket::Remote(term) = &mut sockets[0] {
+            term.read_closed = true;
+        }
+
+        for _ in 0..25 {
+            let mut pollfds = Vec::new();
+            let mut poll_to_socket = Vec::new();
+            build_stdio_pollfds(&sockets, &mut pollfds, &mut poll_to_socket);
+            assert!(
+                pollfds.is_empty() && poll_to_socket.is_empty(),
+                "paused terminal must be excluded from poll"
+            );
+            assert_eq!(poll(&mut pollfds, 0u16).unwrap(), 0);
+            assert_eq!(resume_at, Some(scheduled));
+        }
+
+        resume_at = Some(Instant::now() - Duration::from_millis(1));
+        resume_paused_terminals(&mut sockets, &mut resume_at);
+        assert!(resume_at.is_none());
+        match &sockets[0] {
+            Socket::Remote(t) => assert!(!t.read_closed, "deadline arrival must re-arm"),
+            _ => panic!("expected terminal"),
+        }
         Ok(())
     }
 }

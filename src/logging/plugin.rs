@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use crate::{
     error::{ConmonError, ConmonResult},
-    logging::{file_logger::FileLogger, journald_logger::JournaldLogger, none_logger::NoneLogger},
+    logging::{
+        file_logger::FileLogger, journald_logger::JournaldLogger, none_logger::NoneLogger,
+        syslog_logger::SyslogLogger,
+    },
 };
 
 pub trait LogPlugin {
@@ -35,6 +38,7 @@ fn create_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box<dyn Log
         "none" | "passthrough" | "null" | "off" => Ok(Box::new(NoneLogger::new(cfg)?)),
         "file" | "k8s_file" => Ok(Box::new(FileLogger::new(cfg)?)),
         "journald" => Ok(Box::new(JournaldLogger::new(cfg)?)),
+        "syslog" => Ok(Box::new(SyslogLogger::new(cfg)?)),
         _ => Err(ConmonError::new(format!("No such log driver {name}"), 1)),
     }
 }

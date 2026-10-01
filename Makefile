@@ -66,8 +66,15 @@ unit: ## Run the unit tests.
 	$(CARGO) test --no-fail-fast
 
 .PHONY: e2e
-e2e: conmon-v2 ## Run the e2e tests.
+e2e: e2e-v2 e2e-v3 ## Run conmon-v2 compatibility e2e plus conmon-v3 bats tests
+
+.PHONY: e2e-v2
+e2e-v2: conmon-v2 ## Run the conmon-v2 BATS suite against the v3 binary.
 	CONMON_BINARY="$(MAKEFILE_PATH)target/debug/conmon" conmon-v2/test/run-tests.sh
+
+.PHONY: e2e-v3
+e2e-v3: default conmon-v2 ## Run conmon-v3-specific BATS tests (e.g. syslog).
+	CONMON_BINARY="$(MAKEFILE_PATH)target/debug/conmon" test/bats/run-tests.sh
 
 .PHONY: .install.fmt
 .install.fmt:
