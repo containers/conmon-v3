@@ -38,13 +38,6 @@ const TERMINAL_HUP_RETRY: Duration = Duration::from_millis(100);
 /// noticed within one tick when the deadline is checked each iteration.
 const STDIO_POLL_MS: u16 = 10;
 
-fn is_terminal_remote(socket: &Socket) -> bool {
-    matches!(
-        socket,
-        Socket::Remote(r) if r.socket_type == SocketType::Terminal
-    )
-}
-
 /// Re-arm terminal sockets paused after HUP/EIO once `resume_at` is due.
 ///
 /// Must run on every event-loop iteration (not only when `poll` returns 0);
@@ -76,22 +69,19 @@ fn pause_terminal_reads(remote: &mut RemoteSocket, resume_at: &mut Option<Instan
     *resume_at = Some(Instant::now() + TERMINAL_HUP_RETRY);
 }
 
-/// Fill `pollfds` from `sockets`, recording which socket index each entry maps to.
+/// Build the poll set from `sockets`, with `polled_indices[i]` naming the
+/// socket index behind `pollfds[i]`.
 ///
 /// Read-closed remotes (including HUP-paused terminals) are omitted: clearing
 /// `POLLIN` alone is not enough, because `poll` still reports `POLLHUP` and
 /// would reset the retry deadline every iteration.
-fn build_stdio_pollfds<'a>(
-    sockets: &'a [Socket],
-    pollfds: &mut Vec<PollFd<'a>>,
-    poll_to_socket: &mut Vec<usize>,
-) {
-    pollfds.clear();
-    poll_to_socket.clear();
+fn build_stdio_pollfds<'a>(sockets: &'a [Socket]) -> (Vec<PollFd<'a>>, Vec<usize>) {
+    let mut pollfds = Vec::with_capacity(sockets.len());
+    let mut polled_indices = Vec::with_capacity(sockets.len());
     for (i, socket) in sockets.iter().enumerate() {
         match socket {
             Socket::Unix(listener) => {
-                poll_to_socket.push(i);
+                polled_indices.push(i);
                 pollfds.push(PollFd::new(
                     listener
                         .fd()
@@ -102,15 +92,16 @@ fn build_stdio_pollfds<'a>(
             }
             Socket::Remote(remote) if remote.read_closed => {}
             Socket::Remote(remote) => {
-                poll_to_socket.push(i);
+                polled_indices.push(i);
                 pollfds.push(PollFd::new(remote.fd.as_fd(), PollFlags::POLLIN));
             }
             Socket::Signal(fd) => {
-                poll_to_socket.push(i);
+                polled_indices.push(i);
                 pollfds.push(PollFd::new(fd.as_fd(), PollFlags::POLLIN));
             }
         }
     }
+    (pollfds, polled_indices)
 }
 
 /// Creates new pipe and return read/write fds.
@@ -478,9 +469,7 @@ where
         // Build the poll set each iteration by borrowing the fds owned by
         // `sockets`. Read-closed remotes (including HUP-paused terminals) are
         // omitted so lingering POLLHUP cannot reset the retry deadline.
-        let mut pollfds: Vec<PollFd> = Vec::with_capacity(sockets.len());
-        let mut poll_to_socket: Vec<usize> = Vec::with_capacity(sockets.len());
-        build_stdio_pollfds(&sockets, &mut pollfds, &mut poll_to_socket);
+        let (mut pollfds, polled_indices) = build_stdio_pollfds(&sockets);
 
         let n = poll(&mut pollfds, STDIO_POLL_MS).map_err(|e| {
             ConmonError::new(
@@ -495,11 +484,11 @@ where
         // Snapshot results into a sockets-aligned vector (None = not polled /
         // no events) so later mutation can use socket indices.
         let mut revents: Vec<Option<PollFlags>> = vec![None; sockets.len()];
-        for (poll_i, &sock_i) in poll_to_socket.iter().enumerate() {
+        for (poll_i, &sock_i) in polled_indices.iter().enumerate() {
             revents[sock_i] = pollfds[poll_i].revents();
         }
         drop(pollfds);
-        drop(poll_to_socket);
+        drop(polled_indices);
 
         // We have no fd to read from, so execute the idle function.
         if n == 0 {
@@ -552,44 +541,52 @@ where
                 }
 
                 if events.contains(PollFlags::POLLHUP) {
-                    if is_terminal_remote(&sockets[i]) {
-                        // Transient: no slave open. Keep the master; pause and retry.
-                        // Paused terminals are omitted from the next poll set, so this
-                        // path only runs for an armed terminal.
-                        if let Socket::Remote(remote) = &mut sockets[i] {
+                    match &mut sockets[i] {
+                        Socket::Remote(remote) if remote.socket_type == SocketType::Terminal => {
+                            // Transient: no slave open. Keep the master; pause and retry.
+                            // Paused terminals are omitted from the next poll set, so this
+                            // path only runs for an armed terminal.
                             debug!(
                                 "Terminal HUP on fd {}; pausing reads (v2 tty_hup behavior)",
                                 remote.fd.as_raw_fd()
                             );
                             pause_terminal_reads(remote, &mut terminal_hup_resume_at);
+                            continue_reading = true;
                         }
-                        continue_reading = true;
-                    } else if !events.contains(PollFlags::POLLIN) {
-                        // Pipe HUP without input is final.
+                        _ if !events.contains(PollFlags::POLLIN) => {
+                            // Pipe HUP without input is final.
+                            keep_socket = false;
+                        }
+                        _ => {}
+                    }
+                    if !keep_socket {
                         debug!("HUP on {:?}", sockets[i]);
-                        keep_socket = false;
                     }
                 }
             }
 
             if !continue_reading {
                 // Stop polling this fd for input; it may still be a write target.
-                if is_terminal_remote(&sockets[i]) {
-                    // EOF/EIO on the PTY: pause and retry; never SHUT_RD the master.
-                    if let Socket::Remote(remote) = &mut sockets[i] {
+                let terminal_pause = match &mut sockets[i] {
+                    Socket::Remote(remote) if remote.socket_type == SocketType::Terminal => {
+                        // EOF/EIO on the PTY: pause and retry; never SHUT_RD the master.
                         debug!(
                             "Terminal read pause on fd {} (EOF/EIO)",
                             remote.fd.as_raw_fd()
                         );
                         pause_terminal_reads(remote, &mut terminal_hup_resume_at);
+                        true
                     }
-                } else {
-                    if let Socket::Remote(remote) = &mut sockets[i] {
+                    Socket::Remote(remote) => {
                         let raw = remote.fd.as_raw_fd();
                         debug!("Shutdown {}", raw);
                         unsafe { shutdown(raw, SHUT_RD) };
                         remote.read_closed = true;
+                        false
                     }
+                    _ => false,
+                };
+                if !terminal_pause {
                     on_peer_read_eof(
                         &sockets[i],
                         stdin_attached,
@@ -866,12 +863,10 @@ mod tests {
                 }
             }
 
-            let mut pollfds = Vec::new();
-            let mut poll_to_socket = Vec::new();
-            build_stdio_pollfds(&sockets, &mut pollfds, &mut poll_to_socket);
+            let (mut pollfds, polled_indices) = build_stdio_pollfds(&sockets);
             let n = poll(&mut pollfds, STDIO_POLL_MS).unwrap();
             if n > 0 {
-                if let Some(stderr_poll_i) = poll_to_socket.iter().position(|&i| i == 0) {
+                if let Some(stderr_poll_i) = polled_indices.iter().position(|&i| i == 0) {
                     if pollfds[stderr_poll_i]
                         .revents()
                         .is_some_and(|ev| ev.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
@@ -944,11 +939,9 @@ mod tests {
         }
 
         for _ in 0..25 {
-            let mut pollfds = Vec::new();
-            let mut poll_to_socket = Vec::new();
-            build_stdio_pollfds(&sockets, &mut pollfds, &mut poll_to_socket);
+            let (mut pollfds, polled_indices) = build_stdio_pollfds(&sockets);
             assert!(
-                pollfds.is_empty() && poll_to_socket.is_empty(),
+                pollfds.is_empty() && polled_indices.is_empty(),
                 "paused terminal must be excluded from poll"
             );
             assert_eq!(poll(&mut pollfds, 0u16).unwrap(), 0);

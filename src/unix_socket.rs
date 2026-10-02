@@ -291,6 +291,11 @@ pub struct RemoteSocket {
 
     /// Set when the read side reached EOF.
     pub(crate) read_closed: bool,
+
+    /// Set when writes to this peer fail (attach client gone). Matches conmon-v2
+    /// clearing `writable` after a failed console write so we keep draining
+    /// container stdio instead of aborting the session with exit status 1.
+    pub(crate) write_closed: bool,
 }
 
 impl fmt::Debug for RemoteSocket {
@@ -313,6 +318,7 @@ impl RemoteSocket {
             buf: SocketBuffer::new(),
             handler: None,
             read_closed: false,
+            write_closed: false,
         }
     }
 
@@ -442,6 +448,7 @@ impl From<UnixSocket> for RemoteSocket {
             buf: SocketBuffer::new(),
             handler: None,
             read_closed: false,
+            write_closed: false,
         }
     }
 }
@@ -893,16 +900,47 @@ impl Socket {
                         // SOCKET_SEQPACKET and therefore everything needs to be sent in a single packet.
                         let data = r.buf.data();
                         for chunk in data.chunks(CONMON_CLIENT_BUFFER_SIZE) {
-                            for sock in before.iter().chain(after.iter()) {
+                            for sock in before.iter_mut().chain(after.iter_mut()) {
                                 let Socket::Remote(peer) = sock else { continue };
-                                if peer.socket_type != SocketType::Console {
+                                if peer.socket_type != SocketType::Console || peer.write_closed {
                                     continue;
                                 }
                                 let iov = [
                                     std::io::IoSlice::new(prefix_buf),
                                     std::io::IoSlice::new(chunk),
                                 ];
-                                writev(peer.fd.as_fd(), &iov)?;
+                                match writev(peer.fd.as_fd(), &iov) {
+                                    Ok(_) => {}
+                                    Err(err)
+                                        if matches!(
+                                            err,
+                                            Errno::EPIPE
+                                                | Errno::ECONNRESET
+                                                | Errno::ECONNABORTED
+                                                | Errno::ENOTCONN
+                                        ) =>
+                                    {
+                                        // Match conmon-v2 `write_back_to_remote_consoles`:
+                                        // a gone attach client must not abort the session
+                                        // (that would write exit-file status 1 while the
+                                        // container exited 0).
+                                        warn!(
+                                            "Failed to write to attach console fd {}: {}",
+                                            peer.fd.as_raw_fd(),
+                                            io::Error::from_raw_os_error(err as i32)
+                                        );
+                                        peer.write_closed = true;
+                                    }
+                                    Err(err) => {
+                                        return Err(ConmonError::new(
+                                            format!(
+                                                "write to attach console failed: {}",
+                                                io::Error::from_raw_os_error(err as i32)
+                                            ),
+                                            1,
+                                        ));
+                                    }
+                                }
                             }
                         }
                         r.clear_buffer();
@@ -910,17 +948,51 @@ impl Socket {
                     SocketType::Console => {
                         // Console socket: forward data to container's stdin.
                         if let Some(workerfd_stdin) = workerfd_stdin.as_ref() {
-                            let bytes_written = write(workerfd_stdin, r.buf.data())?;
-                            info!("bytes written: {}", bytes_written);
+                            match write(workerfd_stdin, r.buf.data()) {
+                                Ok(bytes_written) => {
+                                    info!("bytes written: {}", bytes_written);
+                                }
+                                // Stdin already closed (attach EOF); ignore like v2.
+                                Err(err)
+                                    if err == Errno::EPIPE
+                                        || err == Errno::EAGAIN
+                                        || err == Errno::EWOULDBLOCK => {}
+                                Err(err) => {
+                                    return Err(ConmonError::new(
+                                        format!(
+                                            "write to container stdin failed: {}",
+                                            io::Error::from_raw_os_error(err as i32)
+                                        ),
+                                        1,
+                                    ));
+                                }
+                            }
                         }
                         // Forward data to terminal.
-                        for sock in before.iter().chain(after.iter()) {
+                        for sock in before.iter_mut().chain(after.iter_mut()) {
                             let Socket::Remote(peer) = sock else { continue };
-                            if peer.socket_type != SocketType::Terminal || peer.read_closed {
+                            if peer.socket_type != SocketType::Terminal
+                                || peer.read_closed
+                                || peer.write_closed
+                            {
                                 continue;
                             }
                             debug!("Forwarding to terminal {}", peer.fd.as_raw_fd());
-                            write(peer.fd.as_fd(), r.buf.data())?;
+                            match write(peer.fd.as_fd(), r.buf.data()) {
+                                Ok(_) => {}
+                                Err(Errno::EPIPE) | Err(Errno::EIO) | Err(Errno::ECONNRESET) => {
+                                    peer.write_closed = true;
+                                }
+                                Err(err) => {
+                                    return Err(ConmonError::new(
+                                        format!(
+                                            "write to terminal failed: {}",
+                                            io::Error::from_raw_os_error(err as i32)
+                                        ),
+                                        1,
+                                    ));
+                                }
+                            }
                         }
                         r.clear_buffer();
                     }
@@ -1274,6 +1346,51 @@ mod remote_socket_read_tests {
     }
 
     #[test]
+    fn read_returns_data_from_open_terminal_slave() -> ConmonResult<()> {
+        use std::ffi::CStr;
+        use std::os::fd::FromRawFd;
+
+        let (master, slave) = unsafe {
+            let master = nix::libc::posix_openpt(
+                nix::libc::O_RDWR | nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK,
+            );
+            if master < 0 {
+                return Err(ConmonError::new("posix_openpt failed", 1));
+            }
+            if nix::libc::grantpt(master) != 0 || nix::libc::unlockpt(master) != 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("grantpt/unlockpt failed", 1));
+            }
+            let name = nix::libc::ptsname(master);
+            if name.is_null() {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("ptsname failed", 1));
+            }
+            let path = CStr::from_ptr(name);
+            let slave = nix::libc::open(path.as_ptr(), nix::libc::O_RDWR | nix::libc::O_NOCTTY);
+            if slave < 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("open pty slave failed", 1));
+            }
+            (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
+        };
+
+        let marker = b"pty-happy-path";
+        write(slave.as_fd(), marker)?;
+
+        let mut socket = RemoteSocket::new(SocketType::Terminal, master);
+        match socket.read()? {
+            ReadResult::Read(n) => assert!(
+                n >= marker.len(),
+                "expected at least {} bytes from open slave, got {n}",
+                marker.len()
+            ),
+            other => panic!("expected Read, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn handle_data_pauses_on_terminal_hung_up_without_pollhup() -> ConmonResult<()> {
         // POLLIN path with EIO and no POLLHUP must stop reading (continue_reading=false)
         // so the event loop schedules the HUP retry instead of spinning on WouldBlock.
@@ -1283,22 +1400,46 @@ mod remote_socket_read_tests {
             master,
         ))];
         let mut new_sockets = Vec::new();
-        struct NopLog;
-        impl crate::logging::plugin::LogPlugin for NopLog {
-            fn write(&mut self, _: bool, _: &[u8]) -> ConmonResult<()> {
-                Ok(())
-            }
-            fn reopen(&mut self) -> ConmonResult<()> {
-                Ok(())
-            }
-        }
-        let mut log = NopLog;
+        let mut log = crate::logging::none_logger::NoneLogger;
         let continue_reading =
             Socket::handle_data(&mut sockets, 0, &mut log, &mut new_sockets, None, &None)?;
         assert!(
             !continue_reading,
             "TerminalHungUp must request a read pause (false), not WouldBlock keep-alive (true)"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stdout_forward_to_closed_attach_does_not_fail() -> ConmonResult<()> {
+        // --attach stdin with immediate EOF closes the attach client while the
+        // container may still emit stdout. writev EPIPE must not fail handle_data
+        // (conmon would then write exit-file status 1 despite a 0 container exit).
+        let (attach_a, attach_b) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )?;
+        drop(attach_b);
+
+        let (stdout_r, stdout_w) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
+        write(stdout_w.as_fd(), b"hello-from-container")?;
+
+        let mut sockets = vec![
+            Socket::Remote(RemoteSocket::new(SocketType::Console, attach_a)),
+            Socket::Remote(RemoteSocket::new(SocketType::Stdout, stdout_r)),
+        ];
+        let mut new_sockets = Vec::new();
+        let mut log = crate::logging::none_logger::NoneLogger;
+        Socket::handle_data(&mut sockets, 1, &mut log, &mut new_sockets, None, &None)?;
+        match &sockets[0] {
+            Socket::Remote(peer) => assert!(
+                peer.write_closed,
+                "failed attach write must mark the peer write_closed"
+            ),
+            _ => panic!("expected console peer"),
+        }
         Ok(())
     }
 }
