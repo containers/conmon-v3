@@ -1274,6 +1274,51 @@ mod remote_socket_read_tests {
     }
 
     #[test]
+    fn read_returns_data_from_open_terminal_slave() -> ConmonResult<()> {
+        use std::ffi::CStr;
+        use std::os::fd::FromRawFd;
+
+        let (master, slave) = unsafe {
+            let master = nix::libc::posix_openpt(
+                nix::libc::O_RDWR | nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK,
+            );
+            if master < 0 {
+                return Err(ConmonError::new("posix_openpt failed", 1));
+            }
+            if nix::libc::grantpt(master) != 0 || nix::libc::unlockpt(master) != 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("grantpt/unlockpt failed", 1));
+            }
+            let name = nix::libc::ptsname(master);
+            if name.is_null() {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("ptsname failed", 1));
+            }
+            let path = CStr::from_ptr(name);
+            let slave = nix::libc::open(path.as_ptr(), nix::libc::O_RDWR | nix::libc::O_NOCTTY);
+            if slave < 0 {
+                let _ = nix::libc::close(master);
+                return Err(ConmonError::new("open pty slave failed", 1));
+            }
+            (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
+        };
+
+        let marker = b"pty-happy-path";
+        write(slave.as_fd(), marker)?;
+
+        let mut socket = RemoteSocket::new(SocketType::Terminal, master);
+        match socket.read()? {
+            ReadResult::Read(n) => assert!(
+                n >= marker.len(),
+                "expected at least {} bytes from open slave, got {n}",
+                marker.len()
+            ),
+            other => panic!("expected Read, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn handle_data_pauses_on_terminal_hung_up_without_pollhup() -> ConmonResult<()> {
         // POLLIN path with EIO and no POLLHUP must stop reading (continue_reading=false)
         // so the event loop schedules the HUP retry instead of spinning on WouldBlock.
@@ -1283,16 +1328,7 @@ mod remote_socket_read_tests {
             master,
         ))];
         let mut new_sockets = Vec::new();
-        struct NopLog;
-        impl crate::logging::plugin::LogPlugin for NopLog {
-            fn write(&mut self, _: bool, _: &[u8]) -> ConmonResult<()> {
-                Ok(())
-            }
-            fn reopen(&mut self) -> ConmonResult<()> {
-                Ok(())
-            }
-        }
-        let mut log = NopLog;
+        let mut log = crate::logging::none_logger::NoneLogger;
         let continue_reading =
             Socket::handle_data(&mut sockets, 0, &mut log, &mut new_sockets, None, &None)?;
         assert!(
