@@ -4,6 +4,9 @@ use crate::error::{ConmonError, ConmonResult};
 use atomic_write_file::AtomicWriteFile;
 use log::{error, info, warn};
 use nix::errno::Errno;
+use nix::sys::signal::{
+    SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal, pthread_sigmask, sigaction,
+};
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 
@@ -11,10 +14,83 @@ use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use nix::libc::{PR_SET_CHILD_SUBREAPER, close, prctl};
+use nix::libc::{_exit, PR_SET_CHILD_SUBREAPER, close, prctl};
+
+/// Exit status used if systemd SIGTERMs us during `--exit-command` teardown.
+/// Must only be read/written from the main thread or the teardown signal handler.
+static TEARDOWN_EXIT_CODE: AtomicU8 = AtomicU8::new(0);
+
+/// Signals blocked for the runtime spawn window and for signalfd during the
+/// event loop. Must be unblocked before teardown so systemd can SIGTERM the
+/// conmon scope when tearing down a pod slice (matches conmon-v2).
+fn lifecycle_signal_set() -> SigSet {
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGTERM);
+    mask.add(Signal::SIGQUIT);
+    mask.add(Signal::SIGINT);
+    mask.add(Signal::SIGHUP);
+    mask
+}
+
+extern "C" fn teardown_signal_handler(_: i32) {
+    // Async-signal-safe: preserve the container exit code so Type=notify units
+    // report Result=exit-code (failed when non-zero) instead of a death by
+    // KillSignal which systemd treats as a successful stop (ActiveState=inactive).
+    // Prefer `_exit` over `std::process::exit`: the latter runs atexit/destructors
+    // and is not async-signal-safe.
+    let code = TEARDOWN_EXIT_CODE.load(Ordering::Acquire);
+    unsafe { _exit(i32::from(code)) };
+}
+
+/// Install handlers so a lifecycle signal during teardown exits with `exit_code`
+/// rather than the default terminate disposition.
+///
+/// Call this after exit files are written and before unblocking. Leaving the
+/// default SIGTERM disposition after unblock makes `systemctl stop` on a
+/// Type=notify quadlet unit report `ActiveState=inactive` (systemd treats
+/// death by KillSignal as a clean stop) instead of `failed` when the container
+/// exited non-zero.
+pub fn install_teardown_exit_on_lifecycle_signals(exit_code: u8) {
+    TEARDOWN_EXIT_CODE.store(exit_code, Ordering::Release);
+    let action = SigAction::new(
+        SigHandler::Handler(teardown_signal_handler),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    for sig in [
+        Signal::SIGTERM,
+        Signal::SIGQUIT,
+        Signal::SIGINT,
+        Signal::SIGHUP,
+    ] {
+        if let Err(e) = unsafe { sigaction(sig, &action) } {
+            warn!("Failed to install teardown handler for {sig}: {e}");
+        }
+    }
+}
+
+/// Unblock lifecycle signals after the event loop so systemd scope stop can
+/// deliver SIGTERM while we run `--exit-command`.
+///
+/// Install [`install_teardown_exit_on_lifecycle_signals`] first so a pending or
+/// newly delivered SIGTERM exits with the container status instead of the
+/// default terminate disposition.
+///
+/// conmon-v2 installs handlers then restores the process mask before its main
+/// loop; we keep TERM/QUIT/INT blocked only while signalfd owns them. Leaving
+/// them blocked through exit lets `StopUnit` on `libpod-conmon-*.scope` (and
+/// thus the parent pod slice) stall or leave the unit loaded, which races with
+/// the next `StartTransientUnit` (`Unit ... was already loaded or has a fragment file`).
+pub fn unblock_lifecycle_signals() {
+    let mask = lifecycle_signal_set();
+    if let Err(e) = pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None) {
+        warn!("Failed to unblock lifecycle signals before exit: {e}");
+    }
+}
 
 /// Sets this process as subreaper.
 ///
@@ -494,5 +570,49 @@ mod tests {
         let meta = std::fs::metadata(&fifo_path).unwrap();
         assert!(meta.is_file());
         assert_eq!(std::fs::read_to_string(&fifo_path).unwrap(), "13");
+    }
+
+    #[test]
+    fn unblock_lifecycle_signals_clears_blocked_term() {
+        let mut prior = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_SETMASK, None, Some(&mut prior)).unwrap();
+
+        let mut mask = SigSet::empty();
+        mask.add(Signal::SIGTERM);
+        mask.add(Signal::SIGQUIT);
+        mask.add(Signal::SIGINT);
+        mask.add(Signal::SIGHUP);
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None).unwrap();
+
+        unblock_lifecycle_signals();
+
+        let mut pending = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_SETMASK, None, Some(&mut pending)).unwrap();
+        let ok = !pending.contains(Signal::SIGTERM)
+            && !pending.contains(Signal::SIGQUIT)
+            && !pending.contains(Signal::SIGINT)
+            && !pending.contains(Signal::SIGHUP);
+        // Restore whatever the test harness had before we touched the mask.
+        let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&prior), None);
+        assert!(
+            ok,
+            "SIGTERM/QUIT/INT/HUP must be deliverable during exit so systemd can stop the conmon scope"
+        );
+    }
+
+    #[test]
+    fn teardown_handler_stores_exit_code() {
+        install_teardown_exit_on_lifecycle_signals(137);
+        assert_eq!(TEARDOWN_EXIT_CODE.load(Ordering::Acquire), 137);
+        // Restore default disposition so other tests are not surprised.
+        let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        for sig in [
+            Signal::SIGTERM,
+            Signal::SIGQUIT,
+            Signal::SIGINT,
+            Signal::SIGHUP,
+        ] {
+            let _ = unsafe { sigaction(sig, &action) };
+        }
     }
 }
