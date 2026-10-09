@@ -45,7 +45,7 @@ teardown() {
 @test "no log driver should fail" {
     run_conmon --cid "$CTR_ID" --cuuid "$CTR_ID" --runtime "$VALID_PATH"
     assert_failure
-    assert_output_contains "Log driver not provided. Use --log-path"
+    assert_output_contains "Log driver not provided. Use --log-driver (or deprecated --log-path)"
 }
 
 @test "empty log driver should fail" {
