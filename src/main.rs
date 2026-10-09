@@ -5,7 +5,7 @@ use ::log::error;
 use ::log::info;
 use clap::Parser;
 use conmon::Cid;
-use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin, validate_log_tag_locale};
+use conmon::cli::{Cmd, Opts, determine_cmd, resolve_log_plugins, validate_log_tag_locale};
 use conmon::commands::create::Create;
 use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
@@ -100,7 +100,7 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     }
 
     // Parse the log plugin(s) to use and initialize them.
-    let plugin_entries = determine_log_plugin(&opts)?;
+    let plugin_entries = resolve_log_plugins(&opts)?;
     let plugin_names: Vec<&str> = plugin_entries.iter().map(|(n, _)| n.as_str()).collect();
     info!("Using log plugin(s): {:?}", plugin_names);
     let mut log_plugin = initialize_log_plugins(&plugin_entries)?;

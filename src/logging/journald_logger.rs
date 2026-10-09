@@ -45,6 +45,16 @@ fn is_valid_label_name(s: &str) -> bool {
 
 impl JournaldLogger {
     pub fn new(cfg: &LogPluginCfg) -> ConmonResult<Self> {
+        let cid = cfg.cid.as_deref().ok_or_else(|| {
+            ConmonError::new("Container ID must be provided and of the correct length", 1)
+        })?;
+        if cid.chars().count() <= 12 {
+            return Err(ConmonError::new(
+                "Container ID must be longer than 12 characters",
+                1,
+            ));
+        }
+
         // Validate the labels.
         for l in &cfg.log_labels {
             if l.starts_with('=') {
@@ -118,8 +128,8 @@ impl JournaldLogger {
         partial
     }
 
-    /// Truncates the CUUID to 12 characters.
-    fn truncate_cuuid(s: &str) -> &str {
+    /// Truncates a container id to 12 characters.
+    fn truncate_id(s: &str) -> &str {
         if s.len() <= 12 {
             return s;
         }
@@ -128,6 +138,36 @@ impl JournaldLogger {
             Some((idx, _)) => &s[..idx],
             None => s, // fewer than 12 chars
         }
+    }
+
+    /// Journal fields that do not change per line.
+    ///
+    /// Matches conmon-v2: `CONTAINER_ID` is `--cid` truncated to 12 characters,
+    /// `CONTAINER_ID_FULL` is the full `--cid`, and `SYSLOG_IDENTIFIER` prefers
+    /// `--log-tag`, then `--name`, then that truncated id.
+    fn identity_fields(cfg: &LogPluginCfg) -> Vec<String> {
+        let cid = cfg
+            .cid
+            .as_deref()
+            .expect("journald requires a container id");
+        let short = Self::truncate_id(cid);
+        let mut fields = vec![
+            format!("CONTAINER_ID_FULL={cid}"),
+            format!("CONTAINER_ID={short}"),
+        ];
+        if let Some(tag) = &cfg.log_tag {
+            fields.push(format!("CONTAINER_TAG={tag}"));
+        }
+        if let Some(name) = &cfg.name {
+            fields.push(format!("CONTAINER_NAME={name}"));
+        }
+        let ident = cfg
+            .log_tag
+            .as_deref()
+            .or(cfg.name.as_deref())
+            .unwrap_or(short);
+        fields.push(format!("SYSLOG_IDENTIFIER={ident}"));
+        fields
     }
 }
 
@@ -205,26 +245,7 @@ impl LogPlugin for JournaldLogger {
             let priority_txt = format!("PRIORITY={}", parsed_priority);
             fields.push(priority_txt);
 
-            // Other fields.
-            if let Some(cid) = &self.cfg.cid {
-                fields.push(format!("CONTAINER_ID={}", cid));
-            }
-
-            if let Some(cuuid) = &self.cfg.cuuid {
-                fields.push(format!("CONTAINER_ID_FULL={}", cuuid));
-            }
-
-            if let Some(tag) = &self.cfg.log_tag {
-                fields.push(format!("CONTAINER_TAG={}", tag));
-            }
-
-            if let Some(name) = &self.cfg.name {
-                fields.push(format!("CONTAINER_NAME={}", name));
-            }
-
-            if let Some(cuuid) = &self.cfg.cuuid {
-                fields.push(format!("SYSLOG_IDENTIFIER={}", Self::truncate_cuuid(cuuid)));
-            }
+            fields.extend(Self::identity_fields(&self.cfg));
 
             if partial && !self.cfg.no_container_partial_message {
                 fields.push("CONTAINER_PARTIAL_MESSAGE=true".to_string());
@@ -255,5 +276,63 @@ impl LogPlugin for JournaldLogger {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_cid(cid: &str) -> LogPluginCfg {
+        LogPluginCfg {
+            cid: Some(cid.into()),
+            ..LogPluginCfg::default()
+        }
+    }
+
+    #[test]
+    fn identity_uses_truncated_cid() {
+        let cfg = cfg_with_cid("0123456789abcdefEXTRA");
+        let fields = JournaldLogger::identity_fields(&cfg);
+        assert!(fields.iter().any(|f| f == "CONTAINER_ID=0123456789ab"));
+        assert!(
+            fields
+                .iter()
+                .any(|f| f == "CONTAINER_ID_FULL=0123456789abcdefEXTRA")
+        );
+        assert!(fields.iter().any(|f| f == "SYSLOG_IDENTIFIER=0123456789ab"));
+    }
+
+    #[test]
+    fn syslog_identifier_prefers_tag_then_name() {
+        let mut cfg = cfg_with_cid("0123456789abcdefEXTRA");
+        cfg.name = Some("myname".into());
+        let fields = JournaldLogger::identity_fields(&cfg);
+        assert!(fields.iter().any(|f| f == "SYSLOG_IDENTIFIER=myname"));
+        assert!(fields.iter().any(|f| f == "CONTAINER_NAME=myname"));
+        assert!(!fields.iter().any(|f| f.starts_with("CONTAINER_TAG=")));
+
+        cfg.log_tag = Some("mytag".into());
+        let fields = JournaldLogger::identity_fields(&cfg);
+        assert!(fields.iter().any(|f| f == "SYSLOG_IDENTIFIER=mytag"));
+        assert!(fields.iter().any(|f| f == "CONTAINER_TAG=mytag"));
+        assert!(fields.iter().any(|f| f == "CONTAINER_NAME=myname"));
+        assert!(fields.iter().any(|f| f == "CONTAINER_ID=0123456789ab"));
+    }
+
+    #[test]
+    fn rejects_missing_or_short_cid() {
+        let Err(err) = JournaldLogger::new(&LogPluginCfg::default()) else {
+            panic!("missing container id must be rejected");
+        };
+        assert!(err.to_string().contains("Container ID must be provided"));
+
+        let Err(err) = JournaldLogger::new(&cfg_with_cid("abcdefghijkl")) else {
+            panic!("short container id must be rejected");
+        };
+        assert!(
+            err.to_string()
+                .contains("Container ID must be longer than 12 characters")
+        );
     }
 }
