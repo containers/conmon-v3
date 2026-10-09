@@ -1,23 +1,17 @@
 #!/usr/bin/env bash
-#
-# Shared helpers for conmon-v3 BATS tests.
-#
-# Reuses the mature helpers from the conmon-v2 test suite (fetched via
-# `make conmon-v2`) so v3-specific bats files stay small and consistent.
 
+# Common test helper functions for conmon BATS tests.
+# Vendored from conmon-v2/test and extended for conmon-v3.
+
+# status and output are set by bats' run, and several variables defined here
+# are only referenced by the .bats files that load this one, so shellcheck
+# cannot see either when it looks at this file on its own.
 # shellcheck disable=SC2034,SC2154
 
 CONMON_V3_TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONMON_V3_ROOT="$(cd "$CONMON_V3_TEST_DIR/../.." && pwd)"
-CONMON_V2_TEST_DIR="${CONMON_V2_TEST_DIR:-$CONMON_V3_ROOT/conmon-v2/test}"
 
-if [[ ! -f "$CONMON_V2_TEST_DIR/test_helper.bash" ]]; then
-    echo "conmon-v2 test helpers not found at $CONMON_V2_TEST_DIR" >&2
-    echo "Run 'make conmon-v2' first (or set CONMON_V2_TEST_DIR)." >&2
-    return 1 2>/dev/null || exit 1
-fi
-
-# Prefer the v3 binary under test when the caller has not set CONMON_BINARY.
+# Prefer the in-tree v3 binary when the caller has not set CONMON_BINARY.
 if [[ -z "${CONMON_BINARY:-}" ]]; then
     if [[ -x "$CONMON_V3_ROOT/target/debug/conmon" ]]; then
         CONMON_BINARY="$CONMON_V3_ROOT/target/debug/conmon"
@@ -25,7 +19,6 @@ if [[ -z "${CONMON_BINARY:-}" ]]; then
         CONMON_BINARY="$CONMON_V3_ROOT/target/release/conmon"
     fi
 fi
-export CONMON_BINARY
 
 # Prefer crun when present (common on Fedora); fall back to runc.
 if [[ -z "${RUNTIME_BINARY:-}" ]]; then
@@ -35,10 +28,768 @@ if [[ -z "${RUNTIME_BINARY:-}" ]]; then
         RUNTIME_BINARY=/usr/bin/runc
     fi
 fi
-export RUNTIME_BINARY
 
-# shellcheck source=/dev/null
-source "$CONMON_V2_TEST_DIR/test_helper.bash"
+# Provide basic assertion functions if not available
+assert_success() {
+    if [ "$status" -ne 0 ]; then
+        echo "Command failed with status $status"
+        echo "Output: $output"
+        return 1
+    fi
+}
+
+assert_failure() {
+    if [ "$status" -eq 0 ]; then
+        echo "Command succeeded but failure was expected"
+        echo "Output: $output"
+        return 1
+    fi
+}
+
+# Default paths and variables
+CONMON_BINARY="${CONMON_BINARY:-/usr/bin/conmon}"
+RUNTIME_BINARY="${RUNTIME_BINARY:-/usr/bin/runc}"
+
+# UBI10-micro container image for test rootfs. Can be overridden to use
+# a local mirror (or to test the failure path).
+UBI10_MICRO_IMAGE="${UBI10_MICRO_IMAGE:-registry.access.redhat.com/ubi10/ubi-micro:latest}"
+VALID_PATH="/tmp"
+INVALID_PATH="/not/a/path"
+
+# In strict mode (CI), a skipped test is a failed test: a run that skips
+# everything must not be reported as a successful one.
+if [[ -n "${CONMON_TEST_STRICT:-}" ]]; then
+    skip() {
+        die "test skipped in strict mode: $*"
+    }
+fi
+
+# Generate a unique container ID for each test
+generate_ctr_id() {
+    echo "conmon-test-$(date +%s)-$$-$RANDOM"
+}
+
+# Run conmon with given arguments and capture output
+run_conmon() {
+    run "$CONMON_BINARY" "$@"
+}
+
+# Run runtime command (runc)
+run_runtime() {
+    run "$RUNTIME_BINARY" "$@"
+}
+
+# Get journal output for conmon process
+get_conmon_journal_output() {
+    local pid="$1"
+    local level="${2:--1}"
+
+    if ! command -v journalctl >/dev/null 2>&1; then
+        echo ""
+        return 0
+    fi
+
+    local level_filter=()
+    if [[ "$level" != "-1" ]]; then
+        level_filter=(-p "$level")
+    fi
+
+    journalctl -q --no-pager "${level_filter[@]}" _COMM=conmon _PID="$pid" 2>/dev/null || echo ""
+}
+
+# Create a temporary directory for test
+setup_tmpdir() {
+    export TEST_TMPDIR
+    TEST_TMPDIR=$(mktemp -d /tmp/conmon-test-XXXXXX)
+}
+
+# Cleanup temporary directory
+cleanup_tmpdir() {
+    if [[ -n "$TEST_TMPDIR" ]]; then
+        # Handle race condition where conmon might still be creating files
+        local retries=5
+        while [[ $retries -gt 0 ]]; do
+            if rm -rf "$TEST_TMPDIR" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+            ((retries--))
+        done
+    fi
+}
+
+# Generate process.json
+generate_process_spec() {
+    local command="$1"
+    if [[ -z "$command" ]]; then
+        command="for i in \$(seq 1 100); do echo \\\"hello from ubi10 \$i\\\"; done"
+    fi
+    if [[ -z "$BUNDLE_PATH" || ! -e "$BUNDLE_PATH" ]]; then
+        die "The BUNDLE_PATH directory does not exist. Ensure 'generate_process_spec'" \
+            " is called after the 'setup_test_env'"
+    fi
+    local config_path="$BUNDLE_PATH/process.json"
+
+    cat >"$config_path" <<EOF
+{
+    "terminal": false,
+    "user": {
+        "uid": 0,
+        "gid": 0
+    },
+    "args": [
+        "/bin/sh",
+        "-c",
+        "$command"
+    ],
+    "env": [
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "cwd": "/",
+    "capabilities": {
+        "bounding": [],
+        "effective": [],
+        "inheritable": [],
+        "permitted": [],
+        "ambient": []
+    },
+    "rlimits": [
+        {
+            "type": "RLIMIT_NOFILE",
+            "hard": 1024,
+            "soft": 1024
+        }
+    ],
+    "noNewPrivileges": true
+}
+EOF
+}
+
+# Generate OCI runtime configuration
+generate_runtime_config() {
+    local bundle_path="$1"
+    local rootfs="$2"
+    local use_terminal="$3"
+    local command="$4"
+    if [[ -z "$use_terminal" ]]; then
+        use_terminal="false"
+    fi
+    if [[ -z "$command" ]]; then
+        command="for i in \$(seq 1 100); do echo \\\"hello from ubi10 \$i\\\"; done"
+    fi
+    local config_path="$bundle_path/config.json"
+
+    # Make rootfs path relative to bundle
+    local relative_rootfs
+    relative_rootfs=$(basename "$rootfs")
+
+    # Get current user UID and GID
+    local host_uid host_gid
+    host_uid=$(id -u)
+    host_gid=$(id -g)
+
+    cat >"$config_path" <<EOF
+{
+    "ociVersion": "1.0.0",
+    "process": {
+        "terminal": $use_terminal,
+        "user": {
+            "uid": 0,
+            "gid": 0
+        },
+        "args": [
+            "/bin/sh",
+            "-c",
+            "$command"
+        ],
+        "env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "cwd": "/",
+        "capabilities": {
+            "bounding": [],
+            "effective": [],
+            "inheritable": [],
+            "permitted": [],
+            "ambient": []
+        },
+        "rlimits": [
+            {
+                "type": "RLIMIT_NOFILE",
+                "hard": 1024,
+                "soft": 1024
+            }
+        ],
+        "noNewPrivileges": true
+    },
+    "root": {
+        "path": "$relative_rootfs",
+        "readonly": true
+    },
+    "hostname": "conmon-test",
+    "mounts": [
+        {
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc"
+        },
+        {
+            "destination": "/tmp",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": [
+                "nosuid",
+                "nodev",
+                "mode=1777"
+            ]
+        },
+        {
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": [
+                "nosuid",
+                "strictatime",
+                "mode=755",
+                "size=65536k"
+            ]
+        },
+        {
+            "destination": "/dev/pts",
+            "type": "devpts",
+            "source": "devpts",
+            "options": [
+                "nosuid",
+                "noexec",
+                "newinstance",
+                "ptmxmode=0666",
+                "mode=0620"
+            ]
+        }
+    ],
+    "linux": {
+        "resources": {
+            "devices": [
+                {
+                    "allow": false,
+                    "access": "rwm"
+                }
+            ]
+        },
+        "namespaces": [
+            {
+                "type": "pid"
+            },
+            {
+                "type": "ipc"
+            },
+            {
+                "type": "uts"
+            },
+            {
+                "type": "mount"
+            },
+            {
+                "type": "user"
+            }
+        ],
+        "uidMappings": [
+            {
+                "containerID": 0,
+                "hostID": $host_uid,
+                "size": 1
+            }
+        ],
+        "gidMappings": [
+            {
+                "containerID": 0,
+                "hostID": $host_gid,
+                "size": 1
+            }
+        ],
+        "maskedPaths": [
+            "/proc/acpi",
+            "/proc/kcore",
+            "/proc/keys",
+            "/proc/latency_stats",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+            "/proc/sched_debug",
+            "/proc/scsi",
+            "/sys/firmware"
+        ],
+        "readonlyPaths": [
+            "/proc/asound",
+            "/proc/bus",
+            "/proc/fs",
+            "/proc/irq",
+            "/proc/sys",
+            "/proc/sysrq-trigger"
+        ]
+    }
+}
+EOF
+}
+
+# Setup common test environment
+setup_test_env() {
+    setup_tmpdir
+    export CTR_ID
+    CTR_ID=$(generate_ctr_id)
+    export LOG_PATH="$TEST_TMPDIR/container.log"
+    # For tests that run conmon directly; conmons started by _run_conmon each
+    # get their own, in $CONTAINER_PIDFILE.
+    export PID_FILE="$TEST_TMPDIR/pidfile"
+    # For tests that run conmon directly; conmons started by _run_conmon each
+    # get their own, in $CONMON_PIDFILE.
+    export CONMON_PID_FILE="$TEST_TMPDIR/conmon-pidfile"
+    export BUNDLE_PATH="$TEST_TMPDIR"
+    export ROOTFS="$TEST_TMPDIR/rootfs"
+    export SOCKET_PATH="$TEST_TMPDIR"
+    export ATTACH_PATH="$TEST_TMPDIR/attach"
+    export OCI_ATTACHPIPE_PATH="$TEST_TMPDIR/attach-pipe"
+    export OCI_STARTPIPE_PATH="$TEST_TMPDIR/start-pipe"
+    export OCI_SYNCPIPE_PATH="$TEST_TMPDIR/sync-pipe"
+    export CTL_PATH="$TEST_TMPDIR/ctl"
+}
+
+# Setup full container environment with UBI10-micro
+setup_container_env() {
+    local command="$1"
+    local use_terminal="$2"
+    setup_test_env
+
+    # The rootfs tarball is fetched once per run by setup_suite; give
+    # each test its own extracted copy.
+    if [[ ! -f "${CONMON_TEST_ROOTFS_TAR:-}" ]]; then
+        die "CONMON_TEST_ROOTFS_TAR is not set up (is setup_suite.bash in place?)"
+    fi
+    mkdir -p "$ROOTFS"
+    tar -C "$ROOTFS" -xf "$CONMON_TEST_ROOTFS_TAR" || die "failed to extract test rootfs"
+
+    # Generate OCI runtime configuration
+    generate_runtime_config "$BUNDLE_PATH" "$ROOTFS" "$use_terminal" "$command"
+}
+
+# Cleanup test environment
+cleanup_test_env() {
+    # Clean up any running containers
+    if [[ -n "$CTR_ID" ]]; then
+        "$RUNTIME_BINARY" delete -f "$CTR_ID" 2>/dev/null || true
+    fi
+    cleanup_tmpdir
+}
+
+# Check if conmon binary exists and is executable
+check_conmon_binary() {
+    if [[ ! -x "$CONMON_BINARY" ]]; then
+        skip "conmon binary not found or not executable at $CONMON_BINARY"
+    fi
+}
+
+# Check if runtime binary exists and is executable
+check_runtime_binary() {
+    if [[ ! -x "$RUNTIME_BINARY" ]]; then
+        skip "runtime binary not found or not executable at $RUNTIME_BINARY"
+    fi
+}
+
+# Helper to check if a string contains a substring
+assert_output_contains() {
+    local expected="$1"
+    if [[ "$output" != *"$expected"* ]]; then
+        echo "Expected output to contain: $expected"
+        echo "Actual output: $output"
+        return 1
+    fi
+}
+
+# Helper to check if stderr contains a substring
+assert_stderr_contains() {
+    local expected="$1"
+    if [[ "$stderr" != *"$expected"* ]]; then
+        echo "Expected stderr to contain: $expected"
+        echo "Actual stderr: $stderr"
+        return 1
+    fi
+}
+
+# Usage: retry <how_long> <interval> <command ...>
+#
+# Runs the command until it succeeds, for at most <how_long> seconds, waiting
+# <interval> seconds between the attempts. Returns non-zero if the command
+# never succeeded, leaving it to the caller to report that: the caller is the
+# one that knows what it was waiting for.
+retry() {
+    local how_long=$1
+    local interval=$2
+    shift 2
+
+    local t1=$((SECONDS + how_long))
+    while [ "$SECONDS" -lt "$t1" ]; do
+        if "$@"; then
+            return 0
+        fi
+        sleep "$interval"
+    done
+
+    return 1
+}
+
+_runtime_status_is() {
+    run_runtime state "$1"
+    echo "$output"
+    expr "$output" : ".*status\": \"$2" >/dev/null
+}
+
+# Helper function to wait until "runc state $cid" returns expected status.
+wait_for_runtime_status() {
+    local cid=$1
+    local expected_status=$2
+    # Generous on purpose: this polls, so on a healthy machine it returns on
+    # the first iteration, and the only thing a low limit buys is flakes on a
+    # loaded CI runner.
+    local how_long=30
+
+    retry "$how_long" 0.5 _runtime_status_is "$cid" "$expected_status" ||
+        die "timed out waiting for '$expected_status' from $cid"
+}
+
+_pid_is_gone() {
+    ! kill -0 "$1" 2>/dev/null
+}
+
+# Helper function to wait until the conmon process $pid has exited.
+#
+# The container reaching the "stopped" state does not mean its output has made
+# it to the log yet; conmon having exited does.
+wait_for_conmon_exit() {
+    local pid=$1
+    local how_long=${2:-10}
+
+    retry "$how_long" 0.1 _pid_is_gone "$pid" ||
+        die "timed out waiting for conmon (pid $pid) to exit"
+}
+
+# _run_conmon runs conmon with the default arguments plus the ones given,
+# leaving the result in $status and $output as `run` does. $CONMON_PIDFILE and
+# $CONTAINER_PIDFILE are set to the pidfiles this conmon was told to write.
+#
+# A test may start more than one conmon (an --exec one, say), so each gets
+# pidfiles of its own rather than having them clobber shared ones.
+_run_conmon() {
+    ((++CONMON_STARTED))
+    CONMON_PIDFILE="$TEST_TMPDIR/conmon-pidfile.$CONMON_STARTED"
+    CONTAINER_PIDFILE="$TEST_TMPDIR/pidfile.$CONMON_STARTED"
+
+    run timeout 10s "$CONMON_BINARY" \
+        --cid "$CTR_ID" \
+        --cuuid "$CTR_ID" \
+        --runtime "$RUNTIME_BINARY" \
+        --bundle "$BUNDLE_PATH" \
+        --socket-dir-path "$SOCKET_PATH" \
+        --log-level trace \
+        --container-pidfile "$CONTAINER_PIDFILE" \
+        --syslog \
+        --conmon-pidfile "$CONMON_PIDFILE" "$@"
+}
+
+# Helper function to run conmon with default arguments where conmon is
+# expected to fail. That it did is asserted here, so the caller is left to
+# check $output for the particular complaint it is after.
+run_conmon_expecting_failure() {
+    _run_conmon "$@"
+    assert_failure
+}
+
+# Helper function to start conmon with default arguments.
+# Additional conmon arguments can be passed to this function.
+start_conmon_with_default_args() {
+    local pidfile
+
+    _run_conmon "$@"
+    pidfile=$CONMON_PIDFILE
+
+    if [ "$status" -ne 0 ]; then
+        die "conmon failed with status $status: $output"
+    fi
+
+    # The pid of the conmon just started. A test starting more than one has
+    # to save this before starting the next.
+    CONMON_PID=$(cat "$pidfile")
+
+    # Do not try to start the container if it has already been started. This
+    # happens when `start_conmon_with_default_args` has already been called
+    # and this second call uses an option like --exec, which connects to an
+    # already running container.
+    #
+    # Note the container may well be gone by the time we look: an exec that
+    # makes the container's main process exit is racing with us here, so
+    # "stopped" (and "paused") mean "already started", too.
+    run_runtime state "$CTR_ID"
+    echo "$output"
+    if [[ "$output" =~ \"status\":\ *\"(running|stopped|paused)\" ]]; then
+        return
+    fi
+
+    # Wait until the container is created
+    wait_for_runtime_status "$CTR_ID" created
+
+    # Check that conmon pidfile was created
+    [ -f "$pidfile" ]
+
+    # Start the container and wait until it really starts.
+    run_runtime start "$CTR_ID"
+    if [ "$status" -ne 0 ]; then
+        die "$RUNTIME_BINARY start failed with $status: $output"
+    fi
+}
+
+# Helper function to run conmon with default arguments and wait until it is stopped.
+# Additional conmon arguments can be passed to this function.
+run_conmon_with_default_args() {
+    start_conmon_with_default_args "$@"
+    wait_for_runtime_status "$CTR_ID" stopped
+    # Every caller reads a log written by this conmon afterwards.
+    wait_for_conmon_exit "$CONMON_PID"
+}
+
+# wait_for_syncpipe_output waits until the sync pipe reader has written the
+# given number of lines. The reader runs in the background, so it lags behind
+# the conmon that wrote to the pipe, and asserting right away is a race.
+wait_for_syncpipe_output() {
+    local how_many=${1:-1}
+    local how_long=${2:-10}
+    local file="$TEST_TMPDIR/syncpipe-output"
+
+    retry "$how_long" 0.1 _file_has_lines "$file" "$how_many" ||
+        die "timed out waiting for $how_many line(s) in $file: $(cat "$file" 2>&1)"
+}
+
+_file_has_lines() {
+    [ -e "$1" ] && [ "$(wc -l <"$1")" -ge "$2" ]
+}
+
+_file_has_line() {
+    [ -e "$1" ] && grep -q -- "$2" "$1"
+}
+
+# wait_for_log_line waits until the pattern given as $2 shows up in the log
+# file $1. Conmon writes the log as the container's output arrives, so a test
+# acting on a line right after starting the container is racing it.
+wait_for_log_line() {
+    local file=$1
+    local pattern=$2
+    local how_long=${3:-10}
+
+    retry "$how_long" 0.1 _file_has_line "$file" "$pattern" ||
+        die "timed out waiting for '$pattern' in $file: $(cat "$file" 2>&1)"
+}
+
+# Generic helper function to create pipe and read from it.
+_start_pipe_reader() {
+    local pipe_path=$1
+    local pipe_fd_env_name=$2
+    local pipe_fd_number=$3
+    local output_file=$4
+
+    # Create the pipe and export the env variable.
+    mkfifo "$pipe_path"
+    export "$pipe_fd_env_name"="$pipe_fd_number"
+
+    # Run the reader in the background, otherwise it would block until the
+    # conmon opens the other side of the pipe.
+    {
+        exec {r}<"$pipe_path"
+        while IFS= read -r -u "$r" line; do
+            echo "$line" >>"$output_file"
+        done
+    } &
+}
+
+# Helper function to create the _OCI_SYNCPIPE pipe and start the reader.
+# The data read from the pipe is stored in the $TEST_TMPDIR/syncpipe-output
+# file.
+# To pass the pipe to conmon, use the `6>"$OCI_SYNCPIPE_PATH"` as argument
+# to `run_conmon_with_default_args` or `start_conmon_with_default_args`.
+start_oci_sync_pipe_reader() {
+    _start_pipe_reader "$OCI_SYNCPIPE_PATH" "_OCI_SYNCPIPE" 6 "$TEST_TMPDIR/syncpipe-output"
+}
+
+# Helper function to create the _OCI_ATTACHPIPE pipe and start the reader.
+# The data read from the pipe is stored in the $TEST_TMPDIR/attachpipe-output
+# file.
+# To pass the pipe to conmon, use the `4>"$OCI_ATTACHPIPE_PATH"` as argument
+# to `run_conmon_with_default_args` or `start_conmon_with_default_args`.
+start_oci_attach_pipe_reader() {
+    _start_pipe_reader "$OCI_ATTACHPIPE_PATH" "_OCI_ATTACHPIPE" 4 "$TEST_TMPDIR/attachpipe-output"
+}
+
+# Helper function ensuring the file does not exist.
+assert_file_not_exists() {
+    FILE=$1
+    if [ -e "$FILE" ]; then
+        die "$(date): File $FILE exists."
+    fi
+}
+
+# Helper function ensuring the file does exist.
+assert_file_exists() {
+    FILE=$1
+    if [ ! -e "$FILE" ]; then
+        die "$(date): File $FILE does not exist."
+    fi
+}
+
+# bail-now is how we terminate a test upon assertion failure.
+# By default, and the vast majority of the time, it just triggers
+# immediate test termination;
+function bail-now() {
+    # "false" does not apply to "bail now"! It means "nonzero exit",
+    # which BATS interprets as "yes, bail immediately".
+    false
+}
+
+############
+#  assert  #  Compare actual vs expected string; fail if mismatch
+############
+#
+# Compares string (default: $output) against the given string argument.
+# By default we do an exact-match comparison against $output, but there
+# are two different ways to invoke us, each with an optional description:
+#
+#      assert               "EXPECT" [DESCRIPTION]
+#      assert "RESULT" "OP" "EXPECT" [DESCRIPTION]
+#
+# The first form (one or two arguments) does an exact-match comparison
+# of "$output" against "EXPECT". The second (three or four args) compares
+# the first parameter against EXPECT, using the given OPerator. If present,
+# DESCRIPTION will be displayed on test failure.
+#
+# Examples:
+#
+#   assert "this is exactly what we expect"
+#   assert "${lines[0]}" =~ "^abc"  "first line begins with abc"
+#
+function assert() {
+    local actual_string="$output"
+    local operator='=='
+    local expect_string="$1"
+    local testname="$2"
+
+    case "${#*}" in
+    0) die "Internal error: 'assert' requires one or more arguments" ;;
+    1 | 2) ;;
+    3 | 4)
+        actual_string="$1"
+        operator="$2"
+        expect_string="$3"
+        testname="$4"
+        ;;
+    *) die "Internal error: too many arguments to 'assert'" ;;
+    esac
+
+    # Comparisons.
+    # Special case: there is no !~ operator, so fake it via '! x =~ y'
+    local not=
+    local actual_op="$operator"
+    if [[ $operator == '!~' ]]; then
+        not='!'
+        actual_op='=~'
+    fi
+    if [[ $operator == '=' || $operator == '==' ]]; then
+        # Special case: we can't use '=' or '==' inside [[ ... ]] because
+        # the right-hand side is treated as a pattern... and '[xy]' will
+        # not compare literally. There seems to be no way to turn that off.
+        if [ "$actual_string" = "$expect_string" ]; then
+            return
+        fi
+    elif [[ $operator == '!=' ]]; then
+        # Same special case as above
+        if [ "$actual_string" != "$expect_string" ]; then
+            return
+        fi
+    else
+        if eval "[[ $not \$actual_string $actual_op \$expect_string ]]"; then
+            return
+        elif [ $? -gt 1 ]; then
+            die "Internal error: could not process 'actual' $operator 'expect'"
+        fi
+    fi
+
+    # Test has failed. Get a descriptive test name.
+    if [ -z "$testname" ]; then
+        testname="${MOST_RECENT_PODMAN_COMMAND:-[no test name given]}"
+    fi
+
+    # Display optimization: the typical case for 'expect' is an
+    # exact match ('='), but there are also '=~' or '!~' or '-ge'
+    # and the like. Omit the '=' but show the others; and always
+    # align subsequent output lines for ease of comparison.
+    local op=''
+    local ws=''
+    if [ "$operator" != '==' ]; then
+        op="$operator "
+        ws=$(printf "%*s" ${#op} "")
+    fi
+
+    # This is a multi-line message, which may in turn contain multi-line
+    # output, so let's format it ourself to make it more readable.
+    local expect_split
+    mapfile -t expect_split <<<"$expect_string"
+    local actual_split
+    mapfile -t actual_split <<<"$actual_string"
+
+    # bash %q is really nice, except for the way it backslashes spaces
+    local -a expect_split_q
+    for line in "${expect_split[@]}"; do
+        local q
+        q=$(printf "%q" "$line" | sed -e 's/\\ / /g')
+        expect_split_q+=("$q")
+    done
+    local -a actual_split_q
+    for line in "${actual_split[@]}"; do
+        local q
+        q=$(printf "%q" "$line" | sed -e 's/\\ / /g')
+        actual_split_q+=("$q")
+    done
+
+    printf "#/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\n" >&2
+    printf "#|     FAIL: %s\n" "$testname" >&2
+    printf "#| expected: %s%s\n" "$op" "${expect_split_q[0]}" >&2
+    local line
+    for line in "${expect_split_q[@]:1}"; do
+        printf "#|         > %s%s\n" "$ws" "$line" >&2
+    done
+    printf "#|   actual: %s%s\n" "$ws" "${actual_split_q[0]}" >&2
+    for line in "${actual_split_q[@]:1}"; do
+        printf "#|         > %s%s\n" "$ws" "$line" >&2
+    done
+    printf "#\\^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" >&2
+    bail-now
+}
+
+function die() {
+    # FIXME: handle multi-line output
+    echo "#/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" >&2
+    echo "#| FAIL: $*" >&2
+    echo "#\\^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^" >&2
+    bail-now
+}
+
+# Helper function wrapping the `assert`. It expects json as a first
+# argument and normalizes it so it is exactly the same no matter what
+# generated it.
+assert_json() {
+    echo "$1"
+    if ! normalized_json=$(printf '%s' "$1" | jq -S .); then
+        die "Invalid JSON passed to assert_json: $normalized_json"
+    fi
+    echo "$normalized_json"
+    assert "$normalized_json" "$2" "$3" "$4"
+}
+
+# --- conmon-v3 additions ----------------------------------------------------
 
 # Skip when the local syslog socket / journal tooling is unavailable.
 skip_if_no_syslog() {
