@@ -1,7 +1,9 @@
 use crate::Cid;
 use crate::error::{ConmonError, ConmonResult};
 use crate::locale_string::validate_log_tag;
-use crate::logging::plugin::LogPluginCfg;
+use crate::logging::plugin::{
+    LogPluginCfg, is_known_log_driver, log_driver_uses_path, normalize_log_driver_name,
+};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -13,6 +15,18 @@ use log::warn;
 /// Accept any string for --log-path (including empty) so we can reject empty with "log-path must not be empty" in determine_log_plugin.
 fn parse_log_path_any(s: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(s))
+}
+
+/// Parse `--log-driver-opt KEY=VALUE`.
+fn parse_log_driver_opt(s: &str) -> Result<(String, String), String> {
+    let (key, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --log-driver-opt '{s}': expected KEY=VALUE"))?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(format!("invalid --log-driver-opt '{s}': empty key"));
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 #[derive(Parser)]
@@ -85,9 +99,18 @@ pub struct Opts {
     #[arg(long = "log-level")]
     pub log_level: Option<String>,
 
-    /// Log file path (can be specified multiple times). Empty string is accepted here and rejected later with a clear error.
+    /// (DEPRECATED: use --log-driver) Log file path / legacy driver:path spec (multiple).
+    /// Empty string is accepted here and rejected later with a clear error.
     #[arg(long = "log-path", short = 'l', value_parser = clap::builder::ValueParser::new(parse_log_path_any))]
     pub log_path: Vec<PathBuf>,
+
+    /// Container log driver (can be specified multiple times). Prefer this over --log-path.
+    #[arg(long = "log-driver")]
+    pub log_driver: Vec<String>,
+
+    /// Driver-specific option KEY=VALUE (can be specified multiple times).
+    #[arg(long = "log-driver-opt", value_parser = parse_log_driver_opt)]
+    pub log_driver_opts: Vec<(String, String)>,
 
     /// Maximum size of log file
     #[arg(long = "log-size-max", value_parser = clap::value_parser!(i64), allow_negative_numbers = true)]
@@ -473,17 +496,36 @@ pub fn validate_log_tag_locale(opts: &Opts) -> ConmonResult<()> {
     Ok(())
 }
 
-// Handles the logging related options from `opts` and returns a list of (plugin name, LogPluginCfg)
-// so that multiple log plugins can be configured (one entry per --log-path).
-pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCfg)>> {
-    if opts.log_path.is_empty() {
-        return Err(ConmonError::new(
-            "Log driver not provided. Use --log-path",
-            1,
-        ));
+/// Select log plugins from either `--log-driver` or legacy `--log-path`.
+///
+/// When `--log-driver` is set, [`determine_log_driver`] is used and `--log-path`
+/// must not appear. Otherwise the deprecated [`determine_log_plugin`] path is used.
+pub fn resolve_log_plugins(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCfg)>> {
+    let entries = if !opts.log_driver.is_empty() {
+        if !opts.log_path.is_empty() {
+            return Err(ConmonError::new(
+                "cannot combine --log-driver with deprecated --log-path",
+                1,
+            ));
+        }
+        determine_log_driver(opts)?
+    } else {
+        determine_log_plugin(opts)?
+    };
+
+    if opts.no_container_partial_message
+        && !entries.iter().any(|(name, _)| name == "journald")
+    {
+        let msg = "--no-container-partial-message has no effect without journald log driver";
+        warn!("{msg}");
+        eprintln!("{msg}");
     }
 
-    // Validate and normalize log-max-files bounds (apply to all file-based plugins).
+    Ok(entries)
+}
+
+/// Build the shared [`LogPluginCfg`] fields from global logging options.
+fn build_base_log_plugin_cfg(opts: &Opts) -> ConmonResult<LogPluginCfg> {
     let raw_max_files = opts.log_max_files;
     if raw_max_files < 0 {
         return Err(ConmonError::new("log-max-files must be non-negative", 1));
@@ -502,8 +544,7 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
     let max_size = log_size_limit("log-size-max", opts.log_size_max)?;
     let global_max_size = log_size_limit("log-global-size-max", opts.log_global_size_max)?;
 
-    // Base config from non-path options (shared by all plugin instances).
-    let base_cfg = LogPluginCfg {
+    Ok(LogPluginCfg {
         path: PathBuf::new(),
         cid: opts.cid.clone(),
         cuuid: opts.cuuid.clone(),
@@ -521,8 +562,84 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
             Some(opts.log_allowlist_dir.clone())
         },
         rotate: opts.log_rotate,
-    };
+        log_driver_opts: opts.log_driver_opts.clone(),
+    })
+}
 
+/// Cross-driver validation shared by `--log-path` and `--log-driver` parsers.
+fn validate_log_plugin_entries(entries: &[(String, LogPluginCfg)]) -> ConmonResult<()> {
+    for (name, cfg) in entries {
+        if name == "k8s_file" && cfg.path.as_os_str().is_empty() {
+            return Err(ConmonError::new("k8s-file requires a filename", 1));
+        }
+    }
+
+    let passthrough_count = entries
+        .iter()
+        .filter(|(name, _)| name == "passthrough")
+        .count();
+    if passthrough_count > 0 && entries.len() > 1 {
+        return Err(ConmonError::new(
+            "passthrough log driver cannot be combined with other log drivers",
+            1,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Parse `--log-driver` / `--log-driver-opt` into plugin entries.
+///
+/// Known driver names come from [`is_known_log_driver`] (compiled-in plugins).
+/// File drivers take their path from `--log-driver-opt path=...`.
+pub fn determine_log_driver(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCfg)>> {
+    if opts.log_driver.is_empty() {
+        return Err(ConmonError::new(
+            "Log driver not provided. Use --log-driver",
+            1,
+        ));
+    }
+
+    let base_cfg = build_base_log_plugin_cfg(opts)?;
+    let path_opt = opts
+        .log_driver_opts
+        .iter()
+        .find(|(k, _)| k == "path")
+        .map(|(_, v)| PathBuf::from(v));
+
+    let mut entries: Vec<(String, LogPluginCfg)> = Vec::with_capacity(opts.log_driver.len());
+    for raw in &opts.log_driver {
+        let name = normalize_log_driver_name(raw);
+        if name.is_empty() {
+            return Err(ConmonError::new("log-driver must not be empty", 1));
+        }
+        if !is_known_log_driver(&name) {
+            return Err(ConmonError::new(format!("No such log driver {name}"), 1));
+        }
+
+        let mut cfg = base_cfg.clone();
+        if log_driver_uses_path(&name) {
+            if let Some(ref path) = path_opt {
+                cfg.path = path.clone();
+            }
+        }
+        entries.push((name, cfg));
+    }
+
+    validate_log_plugin_entries(&entries)?;
+    Ok(entries)
+}
+
+/// Legacy `--log-path` parser (deprecated). Prefer [`determine_log_driver`].
+pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCfg)>> {
+    if opts.log_path.is_empty() {
+        return Err(ConmonError::new(
+            "Log driver not provided. Use --log-driver (or deprecated --log-path)",
+            1,
+        ));
+    }
+
+    let base_cfg = build_base_log_plugin_cfg(opts)?;
     let mut entries: Vec<(String, LogPluginCfg)> = Vec::with_capacity(opts.log_path.len());
 
     for p in &opts.log_path {
@@ -544,11 +661,11 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
             }
             let plug = plug.trim();
             if !plug.is_empty() {
-                plugin = plug.replace("-", "_");
+                plugin = normalize_log_driver_name(plug);
             }
         } else if matches!(
             s.as_ref(),
-            "journald" | "syslog" | "passthrough" | "none" | "null" | "off"
+            "journald" | "passthrough" | "none" | "null" | "off"
         ) {
             // Bare driver names (no ':') must not be treated as file paths.
             // Matches conmon-v2: `--log-path none` disables logging.
@@ -562,50 +679,7 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
         entries.push((plugin, cfg));
     }
 
-    for (name, cfg) in &entries {
-        if name == "k8s_file" && cfg.path.as_os_str().is_empty() {
-            return Err(ConmonError::new("k8s-file requires a filename", 1));
-        }
-    }
-
-    // Passthrough must be the sole plugin: reject mixing with others.
-    let passthrough_count = entries
-        .iter()
-        .filter(|(name, _)| name == "passthrough")
-        .count();
-    if passthrough_count > 0 && entries.len() > 1 {
-        return Err(ConmonError::new(
-            "passthrough log driver cannot be combined with other log drivers",
-            1,
-        ));
-    }
-
-    // openlog(3) is process-global; more than one syslog driver is unsupported.
-    let syslog_count = entries.iter().filter(|(name, _)| name == "syslog").count();
-    if syslog_count > 1 {
-        return Err(ConmonError::new(
-            "syslog log driver can only be used once",
-            1,
-        ));
-    }
-
-    let has_journald = entries.iter().any(|(name, _)| name == "journald");
-    if has_journald {
-        if let Some(ref cid) = opts.cid {
-            if cid.chars().count() <= 12 {
-                return Err(ConmonError::new(
-                    "Container ID must be longer than 12 characters",
-                    1,
-                ));
-            }
-        }
-    }
-    if opts.no_container_partial_message && !has_journald {
-        let msg = "--no-container-partial-message has no effect without journald log driver";
-        warn!("{msg}");
-        eprintln!("{msg}");
-    }
-
+    validate_log_plugin_entries(&entries)?;
     Ok(entries)
 }
 
@@ -929,19 +1003,72 @@ mod tests {
     }
 
     #[test]
-    fn bare_syslog_and_journald_are_drivers_not_paths() -> ConmonResult<()> {
-        for name in ["syslog", "journald"] {
-            let o = Opts {
-                log_path: vec![PathBuf::from(name)],
-                cid: Some("0123456789abcdef".into()),
-                ..Default::default()
-            };
-            let entries = determine_log_plugin(&o)?;
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].0, name);
-            assert!(entries[0].1.path.as_os_str().is_empty());
-        }
+    fn bare_journald_is_driver_not_path() -> ConmonResult<()> {
+        let o = Opts {
+            log_path: vec![PathBuf::from("journald")],
+            cid: Some("0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let entries = determine_log_plugin(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "journald");
+        assert!(entries[0].1.path.as_os_str().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn log_driver_syslog_is_accepted() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["syslog".into()],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "syslog");
+        Ok(())
+    }
+
+    #[test]
+    fn log_driver_file_uses_path_opt() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["k8s-file".into()],
+            log_driver_opts: vec![("path".into(), "/var/log/k8s.log".into())],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "k8s_file");
+        assert_eq!(entries[0].1.path, PathBuf::from("/var/log/k8s.log"));
+        assert_eq!(entries[0].1.log_driver_opts.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_prefers_log_driver_and_rejects_mix() {
+        let mixed = Opts {
+            log_driver: vec!["journald".into()],
+            log_path: vec![PathBuf::from("/tmp/a.log")],
+            cid: Some("0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let err = resolve_log_plugins(&mixed).unwrap_err();
+        assert!(err.to_string().contains("cannot combine --log-driver"));
+
+        let driver_only = Opts {
+            log_driver: vec!["none".into()],
+            ..Default::default()
+        };
+        let entries = resolve_log_plugins(&driver_only).unwrap();
+        assert_eq!(entries[0].0, "none");
+    }
+
+    #[test]
+    fn parse_log_driver_opt_splits_on_first_equals() {
+        assert_eq!(
+            parse_log_driver_opt("path=/var/log/a=b.log").unwrap(),
+            ("path".into(), "/var/log/a=b.log".into())
+        );
+        assert!(parse_log_driver_opt("nosplit").is_err());
     }
 
     #[test]
@@ -1199,16 +1326,12 @@ mod tests {
     }
 
     #[test]
-    fn multiple_syslog_drivers_are_rejected() {
+    fn log_driver_unknown_is_rejected() {
         let o = Opts {
-            log_path: vec![PathBuf::from("syslog"), PathBuf::from("syslog")],
+            log_driver: vec!["notadriver".into()],
             ..Default::default()
         };
-
-        let err = determine_log_plugin(&o).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("syslog log driver can only be used once")
-        );
+        let err = determine_log_driver(&o).unwrap_err();
+        assert!(err.to_string().contains("No such log driver notadriver"));
     }
 }

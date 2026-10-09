@@ -30,16 +30,54 @@ pub struct LogPluginCfg {
     pub max_files: i32,
     pub allowlist_dirs: Option<Vec<PathBuf>>,
     pub rotate: bool,
+    /// Driver-specific options from repeated `--log-driver-opt KEY=VALUE`.
+    pub log_driver_opts: Vec<(String, String)>,
+}
+
+/// Built-in log driver kinds. Add new plugins here (and only here) so CLI
+/// discovery stays in sync via [`is_known_log_driver`] / [`log_driver_uses_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogDriverKind {
+    None,
+    File,
+    Journald,
+    Syslog,
+}
+
+/// Normalize a log driver name (`k8s-file` → `k8s_file`).
+pub fn normalize_log_driver_name(name: &str) -> String {
+    name.trim().replace('-', "_")
+}
+
+/// Map a (normalized) driver name to its built-in kind.
+fn classify_log_driver(name: &str) -> Option<LogDriverKind> {
+    match name {
+        "none" | "passthrough" | "null" | "off" => Some(LogDriverKind::None),
+        "file" | "k8s_file" => Some(LogDriverKind::File),
+        "journald" => Some(LogDriverKind::Journald),
+        "syslog" => Some(LogDriverKind::Syslog),
+        _ => None,
+    }
+}
+
+/// Returns true when `name` is a compiled-in log driver (after normalization).
+pub fn is_known_log_driver(name: &str) -> bool {
+    classify_log_driver(name).is_some()
+}
+
+/// Returns true when the driver stores container logs under [`LogPluginCfg::path`].
+pub fn log_driver_uses_path(name: &str) -> bool {
+    matches!(classify_log_driver(name), Some(LogDriverKind::File))
 }
 
 /// Creates a single log plugin from name and config.
 fn create_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box<dyn LogPlugin>> {
-    match name {
-        "none" | "passthrough" | "null" | "off" => Ok(Box::new(NoneLogger::new(cfg)?)),
-        "file" | "k8s_file" => Ok(Box::new(FileLogger::new(cfg)?)),
-        "journald" => Ok(Box::new(JournaldLogger::new(cfg)?)),
-        "syslog" => Ok(Box::new(SyslogLogger::new(cfg)?)),
-        _ => Err(ConmonError::new(format!("No such log driver {name}"), 1)),
+    match classify_log_driver(name) {
+        Some(LogDriverKind::None) => Ok(Box::new(NoneLogger::new(cfg)?)),
+        Some(LogDriverKind::File) => Ok(Box::new(FileLogger::new(cfg)?)),
+        Some(LogDriverKind::Journald) => Ok(Box::new(JournaldLogger::new(cfg)?)),
+        Some(LogDriverKind::Syslog) => Ok(Box::new(SyslogLogger::new(cfg)?)),
+        None => Err(ConmonError::new(format!("No such log driver {name}"), 1)),
     }
 }
 
@@ -115,6 +153,28 @@ pub fn initialize_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_drivers_match_create_log_plugin() {
+        for name in [
+            "none",
+            "passthrough",
+            "null",
+            "off",
+            "file",
+            "k8s_file",
+            "journald",
+            "syslog",
+        ] {
+            assert!(is_known_log_driver(name), "{name} should be known");
+        }
+        assert!(!is_known_log_driver("notadriver"));
+        assert_eq!(normalize_log_driver_name("k8s-file"), "k8s_file");
+        assert!(log_driver_uses_path("file"));
+        assert!(log_driver_uses_path("k8s_file"));
+        assert!(!log_driver_uses_path("journald"));
+        assert!(!log_driver_uses_path("syslog"));
+    }
 
     #[test]
     fn initialize_log_plugins_multiple_fans_out() -> ConmonResult<()> {

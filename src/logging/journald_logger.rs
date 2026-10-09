@@ -45,6 +45,15 @@ fn is_valid_label_name(s: &str) -> bool {
 
 impl JournaldLogger {
     pub fn new(cfg: &LogPluginCfg) -> ConmonResult<Self> {
+        if let Some(ref cid) = cfg.cid {
+            if cid.chars().count() <= 12 {
+                return Err(ConmonError::new(
+                    "Container ID must be longer than 12 characters",
+                    1,
+                ));
+            }
+        }
+
         // Validate the labels.
         for l in &cfg.log_labels {
             if l.starts_with('=') {

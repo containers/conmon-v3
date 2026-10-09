@@ -132,7 +132,7 @@ once.
 
 : Log to syslog. This is intended for use with the cgroupfs cgroup manager.
   It controls how conmon itself logs; it is distinct from the container log
-  plugin configured via **--log-path**.
+  plugin configured via **--log-driver** / **--log-path**.
 
 **-s**, **--systemd-cgroup**
 
@@ -210,27 +210,48 @@ once.
   (for example, **debug**, **info**, **warn**, **error**); invalid values are
   treated according to the internal logger defaults.
 
+**--log-driver**=_NAME_ (multiple)
+
+: Select the container log driver. Preferred over the deprecated
+  **--log-path**. Can be specified multiple times. Dashes in the name are
+  normalized to underscores (for example, `k8s-file` becomes `k8s_file`).
+  Supported drivers:
+
+  * `file` / `k8s_file` - File logging. Path is taken from
+    **--log-driver-opt** `path=...` (**k8s_file** requires a path).
+  * `journald` - Journald logging plugin.
+  * `syslog` - Syslog logging plugin (writes container output via
+    **openlog(3)**/**syslog(3)**). Because **openlog(3)** is process-global,
+    only one **syslog** logger may be active.
+  * `passthrough` / `none` / `null` / `off` - No-op / passthrough plugins.
+    **passthrough** cannot be combined with other drivers.
+
+  Cannot be combined with **--log-path**. If neither **--log-driver** nor
+  **--log-path** is provided, conmon exits with an error.
+
+**--log-driver-opt**=_KEY=VALUE_ (multiple)
+
+: Driver-specific option for **--log-driver**. Can be specified multiple
+  times. For **file** / **k8s_file**, use `path=/path/to/logfile`.
+
 **-l**, **--log-path**=_SPEC_ (multiple)
 
-: Configure container logging destination and plugin. This option can be
-  specified multiple times and is required unless **--version** is used.
-  Each value has one of the following forms:
+: **Deprecated.** Use **--log-driver** (and **--log-driver-opt**) instead.
+  Legacy container logging destination and plugin. Can be specified multiple
+  times. Each value has one of the following forms:
 
   * `plugin:path` - Use the given plugin and log to *path*.
     Dashes in the plugin name are normalized to underscores (for example,
     `k8s-file` becomes `k8s_file`).
   * `journald` - Use the **journald** logging plugin.
-  * `syslog` - Use the **syslog** logging plugin (writes container output to
-    the system syslog via **openlog(3)**/**syslog(3)**). Because **openlog(3)**
-    configures a process-global destination, **syslog** may appear at most
-    once among **--log-path** values; a second **syslog** entry is rejected.
   * `passthrough` - Use the **passthrough** logging plugin (no additional file
     path).
+  * `none` / `null` / `off` - Disable container logging.
   * `path` - Any other non-empty value is treated as a file path for the
     default **file** logging plugin.
 
-  If no usable **--log-path** value is provided, conmon exits with
-  "Log driver not provided. Use --log-path".
+  Use **--log-driver syslog** for the syslog plugin (not **--log-path**).
+  Cannot be combined with **--log-driver**.
 
 **--log-size-max**=_BYTES_
 
@@ -361,8 +382,8 @@ conmon selects its internal command mode based on the provided options:
 # ENVIRONMENT
 
 The following environment variables affect conmon's own debug logging. They do
-not control the container log plugin, which is configured via **--log-path**
-and related CLI options.
+not control the container log plugin, which is configured via **--log-driver**
+(or deprecated **--log-path**) and related CLI options.
 
 **CONMON_LOG_PATH**
 
