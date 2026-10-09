@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Test runner for conmon-v3 BATS tests (v3-specific features such as syslog).
+# Test runner for conmon-v3 BATS tests (includes the former conmon-v2 suite).
 
 set -euo pipefail
 
@@ -22,7 +22,6 @@ fi
 
 BATS_OPTIONS="${BATS_OPTIONS:-}"
 CONMON_TEST_STRICT="${CONMON_TEST_STRICT:-}"
-CONMON_V2_TEST_DIR="${CONMON_V2_TEST_DIR:-$PROJECT_ROOT/conmon-v2/test}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,7 +32,7 @@ usage() {
     cat <<EOF
 Usage: $0 [OPTIONS] [TEST_FILES...]
 
-Run conmon-v3 BATS tests (syslog and other v3-only coverage).
+Run conmon BATS tests from $SCRIPT_DIR.
 
 OPTIONS:
     -h, --help              Show this help message
@@ -48,7 +47,6 @@ OPTIONS:
 ENVIRONMENT VARIABLES:
     CONMON_BINARY          Path to conmon binary
     RUNTIME_BINARY         Path to runtime binary
-    CONMON_V2_TEST_DIR     Path to conmon-v2/test helpers (default: ./conmon-v2/test)
     CONMON_TEST_STRICT     Same as --strict, if set to a non-empty value
     UBI10_MICRO_IMAGE      Image to take the test rootfs from
     BATS_OPTIONS           Additional options to pass to bats
@@ -66,16 +64,16 @@ check_dependencies() {
         missing_deps+=("bats")
     fi
 
+    if ! command -v socat >/dev/null 2>&1; then
+        missing_deps+=("socat")
+    fi
+
     if [[ ! -x "$CONMON_BINARY" ]]; then
         missing_deps+=("conmon binary at $CONMON_BINARY (run 'make' first)")
     fi
 
     if [[ ! -x "$RUNTIME_BINARY" ]]; then
         missing_deps+=("runtime binary at $RUNTIME_BINARY")
-    fi
-
-    if [[ ! -f "$CONMON_V2_TEST_DIR/test_helper.bash" ]]; then
-        missing_deps+=("conmon-v2 test helpers at $CONMON_V2_TEST_DIR (run 'make conmon-v2')")
     fi
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
@@ -86,7 +84,7 @@ check_dependencies() {
 }
 
 show_environment() {
-    log_info "Running conmon-v3 bats with:"
+    log_info "Running conmon bats with:"
     log_info "  kernel:  $(uname -srm)"
     if [[ -r /etc/os-release ]]; then
         # shellcheck source=/dev/null
@@ -95,7 +93,6 @@ show_environment() {
     log_info "  conmon:  $CONMON_BINARY: $("$CONMON_BINARY" --version 2>&1 | tr '\n' ' ' | sed 's/  *$//')"
     log_info "  runtime: $RUNTIME_BINARY: $("$RUNTIME_BINARY" --version 2>&1 | head -1)"
     log_info "  bats:    $(command -v bats): $(bats --version 2>&1)"
-    log_info "  helpers: $CONMON_V2_TEST_DIR"
 }
 
 main() {
@@ -188,7 +185,7 @@ main() {
         fi
     done
 
-    export CONMON_BINARY RUNTIME_BINARY CONMON_TEST_STRICT CONMON_V2_TEST_DIR
+    export CONMON_BINARY RUNTIME_BINARY CONMON_TEST_STRICT
 
     show_environment
     log_info "  test files: ${test_files[*]}"

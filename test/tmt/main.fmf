@@ -40,7 +40,6 @@
         - binutils
         - conmon-v3
         - crun
-        - git-core
         - jq
         - podman
         - runc
