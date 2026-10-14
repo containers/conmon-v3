@@ -819,3 +819,168 @@ wait_for_syslog_message() {
             journalctl --no-pager -t "$ident" --since "5 min ago" 2>&1 | tail -20
         )"
 }
+
+# Skip when a private rsyslogd cannot be started for remote syslog e2e tests.
+skip_if_no_rsyslogd() {
+    if ! command -v rsyslogd >/dev/null 2>&1; then
+        skip "rsyslogd not available"
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip "python3 not available (needed to allocate free ports)"
+    fi
+}
+
+# Start a user-owned rsyslogd that listens on tcp, udp, unix, and unixgram.
+#
+# Requires TEST_TMPDIR. Each listener writes to its own capture file so the
+# four transports can be checked independently. Sets PRIVATE_RSYSLOG_PID,
+# PRIVATE_RSYSLOG_TCP_PORT, PRIVATE_RSYSLOG_UDP_PORT, PRIVATE_RSYSLOG_UNIX_SOCK,
+# PRIVATE_RSYSLOG_UNIXGRAM_SOCK, and PRIVATE_RSYSLOG_{TCP,UDP,UNIX,UNIXGRAM}_LOG.
+start_private_rsyslogd() {
+    local dir conf err pidfile ports tcp udp i
+    [[ -n "${TEST_TMPDIR:-}" ]] || die "start_private_rsyslogd requires TEST_TMPDIR"
+
+    dir="$TEST_TMPDIR/private-rsyslog"
+    mkdir -p "$dir"
+    conf="$dir/rsyslog.conf"
+    err="$dir/rsyslog.err"
+    pidfile="$dir/rsyslog.pid"
+
+    PRIVATE_RSYSLOG_TCP_LOG="$dir/tcp.log"
+    PRIVATE_RSYSLOG_UDP_LOG="$dir/udp.log"
+    PRIVATE_RSYSLOG_UNIX_LOG="$dir/unix.log"
+    PRIVATE_RSYSLOG_UNIXGRAM_LOG="$dir/unixgram.log"
+    PRIVATE_RSYSLOG_UNIX_SOCK="$dir/stream.sock"
+    PRIVATE_RSYSLOG_UNIXGRAM_SOCK="$dir/dgram.sock"
+    rm -f "$PRIVATE_RSYSLOG_UNIX_SOCK" "$PRIVATE_RSYSLOG_UNIXGRAM_SOCK" "$pidfile"
+    : >"$PRIVATE_RSYSLOG_TCP_LOG"
+    : >"$PRIVATE_RSYSLOG_UDP_LOG"
+    : >"$PRIVATE_RSYSLOG_UNIX_LOG"
+    : >"$PRIVATE_RSYSLOG_UNIXGRAM_LOG"
+
+    # Hold both ports open together so the kernel does not reuse one for the other.
+    ports=$(python3 -c 'import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0))
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 0))
+print(s.getsockname()[1], u.getsockname()[1])
+s.close(); u.close()')
+    read -r tcp udp <<<"$ports"
+    PRIVATE_RSYSLOG_TCP_PORT=$tcp
+    PRIVATE_RSYSLOG_UDP_PORT=$udp
+
+    cat >"$conf" <<EOF
+global(workDirectory="$dir" maxMessageSize="64k")
+module(load="imtcp")
+module(load="imudp")
+module(load="imptcp")
+module(load="imuxsock" SysSock.Use="off")
+
+template(name="capture" type="string" string="pri=%pri% fac=%syslogfacility-text% tag=%programname% msg=%msg% raw=%rawmsg%\\n")
+
+ruleset(name="tcpin") {
+    action(type="omfile" file="$PRIVATE_RSYSLOG_TCP_LOG" template="capture" queue.type="Direct")
+}
+ruleset(name="udpin") {
+    action(type="omfile" file="$PRIVATE_RSYSLOG_UDP_LOG" template="capture" queue.type="Direct")
+}
+ruleset(name="streamin") {
+    action(type="omfile" file="$PRIVATE_RSYSLOG_UNIX_LOG" template="capture" queue.type="Direct")
+}
+ruleset(name="gramin") {
+    action(type="omfile" file="$PRIVATE_RSYSLOG_UNIXGRAM_LOG" template="capture" queue.type="Direct")
+}
+
+input(type="imtcp" port="$tcp" address="127.0.0.1" ruleset="tcpin"
+      supportOctetCountedFraming="on")
+input(type="imudp" port="$udp" address="127.0.0.1" ruleset="udpin")
+input(type="imptcp" path="$PRIVATE_RSYSLOG_UNIX_SOCK" unlink="on" ruleset="streamin"
+      fileCreateMode="0666" addtlFrameDelimiter="10")
+input(type="imuxsock" Socket="$PRIVATE_RSYSLOG_UNIXGRAM_SOCK" unlink="on" ruleset="gramin"
+      useSpecialParser="on" ignoreTimestamp="on")
+EOF
+
+    if ! rsyslogd -N1 -f "$conf" >"$err" 2>&1; then
+        die "rsyslogd rejected private config: $(cat "$err")"
+    fi
+
+    # Foreground instance with its own pidfile; do not touch the host daemon.
+    # setsid so teardown can signal the whole process group if workers linger.
+    setsid rsyslogd -n -f "$conf" -i "$pidfile" >>"$err" 2>&1 &
+    PRIVATE_RSYSLOG_PID=$!
+    PRIVATE_RSYSLOG_CONF="$conf"
+
+    for i in $(seq 1 50); do
+        if kill -0 "$PRIVATE_RSYSLOG_PID" 2>/dev/null &&
+            [[ -S "$PRIVATE_RSYSLOG_UNIX_SOCK" && -S "$PRIVATE_RSYSLOG_UNIXGRAM_SOCK" ]] &&
+            python3 -c 'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), 0.2); s.close()' "$tcp" &&
+            ! python3 -c 'import socket,sys; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", int(sys.argv[1])))' "$udp" 2>/dev/null
+        then
+            export PRIVATE_RSYSLOG_PID PRIVATE_RSYSLOG_CONF
+            export PRIVATE_RSYSLOG_TCP_PORT PRIVATE_RSYSLOG_UDP_PORT
+            export PRIVATE_RSYSLOG_UNIX_SOCK PRIVATE_RSYSLOG_UNIXGRAM_SOCK
+            export PRIVATE_RSYSLOG_TCP_LOG PRIVATE_RSYSLOG_UDP_LOG
+            export PRIVATE_RSYSLOG_UNIX_LOG PRIVATE_RSYSLOG_UNIXGRAM_LOG
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    stop_private_rsyslogd
+    die "private rsyslogd did not become ready: $(cat "$err"; ls -la "$dir")"
+}
+
+# Stop the private rsyslogd without blocking teardown.
+#
+# A polite SIGTERM plus an unbounded `wait` can hang the BATS suite when
+# rsyslogd is slow to release listeners. Poll briefly, then SIGKILL.
+stop_private_rsyslogd() {
+    local pid=${PRIVATE_RSYSLOG_PID:-}
+    local conf=${PRIVATE_RSYSLOG_CONF:-}
+    local i
+
+    PRIVATE_RSYSLOG_PID=""
+    PRIVATE_RSYSLOG_CONF=""
+
+    if [[ -n "$pid" ]]; then
+        kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        for i in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.05
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+
+    # Belt and suspenders: match only our private conf path, never the host daemon.
+    if [[ -n "$conf" ]]; then
+        pkill -KILL -f "rsyslogd -n -f ${conf}" 2>/dev/null || true
+    fi
+}
+
+# Send one container line to the private rsyslogd and check the listener log.
+#
+# $1 marker, $2 syslog-address, $3 log-tag, $4 capture file.
+# Uses syslog-facility=local0 so every transport yields PRI 134 for stdout.
+deliver_to_private_rsyslogd() {
+    local marker=$1 address=$2 tag=$3 logfile=$4
+
+    "$RUNTIME_BINARY" delete -f "$CTR_ID" >/dev/null 2>&1 || true
+    CTR_ID=$(generate_ctr_id)
+    generate_runtime_config "$BUNDLE_PATH" "$ROOTFS" "false" "echo ${marker}"
+    run_conmon_with_default_args \
+        --log-driver "syslog" \
+        --log-tag "$tag" \
+        --log-driver-opt "syslog-address=${address}" \
+        --log-driver-opt "syslog-facility=local0"
+
+    wait_for_log_line "$logfile" "$marker" 15
+    run cat "$logfile"
+    assert_success
+    assert_output_contains "$marker"
+    assert_output_contains "$tag"
+    # local0 is facility 16, stdout is severity info (6): PRI 134.
+    assert_output_contains "pri=134"
+    assert_output_contains "fac=local0"
+}

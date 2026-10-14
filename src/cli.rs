@@ -1031,6 +1031,36 @@ mod tests {
     }
 
     #[test]
+    fn log_driver_syslog_carries_remote_opts() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["syslog".into()],
+            log_driver_opts: vec![
+                ("syslog-address".into(), "tcp://localhost:1514".into()),
+                ("syslog-facility".into(), "local0".into()),
+            ],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries[0].0, "syslog");
+        assert_eq!(entries[0].1.log_driver_opts.len(), 2);
+        assert!(
+            entries[0]
+                .1
+                .log_driver_opts
+                .iter()
+                .any(|(k, v)| k == "syslog-address" && v == "tcp://localhost:1514")
+        );
+        assert!(
+            entries[0]
+                .1
+                .log_driver_opts
+                .iter()
+                .any(|(k, v)| k == "syslog-facility" && v == "local0")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn log_driver_file_uses_path_opt() -> ConmonResult<()> {
         let o = Opts {
             log_driver: vec!["k8s-file".into()],
