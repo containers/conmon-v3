@@ -210,9 +210,10 @@ once.
   * `file` / `k8s_file` - File logging. Path is taken from
     **--log-driver-opt** `path=...` (**k8s_file** requires a path).
   * `journald` - Write container output to the systemd journal.
-  * `syslog` - Write container output via **openlog(3)**/**syslog(3)**.
-    Because **openlog(3)** is process-global, only one **syslog** driver
-    may be active.
+  * `syslog` - Write container output to syslog. Without **--log-driver-opt**
+    `syslog-address`, messages go through **openlog(3)**/**syslog(3)**
+    (process-global; only one such driver may be active). With
+    `syslog-address`, messages are sent to a remote endpoint (see below).
   * `none` - Discard container output.
   * `passthrough` - Do not capture container output. The container inherits
     conmon's standard streams, and conmon does not create an attach socket.
@@ -225,6 +226,22 @@ once.
 
 : Driver-specific option for **--log-driver**. Can be specified multiple
   times. For **file** / **k8s_file**, use `path=/path/to/logfile`.
+  For **syslog**:
+
+  * `syslog-address` - Remote destination. Supported forms:
+    `tcp://HOST[:PORT]`, `udp://HOST[:PORT]` (default port **514**),
+    `unix:///PATH`, `unixgram:///PATH`. Omit the option for local
+    **openlog(3)**/**syslog(3)**; an empty value is an error.
+  * `syslog-facility` - Facility name or number (for example `daemon`,
+    `user`, `local0`, or `3`). Defaults to **user** for local delivery and
+    **daemon** for remote. Only facilities present on the portable syslog
+    facility set are accepted.
+
+  TCP and UDP messages use RFC 5424. TCP prefixes each message with its
+  octet count (RFC 6587). `unix://` and `unixgram://` follow Docker's
+  traditional local layout: `<PRI>`, Go's `time.Stamp`, the tag, and the
+  pid, then the line and a trailing newline. Those sockets have no
+  octet-count prefix.
 
 **-l**, **--log-path**=_SPEC_ (multiple)
 
