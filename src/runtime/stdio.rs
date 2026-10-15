@@ -913,20 +913,11 @@ mod tests {
 
     #[test]
     fn paused_terminal_with_closed_slave_does_not_spin_or_postpone_deadline() -> ConmonResult<()> {
-        // Empty-events poll still reports POLLHUP on a master with no slave; the
-        // paused fd must be omitted from the poll set so the deadline is not reset.
+        // A master with no slave stays ready: poll reports POLLHUP even when the
+        // requested events are empty, and that would reset the re-arm deadline
+        // every iteration. Kernels and container PTY mounts do not all surface
+        // that hangup for an empty mask, so the test checks the poll set itself.
         let (master, _path) = pty_master_slave_closed()?;
-        {
-            let mut pfd = [PollFd::new(master.as_fd(), PollFlags::empty())];
-            let n = poll(&mut pfd, 0u16).unwrap();
-            assert!(
-                n > 0
-                    && pfd[0]
-                        .revents()
-                        .is_some_and(|r| r.contains(PollFlags::POLLHUP)),
-                "precondition: empty events still surface POLLHUP"
-            );
-        }
 
         let mut sockets = vec![Socket::Remote(RemoteSocket::new(
             SocketType::Terminal,
