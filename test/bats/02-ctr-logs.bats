@@ -21,7 +21,7 @@ run_conmon_with_log_opts() {
 @test "ctr logs: no log driver should fail" {
     run_conmon_with_log_opts
     assert_failure
-    assert_output_contains "Log driver not provided. Use --log-path"
+    assert_output_contains "Log driver not provided. Use --log-driver (or deprecated --log-path)"
 }
 
 @test "ctr logs: log driver as path should pass" {

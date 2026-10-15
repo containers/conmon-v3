@@ -59,7 +59,7 @@ once.
 **-n**, **--name**=_STRING_
 
 : Human-readable container name. This is used in logging metadata and may
-  appear in log records depending on the configured log plugin.
+  appear in log records depending on the configured log driver.
 
 **-b**, **--bundle**=_PATH_
 
@@ -132,7 +132,7 @@ once.
 
 : Log to syslog. This is intended for use with the cgroupfs cgroup manager.
   It controls how conmon itself logs; it is distinct from the container log
-  plugin configured via **--log-path**.
+  driver configured via **--log-driver** / **--log-path**.
 
 **-s**, **--systemd-cgroup**
 
@@ -210,27 +210,50 @@ once.
   (for example, **debug**, **info**, **warn**, **error**); invalid values are
   treated according to the internal logger defaults.
 
+**--log-driver**=_NAME_ (multiple)
+
+: Select the container log driver. Preferred over the deprecated
+  **--log-path**. Can be specified multiple times. Dashes in the name are
+  normalized to underscores (for example, `k8s-file` becomes `k8s_file`).
+  Supported drivers:
+
+  * `file` / `k8s_file` - File logging. Path is taken from
+    **--log-driver-opt** `path=...` (**k8s_file** requires a path).
+  * `journald` - Write container output to the systemd journal.
+  * `syslog` - Write container output via **openlog(3)**/**syslog(3)**.
+    Because **openlog(3)** is process-global, only one **syslog** driver
+    may be active.
+  * `none` - Discard container output.
+  * `passthrough` - Do not capture container output. The container inherits
+    conmon's standard streams, and conmon does not create an attach socket.
+    Cannot be combined with other drivers.
+
+  Cannot be combined with **--log-path**. If neither **--log-driver** nor
+  **--log-path** is provided, conmon exits with an error.
+
+**--log-driver-opt**=_KEY=VALUE_ (multiple)
+
+: Driver-specific option for **--log-driver**. Can be specified multiple
+  times. For **file** / **k8s_file**, use `path=/path/to/logfile`.
+
 **-l**, **--log-path**=_SPEC_ (multiple)
 
-: Configure container logging destination and plugin. This option can be
-  specified multiple times and is required unless **--version** is used.
-  Each value has one of the following forms:
+: **Deprecated.** Use **--log-driver** (and **--log-driver-opt**) instead.
+  Legacy container logging destination. Can be specified multiple
+  times. Each value has one of the following forms:
 
-  * `plugin:path` - Use the given plugin and log to *path*.
-    Dashes in the plugin name are normalized to underscores (for example,
+  * `driver:path` - Use the given driver and log to *path*.
+    Dashes in the driver name are normalized to underscores (for example,
     `k8s-file` becomes `k8s_file`).
-  * `journald` - Use the **journald** logging plugin.
-  * `syslog` - Use the **syslog** logging plugin (writes container output to
-    the system syslog via **openlog(3)**/**syslog(3)**). Because **openlog(3)**
-    configures a process-global destination, **syslog** may appear at most
-    once among **--log-path** values; a second **syslog** entry is rejected.
-  * `passthrough` - Use the **passthrough** logging plugin (no additional file
-    path).
+  * `journald` - Use the **journald** driver.
+  * `passthrough` - Use the **passthrough** driver (no additional file path).
+  * `none` - Discard container output. **null** and **off** are accepted as
+    legacy spellings of **none**.
   * `path` - Any other non-empty value is treated as a file path for the
-    default **file** logging plugin.
+    default **file** driver.
 
-  If no usable **--log-path** value is provided, conmon exits with
-  "Log driver not provided. Use --log-path".
+  Use **--log-driver syslog** for the syslog driver (not **--log-path**).
+  Cannot be combined with **--log-driver**.
 
 **--log-size-max**=_BYTES_
 
@@ -241,7 +264,7 @@ once.
 
 **--log-global-size-max**=_BYTES_
 
-: Maximum total size in bytes of all log files managed by the log plugin. If
+: Maximum total size in bytes of all log files managed by the log driver. If
   unset or **0**, there is no global size limit. Negative values (including
   **-1**) also mean unlimited.
 
@@ -256,14 +279,14 @@ once.
 **--log-allowlist-dir**=_PATH_ (multiple)
 
 : Allowed log directory. Can be specified multiple times. When set, the log
-  plugin restricts log writes to the given directories. If omitted, no
+  driver restricts log writes to the given directories. If omitted, no
   allowlist restriction is applied.
 
 **--no-container-partial-message**
 
 : Do not set **CONTAINER_PARTIAL_MESSAGE=true** for partial log lines when
   using the **journald** log driver. If specified with a non-**journald**
-  plugin, conmon logs a warning and the option has no effect.
+  driver, conmon logs a warning and the option has no effect.
 
 **--no-sync-log**
 
@@ -361,8 +384,8 @@ conmon selects its internal command mode based on the provided options:
 # ENVIRONMENT
 
 The following environment variables affect conmon's own debug logging. They do
-not control the container log plugin, which is configured via **--log-path**
-and related CLI options.
+not control the container log driver, which is configured via **--log-driver**
+(or deprecated **--log-path**) and related CLI options.
 
 **CONMON_LOG_PATH**
 
@@ -392,7 +415,7 @@ In all normal cases, conmon:
 - Writes exit files into the directory specified by **--persist-dir** and/or
   **--exit-dir**, so higher-level tools can detect container exit and read the
   exit status.
-- Flushes any buffered container log output in the configured log plugin
+- Flushes any buffered container log output in the configured log driver
   before exiting.
 - Optionally runs the program specified by **--exit-command**, passing any
   **--exit-command-arg** values, after an optional **--exit-delay**.
