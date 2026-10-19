@@ -14,20 +14,15 @@ teardown() {
     cleanup_test_env
 }
 
-@test "syslog: --log-path syslog is accepted" {
+@test "syslog: --log-driver syslog is accepted" {
     setup_container_env "true"
-    run_conmon_with_default_args --log-path "syslog"
-}
-
-@test "syslog: --log-path syslog: is accepted" {
-    setup_container_env "true"
-    run_conmon_with_default_args --log-path "syslog:"
+    run_conmon_with_default_args --log-driver "syslog"
 }
 
 @test "syslog: rejects --log-label" {
     setup_container_env "true"
     run_conmon_expecting_failure \
-        --log-path "syslog" \
+        --log-driver "syslog" \
         --log-label "FOO=bar"
 
     assert_output_contains "syslog doesn't support --log-label"
@@ -42,7 +37,7 @@ teardown() {
     local marker="syslog-hello"
 
     run_conmon_with_default_args \
-        --log-path "syslog" \
+        --log-driver "syslog" \
         --log-tag "$tag"
 
     wait_for_syslog_message "$tag" "$marker"
@@ -57,7 +52,7 @@ teardown() {
     # Write only to stderr so the default priority is LOG_ERR (3).
     setup_container_env "echo ${marker} 1>&2"
     run_conmon_with_default_args \
-        --log-path "syslog" \
+        --log-driver "syslog" \
         --log-tag "$tag"
 
     wait_for_syslog_message "$tag" "$marker"
@@ -77,7 +72,7 @@ teardown() {
 
     setup_container_env "echo '<1>${marker}'"
     run_conmon_with_default_args \
-        --log-path "syslog" \
+        --log-driver "syslog" \
         --log-tag "$tag"
 
     wait_for_syslog_message "$tag" "$marker"
