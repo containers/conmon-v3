@@ -42,6 +42,8 @@
         - crun
         - jq
         - podman
+        - python3
+        - rsyslog
         - runc
         - socat
     duration: 15m
