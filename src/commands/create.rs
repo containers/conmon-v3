@@ -28,11 +28,6 @@ impl Create {
         // (See `RuntimeProcess::spawn` code and description for more information).
         // ===
 
-        // In case of `--terminal`, wait until runtime creates the console socket.
-        if self.cfg.common.terminal {
-            runtime_session.wait_for_terminal_creation()?;
-        }
-
         // Wait until the `runtime create` finishes and return an error in case it fails.
         runtime_session.wait_for_success(self.cfg.common.api_version, false)?;
 
