@@ -3,6 +3,7 @@ use crate::exit::set_subreaper;
 use crate::runtime::stdio::read_pipe;
 
 use log::{info, warn};
+use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::stat::Mode;
@@ -266,6 +267,25 @@ impl RuntimeProcess {
     /// Returns the runtime process pid or -1 if it's not running.
     pub fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Send `SIGKILL` to the runtime process if it is still running.
+    ///
+    /// Used when create fails early (for example console-socket timeout) so the
+    /// runtime is not left as an orphan under PID 1.
+    pub fn kill(&self) -> ConmonResult<()> {
+        let raw = self.pid;
+        if raw <= 0 {
+            return Ok(());
+        }
+        let pid = Pid::from_raw(raw);
+        match kill(pid, Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(e) => Err(ConmonError::new(
+                format!("Failed to kill runtime process {raw}: {e}"),
+                1,
+            )),
+        }
     }
 
     /// Block until the runtime process exits. Returns the exit code.

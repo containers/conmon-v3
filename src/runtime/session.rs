@@ -202,7 +202,9 @@ impl RuntimeSession {
     ///
     /// This function prepares the complete environment for the "runtime" binary,
     /// including the stdio pipes, sd-notify socket, attach socket, signal-fd and
-    /// many more.
+    /// many more. When `--terminal` is set, it also waits for the console fd.
+    /// On any error after the runtime has been spawned, the runtime is killed
+    /// so it is not left orphaned.
     ///
     /// # Arguments
     ///
@@ -214,6 +216,21 @@ impl RuntimeSession {
     ///
     /// * [`ConmonError`] on any error.
     pub fn launch(
+        &mut self,
+        common: &CommonCfg,
+        args_gen: &impl RuntimeArgsGenerator,
+        attach: bool,
+    ) -> ConmonResult<()> {
+        let result = self.launch_inner(common, args_gen, attach);
+        if result.is_err() {
+            // Spawn may have started the runtime before a later step failed
+            // (signal setup, console-socket wait). Do not leave it orphaned.
+            let _ = self.kill_runtime();
+        }
+        result
+    }
+
+    fn launch_inner(
         &mut self,
         common: &CommonCfg,
         args_gen: &impl RuntimeArgsGenerator,
@@ -426,6 +443,12 @@ impl RuntimeSession {
         pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
         let signals = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)?;
         self.signals = Some(signals);
+
+        // Receive the PTY fd before returning so a console-socket failure is
+        // cleaned up by `launch`'s kill_runtime path together with other errors.
+        if common.terminal {
+            self.wait_for_terminal_creation()?;
+        }
 
         Ok(())
     }
@@ -881,13 +904,14 @@ impl RuntimeSession {
 
     /// Waits for the runtime to send the terminal fd to conmon.
     ///
-    /// When `--terminal` is used, this function is called to receive the terminal
-    /// fd from runtime.
+    /// When `--terminal` is used, this function is called from `launch` to
+    /// receive the terminal fd from runtime.
     ///
     /// # Errors
     ///
-    /// * [`ConmonError`] on any error.
-    pub fn wait_for_terminal_creation(&mut self) -> ConmonResult<()> {
+    /// * [`ConmonError`] on any error. On failure, `launch` kills the runtime
+    ///   so a stuck `crun create` is not left behind.
+    fn wait_for_terminal_creation(&mut self) -> ConmonResult<()> {
         debug!("Waiting for terminal creation.");
         if let Some(cs) = self.console_socket.take() {
             self.terminal_socket = Some(receive_console_fd(
@@ -897,6 +921,29 @@ impl RuntimeSession {
         }
         debug!("Terminal created.");
         Ok(())
+    }
+
+    /// Kill the runtime process if create/exec has not reaped it yet.
+    ///
+    /// Called from `launch` on failure so a still-running `crun create` (for
+    /// example stuck on `--console-socket`) is not left behind when conmon exits.
+    fn kill_runtime(&mut self) -> ConmonResult<()> {
+        if self.exit_code.is_some() || self.process.pid() <= 0 {
+            return Ok(());
+        }
+        self.process.kill()?;
+        match self.process.wait() {
+            Ok(code) => {
+                self.exit_code = Some(code);
+                Ok(())
+            }
+            Err(e) => {
+                // Already gone or wait failed after kill; treat as cleaned up.
+                debug!("wait after kill_runtime: {e}");
+                self.exit_code = Some(-1);
+                Ok(())
+            }
+        }
     }
 }
 
