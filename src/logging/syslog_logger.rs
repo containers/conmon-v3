@@ -1,6 +1,9 @@
 use crate::{
     error::{ConmonError, ConmonResult},
-    logging::plugin::{LogPlugin, LogPluginCfg},
+    logging::{
+        plugin::{LogPlugin, LogPluginCfg},
+        util::{STDIO_BUF_SIZE, next_stdio_line, strip_trailing_newlines, truncate_cuuid},
+    },
 };
 use arrayvec::ArrayVec;
 use chrono::{Datelike, SecondsFormat, Utc};
@@ -16,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const STDIO_BUF_SIZE: usize = 8192;
 const DEFAULT_SYSLOG_PORT: u16 = 514;
 
 /// How long one TCP connect, or one socket write, may block.
@@ -199,7 +201,7 @@ impl SyslogLogger {
             Self::validate_syslog_ident(name)?;
             name.as_str()
         } else if let Some(ref cuuid) = cfg.cuuid {
-            Self::truncate_cuuid(cuuid)
+            truncate_cuuid(cuuid)
         } else {
             "conmon"
         };
@@ -237,27 +239,6 @@ impl SyslogLogger {
             return None;
         }
         Some(((buf[1] - b'0') as i32, 3))
-    }
-
-    /// Returns `(line_len, is_partial)` for the next line in `buf`.
-    ///
-    /// `line_len` includes the trailing newline when `is_partial` is false.
-    fn get_line_len(buf: &[u8]) -> (usize, bool) {
-        if let Some(pos) = buf.iter().position(|&c| c == b'\n') {
-            (pos + 1, false)
-        } else {
-            (buf.len(), true)
-        }
-    }
-
-    fn truncate_cuuid(s: &str) -> &str {
-        if s.len() <= 12 {
-            return s;
-        }
-        match s.char_indices().nth(12) {
-            Some((idx, _)) => &s[..idx],
-            None => s,
-        }
     }
 
     /// Send one assembled line. A leading `<N>` replaces `default_severity`.
@@ -319,27 +300,7 @@ impl SyslogLogger {
         } else {
             &mut self.stderr
         };
-        if input.is_empty() {
-            if partial.is_empty() {
-                return None;
-            }
-            return Some(take_line(partial, &[]));
-        }
-
-        let (len, incomplete) = Self::get_line_len(input);
-        if incomplete {
-            if let Ok(()) = partial.try_extend_from_slice(&input[..len]) {
-                *input = &input[len..];
-                if partial.len() < STDIO_BUF_SIZE {
-                    return None;
-                }
-                return Some(take_line(partial, &[]));
-            }
-        }
-
-        let line = take_line(partial, &input[..len]);
-        *input = &input[len..];
-        Some(line)
+        next_stdio_line(partial, input)
     }
 }
 
@@ -383,22 +344,6 @@ impl LogPlugin for SyslogLogger {
             None => Ok(()),
         }
     }
-}
-
-/// Drop trailing newlines. A buffer of only newlines becomes empty.
-fn strip_trailing_newlines(buf: &[u8]) -> &[u8] {
-    match buf.iter().rposition(|&b| b != b'\n') {
-        Some(last) => &buf[..=last],
-        None => &[],
-    }
-}
-
-/// Join the buffered bytes with `extra` and clear the buffer.
-fn take_line(partial: &mut ArrayVec<u8, STDIO_BUF_SIZE>, extra: &[u8]) -> Vec<u8> {
-    let mut line = Vec::with_capacity(partial.len() + extra.len());
-    line.extend(partial.drain(..));
-    line.extend_from_slice(extra);
-    line
 }
 
 impl RemoteSyslog {
@@ -1080,13 +1025,6 @@ mod tests {
         assert!(SyslogLogger::validate_syslog_ident("app:component").is_ok());
         assert!(SyslogLogger::validate_syslog_ident("bad\ntag").is_err());
         assert!(SyslogLogger::validate_syslog_ident(&"a".repeat(64)).is_ok());
-    }
-
-    #[test]
-    fn get_line_len_reports_partial_and_complete() {
-        assert_eq!(SyslogLogger::get_line_len(b"abc\ndef"), (4, false));
-        assert_eq!(SyslogLogger::get_line_len(b"abc"), (3, true));
-        assert_eq!(SyslogLogger::get_line_len(b""), (0, true));
     }
 
     #[test]

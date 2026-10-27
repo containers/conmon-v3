@@ -1018,6 +1018,26 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "splunk")]
+    #[test]
+    fn log_driver_splunk_is_accepted() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["splunk".into()],
+            log_driver_opts: vec![
+                (
+                    "splunk-url".into(),
+                    "https://splunk.example:8088/services/collector/event".into(),
+                ),
+                ("splunk-token".into(), "secret".into()),
+            ],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries[0].0, "splunk");
+        assert_eq!(entries[0].1.log_driver_opts.len(), 2);
+        Ok(())
+    }
+
     #[test]
     fn log_driver_syslog_is_accepted() -> ConmonResult<()> {
         let o = Opts {

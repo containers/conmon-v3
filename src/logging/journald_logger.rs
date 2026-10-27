@@ -1,10 +1,11 @@
 use crate::{
     error::{ConmonError, ConmonResult},
-    logging::plugin::{LogPlugin, LogPluginCfg},
+    logging::{
+        plugin::{LogPlugin, LogPluginCfg},
+        util::STDIO_BUF_SIZE,
+    },
 };
 use systemd::journal;
-
-const STDIO_BUF_SIZE: usize = 8192;
 
 /// Logging plugin for journald.
 pub struct JournaldLogger {

@@ -49,6 +49,25 @@
     duration: 15m
     environment:
         RUST_BACKTRACE: 1
+        CONMON_TEST_SPLUNK_REAL: "0"
+
+/e2e-splunk:
+    summary: Real Splunk Enterprise HEC e2e (large image)
+    test: bash e2e-splunk.sh
+    require:
+        - bats
+        - binutils
+        - conmon-v3
+        - crun
+        - curl
+        - jq
+        - podman
+        - python3
+        - runc
+    duration: 45m
+    environment:
+        RUST_BACKTRACE: 1
+        CONMON_TEST_SPLUNK_REAL: "1"
 
 /podman:
     summary: Podman system tests with conmon-v3
