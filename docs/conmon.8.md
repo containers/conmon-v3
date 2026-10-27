@@ -214,6 +214,10 @@ once.
     `syslog-address`, messages go through **openlog(3)**/**syslog(3)**
     (process-global; only one such driver may be active). With
     `syslog-address`, messages are sent to a remote endpoint (see below).
+  * `splunk` - POST each container line to a Splunk HTTP Event Collector
+    endpoint. See **Splunk HEC** below. Built when the Cargo feature
+    `splunk` is enabled (the default); builds with
+    `--no-default-features` omit this driver and its HTTP stack.
   * `none` - Discard container output.
   * `passthrough` - Do not capture container output. The container inherits
     conmon's standard streams, and conmon does not create an attach socket.
@@ -242,6 +246,35 @@ once.
   traditional local layout: `<PRI>`, Go's `time.Stamp`, the tag, and the
   pid, then the line and a trailing newline. Those sockets have no
   octet-count prefix.
+
+**Splunk HEC**
+
+: Available when built with Cargo feature `splunk` (default). Sends one
+  JSON event per container line to `splunk-url` (full `http(s)://` HEC
+  event URL). Dialing starts on the first line.
+  Required: `splunk-url`, `splunk-token` (`Authorization: Splunk <token>`;
+  redacted from errors/Debug; still visible on the process argv/**/proc**).
+  Optional: `splunk-source`, `splunk-sourcetype`, `splunk-index`,
+  `splunk-insecureskipverify` (`true`/`1` skips TLS verify).
+  Event shape: `time`, `event.line`, `event.source` (`stdout`/`stderr`),
+  `event.tag`. Invalid UTF-8 → U+FFFD. Unknown `splunk-*` opts and
+  **--log-label** are rejected.
+  One-second connect/request timeout; transient errors, HTTP 429, and
+  5xx retry once (duplicates possible). Other 4xx, TLS failures, HEC
+  `code` ≠ 0, and responses over 64 KiB do not retry. After a failed
+  line, remaining complete lines in that write are dropped; a partial
+  stays buffered. Logging failure does not stop the container.
+  Not implemented vs Docker: queues, batching, gzip, `json`/`raw`,
+  custom CA, indexer ack, disk buffering.
+
+  Example:
+
+      conmon --cid ID --cuuid ID --runtime /usr/bin/crun \
+          --log-driver splunk \
+          --log-driver-opt splunk-url=https://splunk.example:8088/services/collector/event \
+          --log-driver-opt splunk-token=HEC_TOKEN \
+          --log-driver-opt splunk-index=main \
+          --log-tag myctr ...
 
 **-l**, **--log-path**=_SPEC_ (multiple)
 
