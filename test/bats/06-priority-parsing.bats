@@ -4,18 +4,21 @@ load test_helper
 
 setup() {
     check_conmon_binary
-    setup_container_env
+    # Set OCI process.terminal to true (matches conmon -t below).
+    setup_container_env "" "true"
 }
 
 teardown() {
     cleanup_test_env
 }
 
-# Helper function to run conmon with journald logging
+# Run the container to completion with journald (+ optional extra drivers).
+#
+# Uses the normal create/start lifecycle. A bare `conmon --terminal` without
+# sync-pipe double-forks: the outer process exits 0 immediately while the child
+# stays in create/event-loop, which is what left orphaned conmon/crun in CI.
 run_conmon_journald() {
-    local extra_args=("$@")
-    run_conmon --cid "$CTR_ID" --cuuid "$CTR_ID" --runtime "$RUNTIME_BINARY" \
-        --log-path "journald:" --bundle "$BUNDLE_PATH" "${extra_args[@]}"
+    run_conmon_with_default_args --log-path "journald:" -t "$@"
 }
 
 # Helper function to create a test script with priority messages
@@ -53,18 +56,12 @@ run_priority_test() {
     create_test_script "$script_name" "$script_content"
     update_container_args "/$script_name"
 
-    if [ "$verify_journal" = "true" ]; then
-        run_conmon_journald --terminal --conmon-pidfile "$CONMON_PID_FILE"
-    else
-        run_conmon_journald --terminal
-    fi
+    run_conmon_journald
 
-    assert_success
-
-    # Optional journal verification
-    if [ "$verify_journal" = "true" ] && [ -f "$CONMON_PID_FILE" ]; then
+    # Optional journal verification against the conmon that actually ran.
+    if [ "$verify_journal" = "true" ] && [ -f "$CONMON_PIDFILE" ]; then
         local conmon_pid
-        conmon_pid=$(cat "$CONMON_PID_FILE")
+        conmon_pid=$(cat "$CONMON_PIDFILE")
         sleep 1 # Give journald time to process
 
         local journal_output
@@ -139,8 +136,7 @@ echo "<2>stderr with priority 2" >&2'
 
     update_container_args "/test_stderr_stdout.sh"
 
-    run_conmon_journald --terminal
-    assert_success
+    run_conmon_journald
 }
 
 @test "priority parsing: multiline messages with priority prefix only on first line" {
@@ -153,8 +149,7 @@ printf "Regular message\nwith second line\n"'
 
     update_container_args "/test_multiline.sh"
 
-    run_conmon_journald --terminal
-    assert_success
+    run_conmon_journald
 }
 
 @test "priority parsing: edge cases with very short buffers" {
@@ -170,8 +165,7 @@ echo ""'
 
     update_container_args "/test_short.sh"
 
-    run_conmon_journald --terminal
-    assert_success
+    run_conmon_journald
 }
 
 @test "priority parsing: all valid priority levels 0-7" {
@@ -187,13 +181,12 @@ done'
 
     update_container_args "/test_all_priorities.sh"
 
-    run_conmon_journald --terminal --conmon-pidfile "$CONMON_PID_FILE"
-    assert_success
+    run_conmon_journald
 
     # Verify that messages were written to journald with correct priorities
-    if [ -f "$CONMON_PID_FILE" ]; then
+    if [ -f "$CONMON_PIDFILE" ]; then
         local conmon_pid
-        conmon_pid=$(cat "$CONMON_PID_FILE")
+        conmon_pid=$(cat "$CONMON_PIDFILE")
 
         # Give journald a moment to process the messages
         sleep 1
@@ -226,27 +219,19 @@ echo "<6>Info message"'
 
     # Test with both k8s-file and journald logging
     if command -v journalctl >/dev/null 2>&1; then
-        run_conmon --cid "$CTR_ID" --cuuid "$CTR_ID" --runtime "$RUNTIME_BINARY" \
-            --bundle "$BUNDLE_PATH" --log-path "$LOG_PATH" --log-path "journald:" --terminal
-        assert_success
+        run_conmon_with_default_args \
+            --log-path "$LOG_PATH" --log-path "journald:" -t
         [ -f "$LOG_PATH" ]
     else
         # Just test k8s-file if journald not available
-        run_conmon --cid "$CTR_ID" --cuuid "$CTR_ID" --runtime "$RUNTIME_BINARY" \
-            --bundle "$BUNDLE_PATH" --log-path "$LOG_PATH" --terminal
-        assert_success
+        run_conmon_with_default_args --log-path "$LOG_PATH" -t
         [ -f "$LOG_PATH" ]
     fi
 }
 
 # Test to demonstrate better error checking
 @test "priority parsing: error handling with invalid log path" {
-    # Test error handling when journald is not available
-    run_conmon --cid "$CTR_ID" --cuuid "$CTR_ID" --runtime "$RUNTIME_BINARY" \
-        --bundle "$BUNDLE_PATH" --log-path "invalid_driver:" --terminal 2>&1 || true
+    run_conmon_expecting_failure --log-path "invalid_driver:" -t
 
-    # Use assert_output_contains for specific error checking
-    if [ "$status" -ne 0 ]; then
-        assert_output_contains "log driver"
-    fi
+    assert_output_contains "log driver"
 }

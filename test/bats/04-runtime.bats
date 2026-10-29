@@ -125,3 +125,80 @@ teardown() {
     assert_json "${output}" =~ "\"message\":"
     assert_json "${output}" =~ "runc create failed"
 }
+
+# Without _OCI_SYNCPIPE and without --sync, conmon double-forks: the process
+# bats waits on exits immediately while the child stays in create. If that
+# child then fails waiting for the console fd, launch must kill/reap the
+# runtime (PDEATHSIG alone deadlocks with exit cleanup's waitpid(-1)) or it
+# is reparented to PID 1. A stub runtime connects without sending an
+# SCM_RIGHTS fd and would otherwise keep sleeping.
+@test "runtime: --terminal create without sync pipe kills runtime on console failure" {
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip "python3 required for the stub runtime console-socket client"
+    fi
+
+    local fake_runtime="$TEST_TMPDIR/stuck-console-runtime"
+    export FAKE_RUNTIME_PIDFILE="$TEST_TMPDIR/fake-runtime.pid"
+
+    cat >"$fake_runtime" <<'EOF'
+#!/usr/bin/env python3
+"""Stub runtime: fail the console handshake, then sleep like a stuck create."""
+import os
+import socket
+import sys
+import time
+
+open(os.environ["FAKE_RUNTIME_PIDFILE"], "w", encoding="utf-8").write(str(os.getpid()))
+
+console = None
+args = sys.argv[1:]
+i = 0
+while i < len(args):
+    if args[i] == "--console-socket" and i + 1 < len(args):
+        console = args[i + 1]
+        i += 2
+    else:
+        i += 1
+
+if console:
+    for _ in range(50):
+        if os.path.exists(console):
+            break
+        time.sleep(0.1)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(console)
+    # Byte without SCM_RIGHTS: conmon rejects; keep the socket open briefly so
+    # the recv completes, then sleep so we would be orphaned without kill_runtime.
+    sock.send(b"x")
+    time.sleep(300)
+else:
+    time.sleep(300)
+EOF
+    chmod +x "$fake_runtime"
+
+    # Bare create: no sync pipe, no --sync (double-fork). Do not use the
+    # create/start helpers; those wait on the child and hide this path.
+    run_conmon \
+        --cid "$CTR_ID" \
+        --cuuid "$CTR_ID" \
+        --runtime "$fake_runtime" \
+        --log-path "k8s-file:$LOG_PATH" \
+        --bundle "$BUNDLE_PATH" \
+        --socket-dir-path "$SOCKET_PATH" \
+        --container-pidfile "$PID_FILE" \
+        --conmon-pidfile "$CONMON_PID_FILE" \
+        --terminal
+
+    # Outer process exited; the pidfile names the double-forked child.
+    assert_file_exists "$CONMON_PID_FILE"
+    CONMON_PID=$(cat "$CONMON_PID_FILE")
+    wait_for_conmon_exit "$CONMON_PID" 15
+
+    assert_file_exists "$FAKE_RUNTIME_PIDFILE"
+    local runtime_pid
+    runtime_pid=$(cat "$FAKE_RUNTIME_PIDFILE")
+    if kill -0 "$runtime_pid" 2>/dev/null; then
+        kill -9 "$runtime_pid" 2>/dev/null || true
+        die "runtime pid $runtime_pid still running after console-socket failure"
+    fi
+}

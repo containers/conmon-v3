@@ -26,11 +26,6 @@ impl Exec {
         // (See `RuntimeProcess::spawn` code and description for more information).
         // ===
 
-        // In case of `--terminal`, wait until runtime creates the console socket.
-        if self.cfg.common.terminal {
-            runtime_session.wait_for_terminal_creation()?;
-        }
-
         // Wait for the runtime to finish. Unlike create, a non-zero runtime exit
         // is not itself a failure for exec (it may be the exec'd command's status).
         // Matching conmon-v2, "runtime failed to start the process" is detected by
