@@ -8,9 +8,12 @@ load test_helper
 setup() {
     check_conmon_binary
     check_runtime_binary
+    PRIVATE_RSYSLOG_PID=""
+    PRIVATE_RSYSLOG_CONF=""
 }
 
 teardown() {
+    stop_private_rsyslogd
     cleanup_test_env
 }
 
@@ -81,4 +84,45 @@ teardown() {
     assert_success
     assert_output_contains "\"PRIORITY\":\"1\""
     assert_output_contains "$marker"
+}
+
+@test "syslog: rejects unknown syslog- driver opt" {
+    setup_container_env "true"
+    run_conmon_expecting_failure \
+        --log-driver "syslog" \
+        --log-driver-opt "syslog-bogus=x"
+
+    assert_output_contains "unknown log opt"
+}
+
+# One private rsyslogd with four listeners covers every remote address
+# scheme conmon accepts: tcp://, udp://, unix://, and unixgram://.
+@test "syslog: private rsyslogd accepts tcp, udp, unix, and unixgram" {
+    skip_if_no_rsyslogd
+
+    local tag
+    tag="rsys_${RANDOM}_$$"
+    setup_container_env "true"
+    start_private_rsyslogd
+
+    deliver_to_private_rsyslogd \
+        "rsyslog-tcp-marker" \
+        "tcp://127.0.0.1:${PRIVATE_RSYSLOG_TCP_PORT}" \
+        "${tag}-tcp" \
+        "$PRIVATE_RSYSLOG_TCP_LOG"
+    deliver_to_private_rsyslogd \
+        "rsyslog-udp-marker" \
+        "udp://127.0.0.1:${PRIVATE_RSYSLOG_UDP_PORT}" \
+        "${tag}-udp" \
+        "$PRIVATE_RSYSLOG_UDP_LOG"
+    deliver_to_private_rsyslogd \
+        "rsyslog-unix-marker" \
+        "unix://${PRIVATE_RSYSLOG_UNIX_SOCK}" \
+        "${tag}-unix" \
+        "$PRIVATE_RSYSLOG_UNIX_LOG"
+    deliver_to_private_rsyslogd \
+        "rsyslog-unixgram-marker" \
+        "unixgram://${PRIVATE_RSYSLOG_UNIXGRAM_SOCK}" \
+        "${tag}-unixgram" \
+        "$PRIVATE_RSYSLOG_UNIXGRAM_LOG"
 }

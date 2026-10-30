@@ -98,6 +98,14 @@ Once all the dependencies are installed:
 make
 ```
 
+The Splunk HEC log driver is enabled by default (Cargo feature `splunk`,
+which pulls in `ureq` / rustls). To build without it and without those
+HTTP dependencies:
+
+```shell
+cargo build --no-default-features
+```
+
 There is one option for installation, depending on your environment.
 Each can have the PREFIX overridden. The PREFIX defaults to `/usr/local`
 for most Linux distributions.

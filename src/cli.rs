@@ -1018,6 +1018,26 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "splunk")]
+    #[test]
+    fn log_driver_splunk_is_accepted() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["splunk".into()],
+            log_driver_opts: vec![
+                (
+                    "splunk-url".into(),
+                    "https://splunk.example:8088/services/collector/event".into(),
+                ),
+                ("splunk-token".into(), "secret".into()),
+            ],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries[0].0, "splunk");
+        assert_eq!(entries[0].1.log_driver_opts.len(), 2);
+        Ok(())
+    }
+
     #[test]
     fn log_driver_syslog_is_accepted() -> ConmonResult<()> {
         let o = Opts {
@@ -1027,6 +1047,36 @@ mod tests {
         let entries = determine_log_driver(&o)?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "syslog");
+        Ok(())
+    }
+
+    #[test]
+    fn log_driver_syslog_carries_remote_opts() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["syslog".into()],
+            log_driver_opts: vec![
+                ("syslog-address".into(), "tcp://localhost:1514".into()),
+                ("syslog-facility".into(), "local0".into()),
+            ],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries[0].0, "syslog");
+        assert_eq!(entries[0].1.log_driver_opts.len(), 2);
+        assert!(
+            entries[0]
+                .1
+                .log_driver_opts
+                .iter()
+                .any(|(k, v)| k == "syslog-address" && v == "tcp://localhost:1514")
+        );
+        assert!(
+            entries[0]
+                .1
+                .log_driver_opts
+                .iter()
+                .any(|(k, v)| k == "syslog-facility" && v == "local0")
+        );
         Ok(())
     }
 

@@ -44,7 +44,13 @@ finish:
 /e2e:
     summary: End-to-end tests
     discover+:
-        test: /e2e
+        # Anchor so /e2e does not also select /e2e-splunk.
+        test: e2e$
+
+/e2e-splunk:
+    summary: Real Splunk Enterprise HEC e2e (manual Packit job)
+    discover+:
+        test: e2e-splunk$
 
 /podman:
     summary: Podman system tests
