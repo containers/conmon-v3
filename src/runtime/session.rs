@@ -1,5 +1,5 @@
 use std::os::fd::AsRawFd;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
 
 use log::{debug, error, info};
@@ -103,8 +103,8 @@ pub struct RuntimeSession {
     /// The exit status of container, or `None` until known.
     container_status: Option<i32>,
 
-    // Time (unix timestamp) after which the session should terminate
-    timeout: u64,
+    // Time after which the session should terminate (--timeout).
+    timeout: Option<Instant>,
 
     // True if timeout occured.
     timed_out: bool,
@@ -372,11 +372,11 @@ impl RuntimeSession {
 
         // Set the timeout if --timeout is used (already validated as > 0 seconds).
         if let Some(t) = common.timeout {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            self.timeout = now
-                .as_secs()
-                .checked_add(t)
-                .ok_or_else(|| ConmonError::new("Timeout overflow", 1))?;
+            self.timeout = Some(
+                Instant::now()
+                    .checked_add(Duration::from_secs(t))
+                    .ok_or_else(|| ConmonError::new("Timeout overflow", 1))?,
+            );
         }
 
         // Generate the list of arguments for runtime.
@@ -830,8 +830,7 @@ impl RuntimeSession {
         }
 
         // Stop the event-loop if we reach a timeout.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        if self.timeout > 0 && now.as_secs() > self.timeout {
+        if self.timeout.is_some_and(|t| Instant::now() >= t) {
             info!("Timed out - exiting event-loop.");
             // Kill the container in case it exists.
             if let Some(raw_pid) = self.container_pid {
@@ -899,6 +898,7 @@ impl RuntimeSession {
                 stdin_attached,
                 leave_stdin_open,
                 signal_fd,
+                self.timeout,
                 |signals| self.idle_callback(signals),
             )?;
             self.finalize_container_exit()?;
@@ -1110,7 +1110,7 @@ mod tests {
             mainfd_stderr: Some(stderr_r),
             container_started: true,
             container_status: Some(0),
-            timeout: 0,
+            timeout: None,
             timed_out: true,
             exit_code: Some(1),
             ..Default::default()

@@ -376,6 +376,8 @@ fn on_peer_read_eof(
 /// * `ctl_fifo` - Remote socket for `ctl` fifo.
 /// * `winsz_fifo` - Remote socket for `winsz` fifo.
 /// * `leave_stdin_open` - Whether to keep stdin open attach client disconnects.
+/// * `deadline` - time after which `idle_callback` is called on every iteration,
+///   even if the event-loop is never idle.
 /// * `idle_callback` - function executed periodically during the event-loop.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_stdio<F>(
@@ -393,6 +395,7 @@ pub fn handle_stdio<F>(
     stdin_attached: bool,
     leave_stdin_open: bool,
     signal_fd: Option<SignalFd>,
+    deadline: Option<Instant>,
     mut idle_callback: F,
 ) -> ConmonResult<()>
 where
@@ -465,6 +468,15 @@ where
         // Re-arm before building the poll set so a due deadline is honored even
         // when another fd keeps returning events (never idle).
         resume_paused_terminals(&mut sockets, &mut terminal_hup_resume_at);
+
+        // The idle function is normally only called when no fd has events,
+        // which never happens if, e.g., the container writes to stdout
+        // continuously. Call it once the deadline (--timeout) is reached,
+        // so the container is killed on time.
+        if deadline.is_some_and(|d| Instant::now() >= d) && !idle_callback(None)? {
+            info!("idle_callback stopped the event loop after deadline.");
+            return Ok(());
+        }
 
         // Build the poll set each iteration by borrowing the fds owned by
         // `sockets`. Read-closed remotes (including HUP-paused terminals) are
@@ -946,6 +958,58 @@ mod tests {
             Socket::Remote(t) => assert!(!t.read_closed, "deadline arrival must re-arm"),
             _ => panic!("expected terminal"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_is_honored_when_never_idle() -> ConmonResult<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (stdout_r, stdout_w) = create_pipe()?;
+        let (stderr_r, _stderr_w) = create_pipe()?;
+
+        // Keep stdout busy (like `yes` in a container) so poll never times out.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let start = Instant::now();
+                while !stop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(5) {
+                    let _ = nix::unistd::write(stdout_w.as_fd(), b"y\n");
+                }
+            })
+        };
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let mut log = crate::logging::none_logger::NoneLogger;
+        handle_stdio(
+            &mut log,
+            Some(stdout_r),
+            stderr_r,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            Some(deadline),
+            |_| Ok(Instant::now() < deadline),
+        )?;
+        let elapsed = start.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "event loop ignored the deadline, ran for {elapsed:?}"
+        );
         Ok(())
     }
 }
