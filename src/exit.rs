@@ -294,6 +294,21 @@ impl OpenFilesSnapshot {
             self.open_fds.remove(pos);
         }
     }
+
+    /// Close the descriptors from the snapshot that are in `[3, limit)`, and
+    /// remove them from it, so that [`close_all_except_stdio`] does not close
+    /// whatever reuses their numbers later.
+    pub fn close_below(&mut self, limit: RawFd) {
+        self.open_fds.retain(|&fd| {
+            if (3..limit).contains(&fd) {
+                info!("Closing {}", fd);
+                // Best-effort, as in close_all_except_stdio.
+                let _ = unsafe { close(fd) };
+                return false;
+            }
+            true
+        });
+    }
 }
 
 pub fn snapshot_open_fds() -> OpenFilesSnapshot {

@@ -1,4 +1,4 @@
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 use std::{fs, os::fd::OwnedFd, path::PathBuf, process::Stdio};
 
@@ -25,7 +25,7 @@ use crate::{
     runtime::{
         args::{RuntimeArgsGenerator, generate_runtime_args},
         ctl::{setup_console_fifo, setup_terminal_control_fifo},
-        process::{ProcessStatus, RuntimeProcess},
+        process::{ProcessStatus, RuntimeProcess, runtime_fd_count},
         stdio::{create_pipe, handle_stdio, read_pipe, receive_console_fd},
     },
     unix_socket::{RemoteSocket, SocketType, UnixSocket},
@@ -234,6 +234,37 @@ impl RuntimeSession {
         result
     }
 
+    /// Close the descriptors passed to the runtime, now that it has them.
+    ///
+    /// Otherwise conmon keeps them open for as long as the container runs, and
+    /// whoever is on the other end does not see EOF when the container closes
+    /// its copy. This is what conmon v2 does since containers/conmon#703, with
+    /// the fixes from containers/conmon#711.
+    ///
+    /// The descriptors for the runtime start at fd 3, and the caller passes
+    /// conmon's own pipes (`own_fds`) after them, so nothing from the first of
+    /// those on is closed: it is either used by conmon itself or not ours to
+    /// close (such as the ports podman reserves for the container).
+    fn close_runtime_fds(&mut self, common: &CommonCfg, own_fds: &[RawFd]) -> ConmonResult<()> {
+        let nfds = runtime_fd_count(&common.runtime_opts, common.replace_listen_pid)?;
+        let limit = own_fds
+            .iter()
+            .copied()
+            .filter(|&fd| fd > 2)
+            .fold(nfds.saturating_add(3), RawFd::min);
+        self.open_files.close_below(limit);
+
+        // The runtime already got these; do not pass them on any further
+        // (e.g. to the exit command).
+        // SAFETY: conmon is single-threaded here.
+        unsafe {
+            std::env::remove_var("LISTEN_FDS");
+            std::env::remove_var("LISTEN_PID");
+            std::env::remove_var("LISTEN_FDNAMES");
+        }
+        Ok(())
+    }
+
     /// Prepare pipes/sockets and spawn the OCI runtime; wait for the console fd
     /// when `--terminal` is set.
     fn spawn_runtime(
@@ -246,10 +277,15 @@ impl RuntimeSession {
         // or the runtime error message later.
         self.sync_pipe_fd = get_pipe_fd_from_env("_OCI_SYNCPIPE")?;
 
+        // Descriptor numbers of conmon's own pipes passed by the caller,
+        // used by close_runtime_fds.
+        let mut own_fds = Vec::new();
+
         // If we have some sync_pipe fd, we need to remove it from `open_files` snapshot,
         // otherwise we would close this fd prematurely before exit.
         if let Some(fd) = &self.sync_pipe_fd {
             self.open_files.remove(fd.as_raw_fd());
+            own_fds.push(fd.as_raw_fd());
         }
 
         // Get the attach pipe FD. We use it later to inform parent that attach
@@ -269,6 +305,7 @@ impl RuntimeSession {
         // otherwise we would close this fd prematurely before exit.
         if let Some(fd) = &attach_pipe_fd {
             self.open_files.remove(fd.as_raw_fd());
+            own_fds.push(fd.as_raw_fd());
         }
 
         // If logging is not passthrough, we will create attach UNIX socket and other
@@ -311,6 +348,7 @@ impl RuntimeSession {
         let mut start_pipe_fd = get_pipe_fd_from_env("_OCI_STARTPIPE")?;
         if let Some(fd) = &start_pipe_fd {
             self.open_files.remove(fd.as_raw_fd());
+            own_fds.push(fd.as_raw_fd());
         }
 
         if let Some(fd) = start_pipe_fd.take() {
@@ -440,6 +478,8 @@ impl RuntimeSession {
             !common.sync_flag,
             &common.conmon_pidfile,
         )?;
+
+        self.close_runtime_fds(common, &own_fds)?;
 
         // Setup the signal-fd for the signals we want to handle.
         let mut mask = SigSet::empty();
