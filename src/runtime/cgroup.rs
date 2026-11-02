@@ -8,7 +8,7 @@ use nix::sys::stat::Mode;
 use nix::sys::statfs;
 use nix::unistd::close;
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -57,61 +57,35 @@ pub fn setup_oom_handling(
 ///
 /// * Absolut path to cgroup directory.
 fn process_cgroup_subsystem_path(pid: i32) -> ConmonResult<PathBuf> {
-    // Open the /proc/`pid`/cgroup file.
+    // Read the /proc/`pid`/cgroup file.
     let cgroups_file_path = format!("/proc/{pid}/cgroup");
-    let file = match File::open(&cgroups_file_path) {
-        Ok(f) => f,
+    let content = match fs::read_to_string(&cgroups_file_path) {
+        Ok(c) => c,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Ok(PathBuf::from(""));
         }
         Err(e) => {
             return Err(ConmonError::new(
-                format!("Failed to open cgroups file {}: {}", cgroups_file_path, e),
+                format!("Failed to read cgroups file {}: {}", cgroups_file_path, e),
                 1,
             ));
         }
     };
 
-    // Parse the cgroup file.
-    let reader = BufReader::new(file);
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    let Some(path) = cgroup2_path_from(&content) else {
+        warn!("No cgroup v2 entry found in {cgroups_file_path}");
+        return Ok(PathBuf::new());
+    };
+    // The path is absolute inside the cgroup root, e.g. "/user.slice/...".
+    Ok(Path::new(CGROUP_ROOT).join(path.trim_start_matches('/')))
+}
 
-        // Format: hierarchy-ID:controllers:path
-        let path_part = match line.split_once(':') {
-            Some((_, rest)) => match rest.split_once(':') {
-                Some((_, path)) => path,
-                None => {
-                    return Err(ConmonError::new(
-                        format!("Error parsing cgroup, second ':' not found: {}", line),
-                        1,
-                    ));
-                }
-            },
-            None => {
-                return Err(ConmonError::new(
-                    format!("Error parsing cgroup, ':' not found: {}", line),
-                    1,
-                ));
-            }
-        };
-
-        let mut path = path_part.trim_end_matches('\n');
-
-        // v2: path is directly under CGROUP_ROOT
-        let mut full = PathBuf::from(CGROUP_ROOT);
-        // path from /proc is absolute inside cgroup root, e.g. "/user.slice/..."
-        if path.starts_with('/') {
-            path = &path[1..];
-        }
-        full.push(path);
-        return Ok(full);
-    }
-
-    Err(ConmonError::new("Error parsing cgroup file", 1))
+/// Returns the cgroup v2 path from the contents of a /proc/[pid]/cgroup file,
+/// or `None` if there is no cgroup v2 entry in it.
+fn cgroup2_path_from(content: &str) -> Option<&str> {
+    // The cgroup v2 entry is "0::/path". Any other entries are for cgroup v1
+    // hierarchies (e.g. "1:net_cls:/"), which may be mounted alongside v2.
+    content.lines().find_map(|l| l.strip_prefix("0::"))
 }
 
 /// Sets up OOM (out-of-memory) handling for `pid` .
@@ -324,4 +298,30 @@ fn create_oom_file(base_path: &Path) -> Result<(), ()> {
 
     let _ = close(fd);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgroup2_path_from_v2_only() {
+        assert_eq!(
+            cgroup2_path_from("0::/user.slice/ctr\n"),
+            Some("/user.slice/ctr")
+        );
+        assert_eq!(cgroup2_path_from("0::/\n"), Some("/"));
+    }
+
+    #[test]
+    fn cgroup2_path_from_skips_v1_entries() {
+        let content = "2:name=zdtmtst:/\n1:net_cls:/\n0::/system.slice/ctr\n";
+        assert_eq!(cgroup2_path_from(content), Some("/system.slice/ctr"));
+    }
+
+    #[test]
+    fn cgroup2_path_from_no_v2_entry() {
+        assert_eq!(cgroup2_path_from(""), None);
+        assert_eq!(cgroup2_path_from("1:net_cls:/\n1:name=systemd:/x\n"), None);
+    }
 }
