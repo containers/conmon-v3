@@ -38,8 +38,14 @@ pub fn setup_oom_handling(
     unsafe {
         let stat = statfs::statfs("/sys/fs/cgroup")?;
         if stat.filesystem_type() == statfs::CGROUP2_SUPER_MAGIC {
-            let s = setup_oom_handling_cgroup_v2(pid, persist_dir, bundle)?;
-            return Ok(s);
+            // Not being able to detect OOM is not a reason to fail the container.
+            return match setup_oom_handling_cgroup_v2(pid, persist_dir, bundle) {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    warn!("Failed to set up OOM handling: {}", e.msg);
+                    Ok(None)
+                }
+            };
         }
 
         Err(ConmonError::new("Cgroups v1 is not supported.", 1))
@@ -123,11 +129,15 @@ unsafe fn setup_oom_handling_cgroup_v2(
     let ifd_owned = unsafe { OwnedFd::from_raw_fd(ifd) };
     let cstr = CString::new(memory_events_file_path.to_string_lossy().as_bytes()).unwrap();
     if unsafe { libc::inotify_add_watch(ifd, cstr.as_ptr(), libc::IN_MODIFY) } < 0 {
+        let err = Errno::last();
+        let path = memory_events_file_path.display();
+        if err == Errno::ENOENT {
+            // E.g. the memory controller is not enabled for the cgroup.
+            debug!("{path} does not exist, skipping OOM monitoring");
+            return Ok(None);
+        }
         return Err(ConmonError::new(
-            format!(
-                "Failed to add inotify watch for: {}",
-                memory_events_file_path.to_string_lossy()
-            ),
+            format!("Failed to add inotify watch for {path}: {err}"),
             1,
         ));
     }
@@ -323,5 +333,22 @@ mod tests {
     fn cgroup2_path_from_no_v2_entry() {
         assert_eq!(cgroup2_path_from(""), None);
         assert_eq!(cgroup2_path_from("1:net_cls:/\n1:name=systemd:/x\n"), None);
+    }
+
+    #[test]
+    fn setup_oom_handling_skips_missing_memory_events() -> ConmonResult<()> {
+        // kthreadd (pid 2) is in the root cgroup, which has no memory.events.
+        // Skip if this is not the case (e.g. in a pid namespace).
+        match std::fs::read_to_string("/proc/2/cgroup") {
+            Ok(s) if s == "0::/\n" => {}
+            _ => return Ok(()),
+        }
+        if Path::new("/sys/fs/cgroup/memory.events").exists() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let socket = unsafe { setup_oom_handling_cgroup_v2(2, &None, dir.path())? };
+        assert!(socket.is_none());
+        Ok(())
     }
 }
