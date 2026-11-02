@@ -92,6 +92,28 @@ teardown() {
     assert_json "${output}" =~ "\"pid\": $CONTAINER_PID"
 }
 
+@test "runtime: --replace-listen-pid passes LISTEN_FDS to the container" {
+    # conmon sets LISTEN_PID to the runtime's pid, so the runtime takes
+    # LISTEN_FDS and passes the fds to the container. This used to hang
+    # in conmon, between fork and exec of the runtime.
+    setup_container_env "sleep 30"
+    touch "$TEST_TMPDIR/listen"
+    start_oci_sync_pipe_reader
+    LISTEN_FDS=1 LISTEN_PID=1 start_conmon_with_default_args \
+        --replace-listen-pid \
+        --log-path "k8s-file:$LOG_PATH" \
+        3<"$TEST_TMPDIR/listen" 6>"$OCI_SYNCPIPE_PATH"
+
+    # Check that the pid is sent to the sync pipe.
+    wait_for_syncpipe_output 1
+    run cat "$TEST_TMPDIR/syncpipe-output"
+    CONTAINER_PID=$(cat "$CONTAINER_PIDFILE")
+    assert_json "${output}" =~ "\"pid\": $CONTAINER_PID"
+
+    run readlink /proc/"$CONTAINER_PID"/fd/3
+    assert "$output" == "$TEST_TMPDIR/listen" "the container gets the LISTEN_FDS fd"
+}
+
 @test "runtime: runc error with _OCI_SYNCPIPE defined" {
     if [[ $(basename "$RUNTIME_BINARY") != "runc" ]]; then
         skip "test requires runc"

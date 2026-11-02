@@ -5,6 +5,7 @@ use crate::runtime::stdio::read_pipe;
 use log::{info, warn};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
+use nix::libc;
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::stat::Mode;
@@ -13,7 +14,7 @@ use nix::unistd::{
     ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, getpid, getppid, setsid,
 };
 
-use std::env;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::os::fd::{AsFd, OwnedFd};
@@ -113,27 +114,42 @@ fn redirect_self_to_devnull() -> ConmonResult<()> {
     Ok(())
 }
 
-/// Helper function to replace LISTEN_PID with the proper afterk-fork PID.
+/// Helper function to replace LISTEN_PID with the proper after-fork PID.
+///
+/// This runs in the runtime child, between fork and exec, so it must not use
+/// [`std::env::var`] or [`std::env::set_var`]: [`Command::spawn`] holds a read lock on
+/// the environment across the fork, and `set_var` taking the write lock in the
+/// child would wait for it forever. Use libc's `getenv` and `setenv` instead,
+/// which is safe as conmon is single-threaded. As the runtime command has no
+/// environment changes of its own, it is executed with `environ`, so it sees
+/// the new value.
 fn update_listen_pid(replace_listen_pid: bool) {
-    // If LISTEN_PID env is set, we may need to update it to the new child process
-    if let Ok(listenpid) = env::var("LISTEN_PID") {
-        // Try to parse LISTEN_PID as an integer
-        let lpid: i32 = match listenpid.parse() {
-            Ok(v) if v > 0 => v,
-            _ => {
-                warn!("Invalid LISTEN_PID {}", listenpid);
-                return;
-            }
-        };
+    let name = c"LISTEN_PID";
+    // SAFETY: name is NUL-terminated, and the result is used before the
+    // environment is modified.
+    let value = unsafe { libc::getenv(name.as_ptr()) };
+    if value.is_null() {
+        return;
+    }
+    // SAFETY: getenv returns a NUL-terminated string.
+    let listenpid = unsafe { CStr::from_ptr(value) };
 
-        let parent_pid = getppid().as_raw();
-
-        // If we should replace it, or it matches the parent PID, set it to our PID
-        if replace_listen_pid || lpid == parent_pid {
-            let pid = getpid().as_raw();
-            let pidstr = pid.to_string();
-            unsafe { env::set_var("LISTEN_PID", &pidstr) };
+    // Try to parse LISTEN_PID as an integer
+    let lpid = match listenpid.to_str().map(str::parse::<i32>) {
+        Ok(Ok(v)) if v > 0 => v,
+        _ => {
+            warn!("Invalid LISTEN_PID {:?}", listenpid);
+            return;
         }
+    };
+
+    let parent_pid = getppid().as_raw();
+
+    // If we should replace it, or it matches the parent PID, set it to our PID
+    if replace_listen_pid || lpid == parent_pid {
+        let pidstr = CString::new(getpid().as_raw().to_string()).expect("pid has no NUL");
+        // SAFETY: both strings are NUL-terminated, and conmon is single-threaded.
+        unsafe { libc::setenv(name.as_ptr(), pidstr.as_ptr(), 1) };
     }
 }
 
