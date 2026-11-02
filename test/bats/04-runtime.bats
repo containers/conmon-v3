@@ -114,6 +114,21 @@ teardown() {
     assert "$output" == "$TEST_TMPDIR/listen" "the container gets the LISTEN_FDS fd"
 }
 
+@test "runtime: conmon --sync exits cleanly" {
+    # conmon used to close, on exit, the fd it had used to read the list of
+    # its open fds at startup, the number of which was reused by then (for
+    # the log file), making a debug build abort on closing that file.
+    setup_container_env "sleep 30"
+    generate_process_spec "echo hello"
+    start_conmon_with_default_args --log-path "k8s-file:$LOG_PATH"
+    wait_for_runtime_status "$CTR_ID" running
+
+    # With --sync, conmon does not daemonize, so its exit status is seen.
+    _run_conmon --sync --log-path "k8s-file:$LOG_PATH.exec" \
+        --exec --exec-process-spec "$BUNDLE_PATH/process.json"
+    assert_success
+}
+
 @test "runtime: runc error with _OCI_SYNCPIPE defined" {
     if [[ $(basename "$RUNTIME_BINARY") != "runc" ]]; then
         skip "test requires runc"

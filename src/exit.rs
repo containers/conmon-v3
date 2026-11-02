@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use nix::libc::{_exit, PR_SET_CHILD_SUBREAPER, close, prctl};
+use nix::libc::{_exit, F_GETFD, PR_SET_CHILD_SUBREAPER, close, fcntl, prctl};
 
 /// Exit status used if systemd SIGTERMs us during `--exit-command` teardown.
 /// Must only be read/written from the main thread or the teardown signal handler.
@@ -305,16 +305,18 @@ pub fn snapshot_open_fds() -> OpenFilesSnapshot {
     };
 
     // Read the number of open fds.
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with('.') {
-            continue;
+    let fds: Vec<RawFd> = dir
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect();
+
+    // The list includes the fd used to read the directory, which is closed
+    // by now, and its number is to be reused by whatever conmon opens next.
+    // Only keep the fds which are still open.
+    for fd in fds {
+        if unsafe { fcntl(fd, F_GETFD) } != -1 {
+            snap.mark(fd);
         }
-        let Ok(fd) = name.parse::<RawFd>() else {
-            continue;
-        };
-        snap.mark(fd);
     }
 
     snap
