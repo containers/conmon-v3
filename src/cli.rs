@@ -218,14 +218,6 @@ pub struct Opts {
     #[arg(long = "full-attach", action = ArgAction::SetTrue)]
     pub full_attach: bool,
 
-    /// Path to the socket where the seccomp notification fd is received
-    #[arg(long = "seccomp-notify-socket")]
-    pub seccomp_notify_socket: Option<PathBuf>,
-
-    /// Plugins to use for managing the seccomp notifications
-    #[arg(long = "seccomp-notify-plugins")]
-    pub seccomp_notify_plugins: Option<String>,
-
     /// Enable log rotation instead of truncation when log-size-max is reached
     #[arg(long = "log-rotate", action = ArgAction::SetTrue, default_value_t = false)]
     pub log_rotate: bool,

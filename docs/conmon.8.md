@@ -106,16 +106,6 @@ once.
 : Path to the host's systemd sd-notify socket. When set, conmon relays
   sd-notify messages from the container to this socket.
 
-**--seccomp-notify-socket**=_PATH_
-
-: Path to the socket on which the seccomp notification file descriptor is
-  received.
-
-**--seccomp-notify-plugins**=_STRING_
-
-: Comma-separated list or specification of plugins that manage seccomp
-  notifications. The exact semantics are defined by the configured plugins.
-
 **--timeout**, **-T**=_SECONDS_
 
 : Kill the container after the specified timeout in seconds. If unset or **0**,
