@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use nix::libc::{_exit, PR_SET_CHILD_SUBREAPER, close, prctl};
+use nix::libc::{_exit, F_GETFD, PR_SET_CHILD_SUBREAPER, close, fcntl, prctl};
 
 /// Exit status used if systemd SIGTERMs us during `--exit-command` teardown.
 /// Must only be read/written from the main thread or the teardown signal handler.
@@ -294,6 +294,21 @@ impl OpenFilesSnapshot {
             self.open_fds.remove(pos);
         }
     }
+
+    /// Close the descriptors from the snapshot that are in `[3, limit)`, and
+    /// remove them from it, so that [`close_all_except_stdio`] does not close
+    /// whatever reuses their numbers later.
+    pub fn close_below(&mut self, limit: RawFd) {
+        self.open_fds.retain(|&fd| {
+            if (3..limit).contains(&fd) {
+                info!("Closing {}", fd);
+                // Best-effort, as in close_all_except_stdio.
+                let _ = unsafe { close(fd) };
+                return false;
+            }
+            true
+        });
+    }
 }
 
 pub fn snapshot_open_fds() -> OpenFilesSnapshot {
@@ -305,16 +320,18 @@ pub fn snapshot_open_fds() -> OpenFilesSnapshot {
     };
 
     // Read the number of open fds.
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with('.') {
-            continue;
+    let fds: Vec<RawFd> = dir
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect();
+
+    // The list includes the fd used to read the directory, which is closed
+    // by now, and its number is to be reused by whatever conmon opens next.
+    // Only keep the fds which are still open.
+    for fd in fds {
+        if unsafe { fcntl(fd, F_GETFD) } != -1 {
+            snap.mark(fd);
         }
-        let Ok(fd) = name.parse::<RawFd>() else {
-            continue;
-        };
-        snap.mark(fd);
     }
 
     snap
