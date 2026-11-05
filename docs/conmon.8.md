@@ -247,6 +247,36 @@ once.
   pid, then the line and a trailing newline. Those sockets have no
   octet-count prefix.
 
+**--log-mode**=_MODE_
+
+: How container output is delivered to every configured driver.
+  `blocking` (the default) waits for each driver, so a slow or stuck driver
+  can stall the container. `non-blocking` lets the container keep running
+  and holds output in memory, up to **--log-max-buffer-size**. Once that
+  buffer is full, further output is dropped and delivery is not guaranteed.
+  conmon warns when output is dropped. The drivers share one buffer, so a
+  slow driver can delay the others. Output already accepted is sent before
+  conmon exits. A driver error does not stop the container.
+
+**--log-max-buffer-size**=_SIZE_
+
+: Queue limit for **--log-mode** `non-blocking`. Default **1m**
+  (1,000,000 bytes). `k`/`m`/`g` are decimal; `KiB`/`MiB`/`GiB` are binary.
+  Valid only together with **--log-mode** `non-blocking`.
+
+  Example:
+
+      conmon ... --log-driver syslog \
+          --log-mode non-blocking \
+          --log-max-buffer-size 4m \
+          --log-driver-opt syslog-address=tcp://logs.example:514
+
+      conmon ... --log-driver splunk \
+          --log-mode non-blocking \
+          --log-max-buffer-size 4m \
+          --log-driver-opt splunk-url=https://splunk.example:8088/services/collector/event \
+          --log-driver-opt splunk-token=HEC_TOKEN
+
 **Splunk HEC**
 
 : Available when built with Cargo feature `splunk` (default). Sends one
@@ -264,8 +294,9 @@ once.
   `code` ≠ 0, and responses over 64 KiB do not retry. After a failed
   line, remaining complete lines in that write are dropped; a partial
   stays buffered. Logging failure does not stop the container.
-  Not implemented vs Docker: queues, batching, gzip, `json`/`raw`,
-  custom CA, indexer ack, disk buffering.
+  Not implemented vs Docker: batching, gzip, `json`/`raw`, custom CA,
+  indexer ack, disk buffering. Optional non-blocking delivery is
+  **--log-mode** `non-blocking`, not a Splunk-specific queue.
 
   Example:
 

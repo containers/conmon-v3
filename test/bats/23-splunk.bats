@@ -111,6 +111,21 @@ PY
         --log-driver-opt splunk-token=test-token
 }
 
+@test "splunk: non-blocking mode still delivers to the HEC endpoint" {
+    setup_container_env "echo splunk-nb"
+    start_hec ok
+    run_conmon_with_default_args \
+        --log-driver splunk \
+        --log-mode non-blocking \
+        --log-max-buffer-size 1m \
+        --log-driver-opt "splunk-url=http://127.0.0.1:${HEC_PORT}/services/collector/event" \
+        --log-driver-opt splunk-token=test-token
+
+    local log
+    log=$(cat "$HEC_LOG")
+    [[ "$log" == *'"line":"splunk-nb"'* ]]
+}
+
 @test "splunk: HTTP 500 does not stop the container" {
     setup_container_env "echo still-ran"
     start_hec fail

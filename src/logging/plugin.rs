@@ -5,14 +5,22 @@ use crate::logging::splunk_logger::SplunkLogger;
 use crate::{
     error::{ConmonError, ConmonResult},
     logging::{
-        file_logger::FileLogger, journald_logger::JournaldLogger, none_logger::NoneLogger,
-        syslog_logger::SyslogLogger,
+        file_logger::FileLogger, journald_logger::JournaldLogger, non_blocking::DeliveryMode,
+        none_logger::NoneLogger, syslog_logger::SyslogLogger,
     },
 };
 
 pub trait LogPlugin {
     fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()>;
     fn reopen(&mut self) -> ConmonResult<()>;
+
+    /// Finish accepted work and release background resources.
+    ///
+    /// Blocking drivers have nothing to stop. The non-blocking wrapper joins
+    /// its worker here; callers must not rely on `Drop` alone.
+    fn shutdown(&mut self) -> ConmonResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -184,8 +192,12 @@ impl LogPlugin for MultiLogPlugin {
 /// Initializes one or more log plugins from (name, cfg) entries.
 /// If there is exactly one entry, returns that plugin directly; otherwise
 /// returns a MultiLogPlugin that fans out to all of them.
+///
+/// `delivery` applies to the whole set. Non-blocking mode wraps that set in
+/// one shared queue.
 pub fn initialize_log_plugins(
     entries: &[(String, LogPluginCfg)],
+    delivery: DeliveryMode,
 ) -> ConmonResult<Box<dyn LogPlugin>> {
     if entries.is_empty() {
         return Err(ConmonError::new("No log plugin entries provided", 1));
@@ -194,17 +206,23 @@ pub fn initialize_log_plugins(
     for (name, cfg) in entries {
         plugins.push(LogDriverKind::parse(name)?.open(cfg)?);
     }
-    if plugins.len() == 1 {
-        Ok(Box::new(plugins.into_iter().next().unwrap()))
+    let plugin: Box<dyn LogPlugin + Send> = if plugins.len() == 1 {
+        Box::new(plugins.into_iter().next().unwrap())
     } else {
-        Ok(Box::new(MultiLogPlugin::new(plugins)))
+        Box::new(MultiLogPlugin::new(plugins))
+    };
+    match delivery {
+        DeliveryMode::Blocking => Ok(plugin),
+        DeliveryMode::NonBlocking { max_buffer_size } => Ok(Box::new(
+            crate::logging::non_blocking::NonBlockingLogPlugin::start(plugin, max_buffer_size)?,
+        )),
     }
 }
 
 /// Thin wrapper for a single (name, cfg) pair; delegates to initialize_log_plugins.
 pub fn initialize_log_plugin(name: &str, cfg: &LogPluginCfg) -> ConmonResult<Box<dyn LogPlugin>> {
     let entries = [(name.to_string(), cfg.clone())];
-    initialize_log_plugins(&entries)
+    initialize_log_plugins(&entries, DeliveryMode::Blocking)
 }
 
 #[cfg(test)]
@@ -259,7 +277,7 @@ mod tests {
             ("passthrough".to_string(), cfg.clone()),
             ("none".to_string(), cfg),
         ];
-        let mut plugin = initialize_log_plugins(&entries)?;
+        let mut plugin = initialize_log_plugins(&entries, DeliveryMode::Blocking)?;
         plugin.write(true, b"hello")?;
         plugin.write(false, b"world")?;
         plugin.reopen()?;

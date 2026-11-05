@@ -5,7 +5,9 @@ use ::log::error;
 use ::log::info;
 use clap::Parser;
 use conmon::Cid;
-use conmon::cli::{Cmd, Opts, determine_cmd, resolve_log_plugins, validate_log_tag_locale};
+use conmon::cli::{
+    Cmd, Opts, determine_cmd, log_delivery_mode, resolve_log_plugins, validate_log_tag_locale,
+};
 use conmon::commands::create::Create;
 use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
@@ -103,7 +105,8 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     let plugin_entries = resolve_log_plugins(&opts)?;
     let plugin_names: Vec<&str> = plugin_entries.iter().map(|(n, _)| n.as_str()).collect();
     info!("Using log plugin(s): {:?}", plugin_names);
-    let mut log_plugin = initialize_log_plugins(&plugin_entries)?;
+    let delivery = log_delivery_mode(&opts)?;
+    let mut log_plugin = initialize_log_plugins(&plugin_entries, delivery)?;
 
     // logging_passthrough: only true when the sole plugin is passthrough.
     let logging_passthrough = plugin_entries.len() == 1 && plugin_entries[0].0 == "passthrough";
@@ -127,6 +130,11 @@ fn run_conmon(opts: Opts) -> ConmonResult<i32> {
     }
     if let Err(e) = log_plugin.write(false, no_data) {
         error!("failed to drain stderr log: {e}");
+    }
+    // Non-blocking mode drains the queue and joins the worker. Blocking mode
+    // is a no-op. Drop is not the shutdown path.
+    if let Err(e) = log_plugin.shutdown() {
+        error!("failed to shut down log delivery: {e}");
     }
 
     // Return the exit code from subcommand execution.

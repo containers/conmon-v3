@@ -1,5 +1,6 @@
 pub mod file_logger;
 pub mod journald_logger;
+pub mod non_blocking;
 pub mod none_logger;
 pub mod plugin;
 #[cfg(feature = "splunk")]

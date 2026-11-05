@@ -64,6 +64,39 @@ pub fn next_stdio_line(
     Some(line)
 }
 
+/// Parse a byte size. `k`/`m`/`g` are decimal (1000). `KiB`/`MiB`/`GiB` (and
+/// `ki`/`mi`/`gi`) are binary (1024). A bare number, `b`, or `B` is a byte
+/// count. Zero, a negative, and a value that overflows `usize` are rejected.
+pub fn parse_byte_size(raw: &str) -> Option<usize> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('-') {
+        return None;
+    }
+    let split = raw
+        .char_indices()
+        .find(|(_, ch)| ch.is_ascii_alphabetic())
+        .map(|(i, _)| i)
+        .unwrap_or(raw.len());
+    let (number, suffix) = raw.split_at(split);
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let count: u64 = number.parse().ok()?;
+    let factor: u64 = match suffix {
+        "" | "b" | "B" => 1,
+        "k" | "K" | "kb" | "KB" => 1_000,
+        "m" | "M" | "mb" | "MB" => 1_000_000,
+        "g" | "G" | "gb" | "GB" => 1_000_000_000,
+        "ki" | "Ki" | "kib" | "KiB" => 1024,
+        "mi" | "Mi" | "mib" | "MiB" => 1024 * 1024,
+        "gi" | "Gi" | "gib" | "GiB" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    let bytes = count.checked_mul(factor)?;
+    let bytes = usize::try_from(bytes).ok()?;
+    if bytes == 0 { None } else { Some(bytes) }
+}
+
 /// First 12 Unicode scalars of `s`, used as a short container id tag.
 pub fn truncate_cuuid(s: &str) -> &str {
     match s.char_indices().nth(12) {
@@ -89,6 +122,33 @@ mod tests {
         assert_eq!(strip_trailing_newlines(b"hi\n\n"), b"hi");
         assert_eq!(strip_trailing_newlines(b"\n\n"), b"");
         assert_eq!(strip_trailing_newlines(b"hi"), b"hi");
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_decimal_and_binary_units() {
+        for (raw, bytes) in [
+            ("100", 100usize),
+            ("2k", 2_000),
+            ("2KiB", 2048),
+            ("1m", 1_000_000),
+            ("1MiB", 1024 * 1024),
+            ("1g", 1_000_000_000),
+            ("1GiB", 1024 * 1024 * 1024),
+        ] {
+            assert_eq!(parse_byte_size(raw), Some(bytes), "{raw}");
+        }
+        for bad in [
+            "",
+            "0",
+            "0m",
+            "-1",
+            "-1m",
+            "nope",
+            "1.5m",
+            "99999999999999999999",
+        ] {
+            assert_eq!(parse_byte_size(bad), None, "{bad}");
+        }
     }
 
     #[test]
