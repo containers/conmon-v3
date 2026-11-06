@@ -5,6 +5,7 @@ use crate::runtime::stdio::read_pipe;
 use log::{info, warn};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
+use nix::libc;
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::stat::Mode;
@@ -13,10 +14,10 @@ use nix::unistd::{
     ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, getpid, getppid, setsid,
 };
 
-use std::env;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{Error, ErrorKind, Result as IoResult};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 // for pre_exec
@@ -113,28 +114,114 @@ fn redirect_self_to_devnull() -> ConmonResult<()> {
     Ok(())
 }
 
-/// Helper function to replace LISTEN_PID with the proper afterk-fork PID.
+/// Helper function to replace LISTEN_PID with the proper after-fork PID.
+///
+/// This runs in the runtime child, between fork and exec, so it must not use
+/// [`std::env::var`] or [`std::env::set_var`]: [`Command::spawn`] holds a read lock on
+/// the environment across the fork, and `set_var` taking the write lock in the
+/// child would wait for it forever. Use libc's `getenv` and `setenv` instead,
+/// which is safe as conmon is single-threaded. As the runtime command has no
+/// environment changes of its own, it is executed with `environ`, so it sees
+/// the new value.
 fn update_listen_pid(replace_listen_pid: bool) {
-    // If LISTEN_PID env is set, we may need to update it to the new child process
-    if let Ok(listenpid) = env::var("LISTEN_PID") {
-        // Try to parse LISTEN_PID as an integer
-        let lpid: i32 = match listenpid.parse() {
-            Ok(v) if v > 0 => v,
-            _ => {
-                warn!("Invalid LISTEN_PID {}", listenpid);
-                return;
-            }
-        };
+    let name = c"LISTEN_PID";
+    // SAFETY: name is NUL-terminated, and the result is used before the
+    // environment is modified.
+    let value = unsafe { libc::getenv(name.as_ptr()) };
+    if value.is_null() {
+        return;
+    }
+    // SAFETY: getenv returns a NUL-terminated string.
+    let listenpid = unsafe { CStr::from_ptr(value) };
 
-        let parent_pid = getppid().as_raw();
+    // Try to parse LISTEN_PID as an integer
+    let lpid = match listenpid.to_str().map(str::parse::<i32>) {
+        Ok(Ok(v)) if v > 0 => v,
+        _ => {
+            warn!("Invalid LISTEN_PID {:?}", listenpid);
+            return;
+        }
+    };
 
-        // If we should replace it, or it matches the parent PID, set it to our PID
-        if replace_listen_pid || lpid == parent_pid {
-            let pid = getpid().as_raw();
-            let pidstr = pid.to_string();
-            unsafe { env::set_var("LISTEN_PID", &pidstr) };
+    let parent_pid = getppid().as_raw();
+
+    // If we should replace it, or it matches the parent PID, set it to our PID
+    if replace_listen_pid || lpid == parent_pid {
+        let pidstr = CString::new(getpid().as_raw().to_string()).expect("pid has no NUL");
+        // SAFETY: both strings are NUL-terminated, and conmon is single-threaded.
+        unsafe { libc::setenv(name.as_ptr(), pidstr.as_ptr(), 1) };
+    }
+}
+
+/// Returns whether the runtime takes the `LISTEN_FDS` descriptors.
+///
+/// A runtime only takes them if `LISTEN_PID` is its own pid, which is only the
+/// case if [`update_listen_pid`] replaced it, i.e. if `replace_listen_pid` is
+/// set, or `LISTEN_PID` is the pid of the conmon process that spawned it
+/// (`conmon_pid`).
+fn runtime_takes_listen_fds(
+    listen_pid: Option<&str>,
+    replace_listen_pid: bool,
+    conmon_pid: i32,
+) -> bool {
+    match listen_pid.map(str::parse::<i32>) {
+        Some(Ok(lpid)) if lpid > 0 => replace_listen_pid || lpid == conmon_pid,
+        _ => false,
+    }
+}
+
+/// Parses a count of descriptors from `value` (named `name` in errors).
+fn parse_fd_count(value: &str, name: &str) -> ConmonResult<RawFd> {
+    value
+        .parse::<RawFd>()
+        .ok()
+        .filter(|n| (0..=RawFd::MAX - 3).contains(n))
+        .ok_or_else(|| ConmonError::new(format!("Invalid {name} {value:.10}"), 1))
+}
+
+/// Returns the number of descriptors (starting at fd 3) the runtime gets:
+/// the `--preserve-fds` value from `runtime_opts`, plus `listen_fds` if the
+/// runtime takes them (see [`runtime_takes_listen_fds`]).
+fn runtime_fd_count_with(
+    runtime_opts: &[String],
+    listen_fds: Option<&str>,
+    listen_pid: Option<&str>,
+    replace_listen_pid: bool,
+    conmon_pid: i32,
+) -> ConmonResult<RawFd> {
+    let mut preserved = 0;
+    let mut opts = runtime_opts.iter();
+    while let Some(opt) = opts.next() {
+        if opt == "--preserve-fds" {
+            let value = opts
+                .next()
+                .ok_or_else(|| ConmonError::new(format!("Missing value for {opt}"), 1))?;
+            preserved = parse_fd_count(value, "--preserve-fds")?;
+        } else if let Some(value) = opt.strip_prefix("--preserve-fds=") {
+            preserved = parse_fd_count(value, "--preserve-fds")?;
         }
     }
+
+    let mut listen = 0;
+    if let Some(value) = listen_fds
+        && runtime_takes_listen_fds(listen_pid, replace_listen_pid, conmon_pid)
+    {
+        listen = parse_fd_count(value, "LISTEN_FDS")?;
+    }
+
+    Ok(preserved.saturating_add(listen))
+}
+
+/// Returns the number of descriptors (starting at fd 3) passed to the runtime
+/// spawned by this process, see [`runtime_fd_count_with`].
+pub fn runtime_fd_count(runtime_opts: &[String], replace_listen_pid: bool) -> ConmonResult<RawFd> {
+    runtime_fd_count_with(
+        runtime_opts,
+        std::env::var("LISTEN_FDS").ok().as_deref(),
+        std::env::var("LISTEN_PID").ok().as_deref(),
+        replace_listen_pid,
+        getpid().as_raw(),
+    )
 }
 
 /// Represents single RuntimeProcess.
@@ -333,6 +420,54 @@ impl RuntimeProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn runtime_fd_count_parses_preserve_fds() -> ConmonResult<()> {
+        assert_eq!(runtime_fd_count_with(&[], None, None, false, 1)?, 0);
+        let o = opts(&["--foo", "--preserve-fds", "2", "--bar"]);
+        assert_eq!(runtime_fd_count_with(&o, None, None, false, 1)?, 2);
+        let o = opts(&["--preserve-fds=3"]);
+        assert_eq!(runtime_fd_count_with(&o, None, None, false, 1)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_fd_count_rejects_bad_preserve_fds() {
+        for o in [
+            opts(&["--preserve-fds"]),
+            opts(&["--preserve-fds", "x"]),
+            opts(&["--preserve-fds=-1"]),
+            opts(&["--preserve-fds=2147483647"]),
+        ] {
+            let res = runtime_fd_count_with(&o, None, None, false, 1);
+            assert!(res.is_err(), "{o:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_fd_count_counts_listen_fds_taken_by_runtime() -> ConmonResult<()> {
+        let o = opts(&["--preserve-fds=1"]);
+        // Conmon's pid is 42.
+        let count = |fds, pid, replace| runtime_fd_count_with(&o, fds, pid, replace, 42);
+        // LISTEN_PID is conmon's pid: the runtime takes LISTEN_FDS.
+        assert_eq!(count(Some("2"), Some("42"), false)?, 3);
+        // --replace-listen-pid: the runtime takes LISTEN_FDS.
+        assert_eq!(count(Some("2"), Some("1"), true)?, 3);
+        // LISTEN_PID is someone else's (podman's own LISTEN_FDS, which podman
+        // already counts in --preserve-fds): not taken.
+        assert_eq!(count(Some("2"), Some("1"), false)?, 1);
+        // No or invalid LISTEN_PID: not taken, even with --replace-listen-pid.
+        assert_eq!(count(Some("2"), None, true)?, 1);
+        assert_eq!(count(Some("2"), Some("x"), true)?, 1);
+        // Invalid LISTEN_FDS is only an error if the runtime takes it.
+        assert!(count(Some("x"), Some("42"), false).is_err());
+        assert_eq!(count(Some("x"), Some("1"), false)?, 1);
+        Ok(())
+    }
 
     #[test]
     fn state_from_proc_stat_parses_zombie() {

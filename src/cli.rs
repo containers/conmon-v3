@@ -218,14 +218,6 @@ pub struct Opts {
     #[arg(long = "full-attach", action = ArgAction::SetTrue)]
     pub full_attach: bool,
 
-    /// Path to the socket where the seccomp notification fd is received
-    #[arg(long = "seccomp-notify-socket")]
-    pub seccomp_notify_socket: Option<PathBuf>,
-
-    /// Plugins to use for managing the seccomp notifications
-    #[arg(long = "seccomp-notify-plugins")]
-    pub seccomp_notify_plugins: Option<String>,
-
     /// Enable log rotation instead of truncation when log-size-max is reached
     #[arg(long = "log-rotate", action = ArgAction::SetTrue, default_value_t = false)]
     pub log_rotate: bool,
@@ -1027,6 +1019,36 @@ mod tests {
         let entries = determine_log_driver(&o)?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "syslog");
+        Ok(())
+    }
+
+    #[test]
+    fn log_driver_syslog_carries_remote_opts() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["syslog".into()],
+            log_driver_opts: vec![
+                ("syslog-address".into(), "tcp://localhost:1514".into()),
+                ("syslog-facility".into(), "local0".into()),
+            ],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries[0].0, "syslog");
+        assert_eq!(entries[0].1.log_driver_opts.len(), 2);
+        assert!(
+            entries[0]
+                .1
+                .log_driver_opts
+                .iter()
+                .any(|(k, v)| k == "syslog-address" && v == "tcp://localhost:1514")
+        );
+        assert!(
+            entries[0]
+                .1
+                .log_driver_opts
+                .iter()
+                .any(|(k, v)| k == "syslog-facility" && v == "local0")
+        );
         Ok(())
     }
 

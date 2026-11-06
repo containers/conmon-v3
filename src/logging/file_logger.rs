@@ -429,15 +429,11 @@ impl FileLogger {
         // Validate path using secure validation
         self.secure_validate_log_path(&self.path)?;
 
-        // Shift: .N-1 -> .N, ...
-        let loop_start = if self.max_files > 1 {
-            self.max_files
-        } else {
-            2
-        };
+        // Shift: .N-1 -> .N, ..., .1 -> .2. With max_files == 1, there is
+        // nothing to shift: .1 is replaced by the current log file.
         let mut had_errors = false;
 
-        for i in (2..=loop_start).rev() {
+        for i in (2..=self.max_files).rev() {
             let from = PathBuf::from(format!("{}.{}", self.path.display(), i - 1));
             let to = PathBuf::from(format!("{}.{}", self.path.display(), i));
 
