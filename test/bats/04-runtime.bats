@@ -9,6 +9,9 @@ setup() {
 }
 
 teardown() {
+    if [[ -n "${CGROUP_V1_MOUNT:-}" ]]; then
+        umount "$CGROUP_V1_MOUNT"
+    fi
     cleanup_test_env
 }
 
@@ -91,6 +94,28 @@ teardown() {
     CONTAINER_PID=$(cat "$CONTAINER_PIDFILE")
     assert_json "${output}" =~ "\"pid\": $CONTAINER_PID"
 }
+
+@test "runtime: cgroup v1 hierarchies alongside cgroup v2 are ignored" {
+    if [[ $EUID -ne 0 ]]; then
+        skip "test requires root"
+    fi
+    if ! [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+        skip "test requires cgroup v2"
+    fi
+    # With a cgroup v1 hierarchy mounted (a named one, with no controllers,
+    # so it does not take any from cgroup v2), /proc/PID/cgroup has a v1
+    # entry ("N:name=...:/") before the cgroup v2 one ("0::/...").
+    local mnt="$TEST_TMPDIR/cgroup-v1"
+    mkdir "$mnt"
+    if ! mount -t cgroup -o none,name=conmon-test none "$mnt"; then
+        skip "can not mount a cgroup v1 hierarchy"
+    fi
+    CGROUP_V1_MOUNT=$mnt
+
+    setup_container_env "echo hello"
+    run_conmon_with_default_args --log-path "k8s-file:$LOG_PATH"
+    run cat "$LOG_PATH"
+    assert "${output}" =~ "hello" "'hello' found in the log"
 
 @test "runtime: --replace-listen-pid passes LISTEN_FDS to the container" {
     # conmon sets LISTEN_PID to the runtime's pid, so the runtime takes
