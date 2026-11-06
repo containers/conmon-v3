@@ -367,8 +367,8 @@ impl RuntimeProcess {
 
         // Restore the parent's mask after spawn. Signals stay blocked only in
         // the fork/exec window (child restores via pre_exec). Session::launch
-        // will block TERM/QUIT/INT again for signalfd; HUP must not stay stuck
-        // blocked for the rest of the process lifetime (conmon-v2 unblocks).
+        // will block TERM/QUIT/INT and SIGCHLD again for signalfd; HUP must not
+        // stay stuck blocked for the rest of the process lifetime (conmon-v2 unblocks).
         pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&oldmask), None).map_err(|e| {
             ConmonError::new(format!("Failed to restore signal mask after spawn: {e}"), 1)
         })?;

@@ -522,8 +522,10 @@ where
 
             if let Some(events) = revents[i] {
                 if events.contains(PollFlags::POLLIN) {
-                    // If the POLLIN comes from the signal fd, hand the signal fd to
-                    // the idle_callback so it can read and forward the signal.
+                    // SIGCHLD on this fd is what reaps the container. It has to be
+                    // handled here: a busy stdout or OOM watch keeps poll from
+                    // going idle, and only this fd becoming readable reports
+                    // the child exit.
                     if let Socket::Signal(signal_fd) = &sockets[i] {
                         if !idle_callback(Some(signal_fd))? {
                             info!("idle_callback stopped the event loop after signal.");
