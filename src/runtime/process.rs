@@ -20,8 +20,30 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 // for pre_exec
 use std::process::{Command, Stdio, exit};
+
+/// Whether this process may run the exit command.
+///
+/// The original conmon process must not run it. Podman may be blocked in
+/// Wait() on that process while holding the container lock, and the exit
+/// command takes the same lock. The command becomes allowed in the surviving
+/// child after the double-fork, and in this process when --sync does not fork.
+///
+/// This records permission only. It does not mean the original parent has
+/// already exited or released its lock.
+static EXIT_COMMAND_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Allow this process to run the exit command.
+pub fn allow_exit_command() {
+    EXIT_COMMAND_ALLOWED.store(true, Ordering::Relaxed);
+}
+
+/// Whether [`allow_exit_command`] has run in this process.
+pub fn exit_command_allowed() -> bool {
+    EXIT_COMMAND_ALLOWED.load(Ordering::Relaxed)
+}
 
 /// Convert a nix::Error into std::io::Error (for use inside pre_exec closure).
 fn io_err(e: nix::Error) -> Error {
@@ -276,13 +298,17 @@ impl RuntimeProcess {
                         }
                         exit(0);
                     }
-                    // In the child: continue execution.
-                    Ok(ForkResult::Child) => {}
+                    // Allow the exit command in the surviving child.
+                    Ok(ForkResult::Child) => allow_exit_command(),
                     Err(e) => {
                         return Err(ConmonError::new(format!("Failed to fork: {e}"), 1));
                     }
                 }
             }
+        } else {
+            // --sync keeps this process, so the exit command is allowed here,
+            // as conmon-v2 does after skipping the fork.
+            allow_exit_command();
         }
 
         // Detach from controlling terminal: new session.

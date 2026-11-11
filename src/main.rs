@@ -18,6 +18,7 @@ use conmon::exit::unblock_lifecycle_signals;
 use conmon::exit::write_exit_files;
 use conmon::log;
 use conmon::logging::plugin::initialize_log_plugins;
+use conmon::runtime::process::exit_command_allowed;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -169,6 +170,18 @@ fn main() -> ExitCode {
             error!("Exiting with error message: {}", e.msg);
             eprintln!("conmon: {}", e.msg);
             info!("Exiting with status {}", e.code);
+            // The exit command must not run in the original process. Podman
+            // may be blocked in Wait() on it while holding the container lock,
+            // and the exit command takes that lock. Return the error status
+            // and skip the exit files and the exit command.
+            //
+            // Once the command is allowed, fall through. That is the surviving
+            // child after the double-fork, or this process when --sync skips
+            // the fork. Permission does not mean the original parent has
+            // already exited or released its lock.
+            if !exit_command_allowed() {
+                return ExitCode::from(e.code);
+            }
             e.code as i32
         }
     };
