@@ -28,7 +28,12 @@ BATS_DIR="${SCRIPT_DIR}/../bats"
 
 # Run e2e tests using the installed conmon-v3 binary.
 # Keep this under the TMT plan duration (15m) with a little headroom for cleanup.
-cd "$BATS_DIR" && timeout 840 env CONMON_BINARY="/usr/bin/conmon-v3" bats . || {
+# Real Splunk Enterprise coverage is a separate plan (/plans/e2e-splunk); keep
+# it off here so the large image is never pulled in the default suite.
+cd "$BATS_DIR" && timeout 840 env \
+    CONMON_BINARY="/usr/bin/conmon-v3" \
+    CONMON_TEST_SPLUNK_REAL=0 \
+    bats . || {
     rc=$?
     if [ $rc -eq 124 ]; then
         echo "BATS timed out after 14 minutes" >&2

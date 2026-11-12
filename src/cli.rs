@@ -1,6 +1,7 @@
 use crate::Cid;
 use crate::error::{ConmonError, ConmonResult};
 use crate::locale_string::validate_log_tag;
+use crate::logging::non_blocking::{DeliveryMode, parse_delivery_mode};
 use crate::logging::plugin::{LogDriverKind, LogPluginCfg, normalize_log_driver_name};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -109,6 +110,21 @@ pub struct Opts {
     /// Driver-specific option KEY=VALUE (can be specified multiple times).
     #[arg(long = "log-driver-opt", value_parser = parse_log_driver_opt)]
     pub log_driver_opts: Vec<(String, String)>,
+
+    /// Delivery mode for every configured log driver: `blocking` or `non-blocking`.
+    ///
+    /// `blocking` (the default) writes on the stdio thread. `non-blocking`
+    /// queues chunks for one worker shared by all drivers.
+    #[arg(long = "log-mode", value_name = "MODE", action = ArgAction::Append)]
+    pub log_mode: Vec<String>,
+
+    /// Queued payload limit for `--log-mode non-blocking` (default `1m`).
+    #[arg(
+        long = "log-max-buffer-size",
+        value_name = "SIZE",
+        action = ArgAction::Append
+    )]
+    pub log_max_buffer_size: Vec<String>,
 
     /// Maximum size of log file
     #[arg(long = "log-size-max", value_parser = clap::value_parser!(i64), allow_negative_numbers = true)]
@@ -486,6 +502,23 @@ pub fn validate_log_tag_locale(opts: &Opts) -> ConmonResult<()> {
     Ok(())
 }
 
+/// `--log-mode` and `--log-max-buffer-size` apply once, to every driver.
+///
+/// Repeating either flag is an error. The values themselves are parsed by
+/// [`parse_delivery_mode`].
+pub fn log_delivery_mode(opts: &Opts) -> ConmonResult<DeliveryMode> {
+    if opts.log_mode.len() > 1 {
+        return Err(ConmonError::new("duplicate --log-mode", 1));
+    }
+    if opts.log_max_buffer_size.len() > 1 {
+        return Err(ConmonError::new("duplicate --log-max-buffer-size", 1));
+    }
+    parse_delivery_mode(
+        opts.log_mode.first().map(String::as_str),
+        opts.log_max_buffer_size.first().map(String::as_str),
+    )
+}
+
 /// Select log plugins from either `--log-driver` or legacy `--log-path`.
 ///
 /// When `--log-driver` is set, [`determine_log_driver`] is used and `--log-path`
@@ -502,6 +535,8 @@ pub fn resolve_log_plugins(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCf
     } else {
         determine_log_plugin(opts)?
     };
+
+    reject_delivery_opts_on_drivers(&entries)?;
 
     if opts.no_container_partial_message && !entries.iter().any(|(name, _)| name == "journald") {
         let msg = "--no-container-partial-message has no effect without journald log driver";
@@ -554,6 +589,24 @@ impl LogPluginCfg {
             log_driver_opts: opts.log_driver_opts.clone(),
         })
     }
+}
+
+/// `mode` and `max-buffer-size` are process-wide flags, not driver options.
+fn reject_delivery_opts_on_drivers(entries: &[(String, LogPluginCfg)]) -> ConmonResult<()> {
+    for (_, cfg) in entries {
+        for (key, _) in &cfg.log_driver_opts {
+            let flag = match key.as_str() {
+                "mode" => "--log-mode",
+                "max-buffer-size" => "--log-max-buffer-size",
+                _ => continue,
+            };
+            return Err(ConmonError::new(
+                format!("--log-driver-opt {key}= is not a driver option; use {flag}"),
+                1,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Cross-driver validation shared by `--log-path` and `--log-driver` parsers.
@@ -1010,6 +1063,26 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "splunk")]
+    #[test]
+    fn log_driver_splunk_is_accepted() -> ConmonResult<()> {
+        let o = Opts {
+            log_driver: vec!["splunk".into()],
+            log_driver_opts: vec![
+                (
+                    "splunk-url".into(),
+                    "https://splunk.example:8088/services/collector/event".into(),
+                ),
+                ("splunk-token".into(), "secret".into()),
+            ],
+            ..Default::default()
+        };
+        let entries = determine_log_driver(&o)?;
+        assert_eq!(entries[0].0, "splunk");
+        assert_eq!(entries[0].1.log_driver_opts.len(), 2);
+        Ok(())
+    }
+
     #[test]
     fn log_driver_syslog_is_accepted() -> ConmonResult<()> {
         let o = Opts {
@@ -1093,6 +1166,37 @@ mod tests {
             ("path".into(), "/var/log/a=b.log".into())
         );
         assert!(parse_log_driver_opt("nosplit").is_err());
+    }
+
+    #[test]
+    fn delivery_flags_are_not_log_driver_opts() {
+        for key in ["mode", "max-buffer-size"] {
+            let o = Opts {
+                log_driver: vec!["none".into()],
+                log_driver_opts: vec![(key.into(), "non-blocking".into())],
+                ..Default::default()
+            };
+            let err = resolve_log_plugins(&o).unwrap_err();
+            assert!(err.msg.contains("not a driver option"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_log_delivery_flags_are_rejected() {
+        let mode = Opts {
+            log_mode: vec!["blocking".into(), "non-blocking".into()],
+            ..Default::default()
+        };
+        let err = log_delivery_mode(&mode).unwrap_err();
+        assert!(err.msg.contains("duplicate --log-mode"), "{err}");
+
+        let size = Opts {
+            log_mode: vec!["non-blocking".into()],
+            log_max_buffer_size: vec!["1m".into(), "2m".into()],
+            ..Default::default()
+        };
+        let err = log_delivery_mode(&size).unwrap_err();
+        assert!(err.msg.contains("duplicate --log-max-buffer-size"), "{err}");
     }
 
     #[test]
