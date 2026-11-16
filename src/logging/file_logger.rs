@@ -30,8 +30,6 @@ const TSBUFLEN: usize = 44;
 /// Writes all log data to the configured file path.
 pub struct FileLogger {
     file: File,
-    stdout_has_partial: bool,
-    stderr_has_partial: bool,
     no_sync: bool,
     max_size: Option<u64>,
     global_max_size: Option<u64>,
@@ -68,8 +66,6 @@ impl FileLogger {
 
         Ok(Self {
             file,
-            stdout_has_partial: false,
-            stderr_has_partial: false,
             no_sync: cfg.no_sync,
             max_size: cfg.max_size.map(|n| u64::try_from(n).unwrap_or(u64::MAX)),
             global_max_size: cfg
@@ -656,13 +652,6 @@ impl LogPlugin for FileLogger {
     }
 
     fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()> {
-        // Track if we previously wrote a partial line for each stream.
-        let has_partial = if is_stdout {
-            self.stdout_has_partial
-        } else {
-            self.stderr_has_partial
-        };
-
         let pipename = if is_stdout { "stdout" } else { "stderr" };
 
         let mut buf = data;
@@ -671,39 +660,12 @@ impl LogPlugin for FileLogger {
         // Helper to map I/O errors into ConmonError.
         let map_err = |e: std::io::Error, msg: &str| ConmonError::new(format!("{msg}: {e}"), 1);
 
-        // If we get an empty buffer and we had a partial line before, emit terminating "F\n".
-        if buflen == 0 && has_partial {
-            let mut tsbuf = [0u8; TSBUFLEN];
-            Self::set_k8s_timestamp(&mut tsbuf, pipename);
-            let ts_len = tsbuf.iter().position(|&b| b == 0).unwrap_or(tsbuf.len());
-
-            // bytes: timestamp + "F\n"
-            let bytes_to_be_written = ts_len as u64 + 2;
-            if let Some(global_max) = self.global_max_size {
-                if self.total_bytes_written.saturating_add(bytes_to_be_written) >= global_max {
-                    return Ok(());
-                }
-            }
-            self.rotate_if_needed(bytes_to_be_written)?;
-
-            self.file
-                .write_all(&tsbuf[..ts_len])
-                .map_err(|e| map_err(e, "failed to write timestamp"))?;
-            self.file
-                .write_all(b"F\n")
-                .map_err(|e| map_err(e, "failed to write terminating F-sequence"))?;
-            self.file
-                .flush()
-                .map_err(|e| map_err(e, "failed to flush log file"))?;
-
-            self.bytes_written = self.bytes_written.saturating_add(bytes_to_be_written);
-            self.total_bytes_written = self.total_bytes_written.saturating_add(bytes_to_be_written);
-
-            if is_stdout {
-                self.stdout_has_partial = false;
-            } else {
-                self.stderr_has_partial = false;
-            };
+        // Same as conmon-v2 write_k8s_log: only bytes in this buffer are
+        // written. A chunk with no newline is a partial record ("P ") and
+        // keeps its text. A chunk that ends in newline is a full record
+        // ("F "). A zero-length write, including the exit-time drain, adds
+        // nothing. An "F" record with no message is not a valid CRI log line.
+        if buflen == 0 {
             return Ok(());
         }
 
@@ -763,12 +725,6 @@ impl LogPlugin for FileLogger {
             self.bytes_written = self.bytes_written.saturating_add(bytes_to_be_written);
             self.total_bytes_written = self.total_bytes_written.saturating_add(bytes_to_be_written);
 
-            if is_stdout {
-                self.stdout_has_partial = partial;
-            } else {
-                self.stderr_has_partial = partial;
-            };
-
             // Advance buffer
             buf = &buf[line_slice_len..];
             buflen -= line_len;
@@ -778,5 +734,56 @@ impl LogPlugin for FileLogger {
             .flush()
             .map_err(|e| map_err(e, "failed to flush log file"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_log(logger: FileLogger, path: &std::path::Path) -> String {
+        drop(logger);
+        let text = std::fs::read_to_string(path).expect("read log");
+        let _ = std::fs::remove_file(path);
+        text
+    }
+
+    fn test_logger() -> (FileLogger, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "conmon-k8s-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cfg = LogPluginCfg {
+            path: path.clone(),
+            ..LogPluginCfg::default()
+        };
+        let logger = FileLogger::new(&cfg).expect("open log");
+        (logger, path)
+    }
+
+    #[test]
+    fn partial_chunk_is_tagged_p_and_completion_is_f() {
+        let (mut logger, path) = test_logger();
+        // Two reads of one logical line, as when the stdio buffer splits it.
+        logger.write(true, b"hel").expect("partial");
+        logger.write(true, b"lo\n").expect("full");
+        let text = read_log(logger, &path);
+        assert!(text.contains("stdout P hel\n"), "{text}");
+        assert!(text.contains("stdout F lo\n"), "{text}");
+    }
+
+    #[test]
+    fn empty_drain_does_not_append_an_f_record() {
+        let (mut logger, path) = test_logger();
+        // printf with no newline: one partial record, then the exit drain.
+        logger.write(true, b"hello").expect("partial");
+        logger.write(true, b"").expect("drain");
+        let text = read_log(logger, &path);
+        assert!(text.contains("stdout P hello\n"), "{text}");
+        assert!(!text.contains("stdout F"), "{text}");
     }
 }

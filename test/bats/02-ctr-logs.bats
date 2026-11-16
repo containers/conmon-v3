@@ -173,6 +173,21 @@ run_conmon_with_log_opts() {
     assert "${output}" =~ "stdout P"
 }
 
+@test "ctr logs: k8s partial line is not closed with an empty F record" {
+    # printf writes no newline, so the text stays one P record. The exit
+    # drain must not append "stdout F" with no message: Podman rejects
+    # that line as not a valid container log line.
+    setup_container_env "printf '%s' partial-no-newline"
+    run_conmon_with_default_args \
+        --log-path "k8s-file:$LOG_PATH"
+
+    assert_file_exists "$LOG_PATH"
+    run cat "$LOG_PATH"
+    assert_output_contains "stdout P partial-no-newline"
+    run grep -E 'stdout F$' "$LOG_PATH"
+    assert_failure
+}
+
 @test "ctr logs: should keep only log-max-files backup files" {
     # The container's output rotates the 1024-byte log several times over, so
     # with --log-max-files 1 a backup must exist, and it must be the only one
