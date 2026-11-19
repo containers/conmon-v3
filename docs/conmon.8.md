@@ -214,6 +214,10 @@ once.
     `syslog-address`, messages go through **openlog(3)**/**syslog(3)**
     (process-global; only one such driver may be active). With
     `syslog-address`, messages are sent to a remote endpoint (see below).
+  * `splunk` - POST each container line to a Splunk HTTP Event Collector
+    endpoint. See **Splunk HEC** below. Built when the Cargo feature
+    `splunk` is enabled (the default); builds with
+    `--no-default-features` omit this driver and its HTTP stack.
   * `none` - Discard container output.
   * `passthrough` - Do not capture container output. The container inherits
     conmon's standard streams, and conmon does not create an attach socket.
@@ -242,6 +246,66 @@ once.
   traditional local layout: `<PRI>`, Go's `time.Stamp`, the tag, and the
   pid, then the line and a trailing newline. Those sockets have no
   octet-count prefix.
+
+**--log-mode**=_MODE_
+
+: How container output is delivered to every configured driver.
+  `blocking` (the default) waits for each driver, so a slow or stuck driver
+  can stall the container. `non-blocking` lets the container keep running
+  and holds output in memory, up to **--log-max-buffer-size**. Once that
+  buffer is full, further output is dropped and delivery is not guaranteed.
+  conmon warns when output is dropped. The drivers share one buffer, so a
+  slow driver can delay the others. Output already accepted is sent before
+  conmon exits. A driver error does not stop the container.
+
+**--log-max-buffer-size**=_SIZE_
+
+: Queue limit for **--log-mode** `non-blocking`. Default **1m**
+  (1,000,000 bytes). `k`/`m`/`g` are decimal; `KiB`/`MiB`/`GiB` are binary.
+  Valid only together with **--log-mode** `non-blocking`.
+
+  Example:
+
+      conmon ... --log-driver syslog \
+          --log-mode non-blocking \
+          --log-max-buffer-size 4m \
+          --log-driver-opt syslog-address=tcp://logs.example:514
+
+      conmon ... --log-driver splunk \
+          --log-mode non-blocking \
+          --log-max-buffer-size 4m \
+          --log-driver-opt splunk-url=https://splunk.example:8088/services/collector/event \
+          --log-driver-opt splunk-token=HEC_TOKEN
+
+**Splunk HEC**
+
+: Available when built with Cargo feature `splunk` (default). Sends one
+  JSON event per container line to `splunk-url` (full `http(s)://` HEC
+  event URL). Dialing starts on the first line.
+  Required: `splunk-url`, `splunk-token` (`Authorization: Splunk <token>`;
+  redacted from errors/Debug; still visible on the process argv/**/proc**).
+  Optional: `splunk-source`, `splunk-sourcetype`, `splunk-index`,
+  `splunk-insecureskipverify` (`true`/`1` skips TLS verify).
+  Event shape: `time`, `event.line`, `event.source` (`stdout`/`stderr`),
+  `event.tag`. Invalid UTF-8 → U+FFFD. Unknown `splunk-*` opts and
+  **--log-label** are rejected.
+  One-second connect/request timeout; transient errors, HTTP 429, and
+  5xx retry once (duplicates possible). Other 4xx, TLS failures, HEC
+  `code` ≠ 0, and responses over 64 KiB do not retry. After a failed
+  line, remaining complete lines in that write are dropped; a partial
+  stays buffered. Logging failure does not stop the container.
+  Not implemented vs Docker: batching, gzip, `json`/`raw`, custom CA,
+  indexer ack, disk buffering. Optional non-blocking delivery is
+  **--log-mode** `non-blocking`, not a Splunk-specific queue.
+
+  Example:
+
+      conmon --cid ID --cuuid ID --runtime /usr/bin/crun \
+          --log-driver splunk \
+          --log-driver-opt splunk-url=https://splunk.example:8088/services/collector/event \
+          --log-driver-opt splunk-token=HEC_TOKEN \
+          --log-driver-opt splunk-index=main \
+          --log-tag myctr ...
 
 **-l**, **--log-path**=_SPEC_ (multiple)
 

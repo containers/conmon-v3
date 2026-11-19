@@ -106,6 +106,30 @@ jobs:
           - type: repository-file
             id: https://copr.fedorainfracloud.org/coprs/rhcontainerbot/podman-next/repo/centos-stream-$releasever/rhcontainerbot-podman-next-centos-stream-$releasever.repo
 
+  # Real Splunk Enterprise HEC e2e. Manual only: the image is large and slow
+  # to start. After a Copr build succeeds, comment:
+  #   /packit test --identifier e2e-splunk
+  # Or re-run the e2e-splunk check in the GitHub UI.
+  - job: tests
+    trigger: pull_request
+    identifier: e2e-splunk
+    packages: [conmon-fedora]
+    manual_trigger: true
+    targets:
+      - fedora-latest-stable-x86_64
+    tmt_plan: "/plans/e2e-splunk"
+    tf_extra_params:
+      environments:
+        - artifacts:
+          - type: repository-file
+            id: https://copr.fedorainfracloud.org/coprs/rhcontainerbot/podman-next/repo/fedora-$releasever/rhcontainerbot-podman-next-fedora-$releasever.repo
+          variables:
+            CONMON_TEST_SPLUNK_REAL: "1"
+      settings:
+        pipeline:
+          # Splunk first boot + image pull can exceed the default TF timeout.
+          timeout: 60
+
   # Podman system tests on Fedora
   - job: tests
     trigger: pull_request
