@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "splunk")]
+use crate::logging::splunk_logger::SplunkLogger;
 use crate::{
     error::{ConmonError, ConmonResult},
     logging::{
@@ -45,6 +47,8 @@ pub enum LogDriverKind {
     File,
     Journald,
     Syslog,
+    #[cfg(feature = "splunk")]
+    Splunk,
 }
 
 /// Normalize a log driver name (`k8s-file` → `k8s_file`).
@@ -64,6 +68,19 @@ impl LogDriverKind {
             "file" | "k8s_file" => Ok(Self::File),
             "journald" => Ok(Self::Journald),
             "syslog" => Ok(Self::Syslog),
+            "splunk" => {
+                #[cfg(feature = "splunk")]
+                {
+                    Ok(Self::Splunk)
+                }
+                #[cfg(not(feature = "splunk"))]
+                {
+                    Err(ConmonError::new(
+                        "splunk log driver was not enabled at build time",
+                        1,
+                    ))
+                }
+            }
             other => Err(ConmonError::new(format!("No such log driver {other}"), 1)),
         }
     }
@@ -78,19 +95,23 @@ impl LogDriverKind {
             Self::File => Ok(LogDriver::File(Box::new(FileLogger::new(cfg)?))),
             Self::Journald => Ok(LogDriver::Journald(Box::new(JournaldLogger::new(cfg)?))),
             Self::Syslog => Ok(LogDriver::Syslog(Box::new(SyslogLogger::new(cfg)?))),
+            #[cfg(feature = "splunk")]
+            Self::Splunk => Ok(LogDriver::Splunk(Box::new(SplunkLogger::new(cfg)?))),
         }
     }
 }
 
 /// Dispatches container log writes to one built-in logger.
 ///
-/// Journald and syslog loggers are boxed because each buffers full stdio
-/// lines; keeping those buffers out of the enum avoids a large stack value.
+/// Journald, syslog, and splunk loggers are boxed because each buffers full
+/// stdio lines; keeping those buffers out of the enum avoids a large stack value.
 pub enum LogDriver {
     None(NoneLogger),
     File(Box<FileLogger>),
     Journald(Box<JournaldLogger>),
     Syslog(Box<SyslogLogger>),
+    #[cfg(feature = "splunk")]
+    Splunk(Box<SplunkLogger>),
 }
 
 impl LogPlugin for LogDriver {
@@ -100,6 +121,8 @@ impl LogPlugin for LogDriver {
             Self::File(logger) => logger.write(is_stdout, data),
             Self::Journald(logger) => logger.write(is_stdout, data),
             Self::Syslog(logger) => logger.write(is_stdout, data),
+            #[cfg(feature = "splunk")]
+            Self::Splunk(logger) => logger.write(is_stdout, data),
         }
     }
 
@@ -109,6 +132,8 @@ impl LogPlugin for LogDriver {
             Self::File(logger) => logger.reopen(),
             Self::Journald(logger) => logger.reopen(),
             Self::Syslog(logger) => logger.reopen(),
+            #[cfg(feature = "splunk")]
+            Self::Splunk(logger) => logger.reopen(),
         }
     }
 }
@@ -196,6 +221,8 @@ mod tests {
             "k8s-file",
             "journald",
             "syslog",
+            #[cfg(feature = "splunk")]
+            "splunk",
         ] {
             assert!(LogDriverKind::parse(name).is_ok(), "{name} should parse");
         }
@@ -211,6 +238,17 @@ mod tests {
         assert_eq!(
             LogDriverKind::parse("journald").unwrap(),
             LogDriverKind::Journald
+        );
+    }
+
+    #[cfg(not(feature = "splunk"))]
+    #[test]
+    fn splunk_driver_rejected_when_feature_disabled() {
+        let err = LogDriverKind::parse("splunk").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("splunk log driver was not enabled at build time"),
+            "{err}"
         );
     }
 
