@@ -127,6 +127,117 @@ pub fn create_pipe() -> ConmonResult<(OwnedFd, OwnedFd)> {
     Ok((rfd, wfd))
 }
 
+/// Stdout, stderr, or the terminal master, still open for reading.
+///
+/// These are the fds that carry container output. A read side that is already
+/// shut down has nothing left to drain.
+fn is_container_output(socket: &Socket) -> bool {
+    matches!(
+        socket,
+        Socket::Remote(remote)
+            if !remote.read_closed
+                && matches!(
+                    remote.socket_type,
+                    SocketType::Stdout | SocketType::Stderr | SocketType::Terminal
+                )
+    )
+}
+
+/// `true` when a non-blocking poll says `fd` has bytes to read.
+fn has_pending_input(fd: BorrowedFd<'_>) -> ConmonResult<bool> {
+    let mut pollfd = [PollFd::new(fd, PollFlags::POLLIN)];
+    loop {
+        match poll(&mut pollfd, 0u16) {
+            Ok(n) => {
+                return Ok(n > 0
+                    && pollfd[0]
+                        .revents()
+                        .is_some_and(|events| events.contains(PollFlags::POLLIN)));
+            }
+            Err(Errno::EINTR) => continue,
+            Err(e) => {
+                return Err(ConmonError::new(
+                    format!(
+                        "handle_stdio poll() failed: {}",
+                        io::Error::from_raw_os_error(e as i32)
+                    ),
+                    1,
+                ));
+            }
+        }
+    }
+}
+
+/// Copy container output that is already queued when the event loop stops.
+///
+/// A short `podman exec` writes its line and exits together. SIGCHLD is then
+/// readable while those bytes are still in the pipe, and returning without
+/// reading them delivers empty exec output.
+fn drain_stdio(
+    sockets: &mut Vec<Socket>,
+    log_plugin: &mut dyn LogPlugin,
+    workerfd_stdin: &Option<OwnedFd>,
+    notify_host_path: &Option<PathBuf>,
+) -> ConmonResult<()> {
+    // The attach client has to exist before the pipe is read, or the bytes
+    // have no console to land on.
+    let listeners: Vec<usize> = sockets
+        .iter()
+        .enumerate()
+        .filter(|(_, socket)| matches!(socket, Socket::Unix(_)))
+        .map(|(index, _)| index)
+        .collect();
+    for index in listeners {
+        loop {
+            let mut added = Vec::new();
+            Socket::handle_data(
+                sockets,
+                index,
+                log_plugin,
+                &mut added,
+                workerfd_stdin.as_ref(),
+                notify_host_path,
+            )?;
+            if added.is_empty() {
+                break;
+            }
+            sockets.extend(added.into_iter().map(Socket::Remote));
+        }
+    }
+
+    let outputs: Vec<usize> = sockets
+        .iter()
+        .enumerate()
+        .filter(|(_, socket)| is_container_output(socket))
+        .map(|(index, _)| index)
+        .collect();
+    for index in outputs {
+        loop {
+            let ready = match &sockets[index] {
+                Socket::Remote(remote) => has_pending_input(remote.fd.as_fd())?,
+                _ => false,
+            };
+            if !ready {
+                break;
+            }
+            let mut added = Vec::new();
+            let keep_reading = Socket::handle_data(
+                sockets,
+                index,
+                log_plugin,
+                &mut added,
+                workerfd_stdin.as_ref(),
+                notify_host_path,
+            )?;
+            sockets.extend(added.into_iter().map(Socket::Remote));
+            if !keep_reading {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads data from fd and stores them in the buffer.
 /// # Returns
 ///
@@ -507,12 +618,16 @@ where
             let keep_running = idle_callback(None)?;
             if !keep_running {
                 info!("idle_callback stopped the event loop.");
+                drain_stdio(&mut sockets, log_plugin, &workerfd_stdin, &notify_host_path)?;
                 return Ok(());
             }
             continue;
         }
 
         // We will mutate sockets/revents, so iterate by index.
+        // A SIGCHLD reap must not return before the other ready fds in this
+        // wake are handled: stdout often becomes readable in the same poll.
+        let mut stop_after_events = false;
         let mut i = 0;
         while i < revents.len() {
             // If `false`, we close the socket completely.
@@ -522,13 +637,15 @@ where
 
             if let Some(events) = revents[i] {
                 if events.contains(PollFlags::POLLIN) {
-                    // If the POLLIN comes from the signal fd, hand the signal fd to
-                    // the idle_callback so it can read and forward the signal.
-                    if let Socket::Signal(signal_fd) = &sockets[i] {
-                        if !idle_callback(Some(signal_fd))? {
-                            info!("idle_callback stopped the event loop after signal.");
-                            return Ok(());
-                        }
+                    // SIGCHLD on this fd is what reaps the container. It has to be
+                    // handled here: a busy stdout or OOM watch keeps poll from
+                    // going idle, and only this fd becoming readable reports
+                    // the child exit.
+                    if let Some(stop) = match &sockets[i] {
+                        Socket::Signal(signal_fd) => Some(!idle_callback(Some(signal_fd))?),
+                        _ => None,
+                    } {
+                        stop_after_events |= stop;
                         i += 1;
                         continue;
                     }
@@ -619,6 +736,12 @@ where
 
                 // Do NOT increment the `i`, since it now points to swapped fd.
             }
+        }
+
+        if stop_after_events {
+            info!("idle_callback stopped the event loop after signal.");
+            drain_stdio(&mut sockets, log_plugin, &workerfd_stdin, &notify_host_path)?;
+            return Ok(());
         }
     }
 
@@ -1010,6 +1133,56 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "event loop ignored the deadline, ran for {elapsed:?}"
         );
+        Ok(())
+    }
+
+    struct MemLog(Vec<u8>);
+
+    impl crate::logging::plugin::LogPlugin for MemLog {
+        fn write(&mut self, is_stdout: bool, data: &[u8]) -> ConmonResult<()> {
+            if is_stdout {
+                self.0.extend_from_slice(data);
+            }
+            Ok(())
+        }
+
+        fn reopen(&mut self) -> ConmonResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_is_drained_when_the_event_loop_stops() -> ConmonResult<()> {
+        let (stdout_r, stdout_w) = create_pipe()?;
+        let (stderr_r, _stderr_w) = create_pipe()?;
+        let mut log = MemLog(Vec::new());
+
+        // The payload is written only once the loop has already decided to
+        // stop, which is what a fast `podman exec` does: SIGCHLD is handled
+        // before the next stdout read, and the bytes are still in the pipe.
+        handle_stdio(
+            &mut log,
+            Some(stdout_r),
+            stderr_r,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            move |_| {
+                let _ = nix::unistd::write(stdout_w.as_fd(), b"random-0\n");
+                Ok(false)
+            },
+        )?;
+
+        assert_eq!(log.0, b"random-0\n");
         Ok(())
     }
 }

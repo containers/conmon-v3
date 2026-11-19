@@ -9,10 +9,93 @@ setup() {
 }
 
 teardown() {
+    if [[ -n "${KILL_CONMON_ON_TEARDOWN:-}" && -n "${CONMON_PID:-}" ]]; then
+        _kill_pid_tree "$CONMON_PID"
+    fi
     if [[ -n "${CGROUP_V1_MOUNT:-}" ]]; then
         umount "$CGROUP_V1_MOUNT"
     fi
     cleanup_test_env
+}
+
+@test "runtime: SIGCHLD for another child is not forwarded" {
+    # SECONDS is a shell variable, so this wait does not fork. A SIGCHLD that
+    # arrives was forwarded by conmon. The runtime has exited before READY;
+    # the container must still be running, and a later SIGCHLD must not
+    # reach it or be treated as the container exiting.
+    setup_container_env "trap 'echo SIGCHLD-FORWARDED' CHLD; echo READY; end=\$((SECONDS+5)); while [ \$SECONDS -lt \$end ]; do :; done; echo STILL-HERE"
+    start_conmon_with_default_args --log-path "k8s-file:$LOG_PATH"
+    wait_for_log_line "$LOG_PATH" "READY"
+
+    kill -0 "$CONMON_PID"
+    run_runtime state "$CTR_ID"
+    assert "$output" =~ '"status": "running"' "container still running after runtime exit"
+
+    # The trap is installed. A SIGCHLD now must not be delivered to it, and
+    # must not make conmon treat the container as exited.
+    kill -s CHLD "$CONMON_PID"
+    sleep 0.5
+    run cat "$LOG_PATH"
+    assert "$output" !~ "SIGCHLD-FORWARDED" "SIGCHLD was forwarded to the container"
+    kill -0 "$CONMON_PID"
+    run_runtime state "$CTR_ID"
+    assert "$output" =~ '"status": "running"' "container still running after SIGCHLD"
+
+    wait_for_log_line "$LOG_PATH" "STILL-HERE"
+    wait_for_runtime_status "$CTR_ID" stopped
+    wait_for_conmon_exit "$CONMON_PID"
+    run cat "$LOG_PATH"
+    assert "$output" !~ "SIGCHLD-FORWARDED" "SIGCHLD was forwarded to the container"
+}
+
+# Kill pid and its descendants. Used when a writer was left outside the
+# container pid so a failed test cannot leak it.
+_kill_pid_tree() {
+    local pid=$1
+    local child
+    local children
+
+    children=$(cat "/proc/${pid}/task/${pid}/children" 2>/dev/null || true)
+    for child in $children; do
+        _kill_pid_tree "$child"
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+@test "runtime: container exit is reaped while stdout is busy" {
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip "python3 required to drop the pid namespace"
+    fi
+
+    # A pid namespace kills every process in it when pid 1 exits, and
+    # mounting proc without that namespace is rejected. Drop both, and the
+    # paths that only exist to cover /proc. The writer then keeps the
+    # stdout pipe readable after the container process exits, so poll does
+    # not go idle and the exit has to be noticed from SIGCHLD. printf fills
+    # the pipe before that exit, so the first polls are already busy.
+    setup_container_env "echo READY; printf '%200000s\n' y; while true; do echo y; done & exit 42" false
+    python3 - "$BUNDLE_PATH/config.json" <<'PY' || die "failed to adjust the runtime config"
+import json, sys
+path = sys.argv[1]
+with open(path) as fh:
+    cfg = json.load(fh)
+cfg["linux"]["namespaces"] = [
+    ns for ns in cfg["linux"]["namespaces"] if ns.get("type") != "pid"
+]
+cfg["mounts"] = [m for m in cfg["mounts"] if m.get("destination") != "/proc"]
+for key in ("maskedPaths", "readonlyPaths"):
+    cfg["linux"].pop(key, None)
+with open(path, "w") as fh:
+    json.dump(cfg, fh)
+PY
+    KILL_CONMON_ON_TEARDOWN=1
+    mkdir -p "$TEST_TMPDIR/exits"
+    start_conmon_with_default_args --log-path "k8s-file:$LOG_PATH" --exit-dir "$TEST_TMPDIR/exits"
+    wait_for_log_line "$LOG_PATH" "READY"
+    # A missed SIGCHLD leaves conmon reading the writer until something else stops it.
+    wait_for_conmon_exit "$CONMON_PID" 3
+    wait_for_runtime_status "$CTR_ID" stopped
+    [ "$(cat "$TEST_TMPDIR/exits/$CTR_ID")" = 42 ]
 }
 
 @test "runtime: simple runtime test" {

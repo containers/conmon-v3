@@ -482,10 +482,12 @@ impl RuntimeSession {
         self.close_runtime_fds(common, &own_fds)?;
 
         // Setup the signal-fd for the signals we want to handle.
+        // SIGCHLD is how conmon-v2 notices a dead container.
         let mut mask = SigSet::empty();
         mask.add(Signal::SIGTERM);
         mask.add(Signal::SIGQUIT);
         mask.add(Signal::SIGINT);
+        mask.add(Signal::SIGCHLD);
         pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
         let signals = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)?;
         self.signals = Some(signals);
@@ -849,28 +851,33 @@ impl RuntimeSession {
             return Ok(false);
         }
 
-        // We received a signal.
+        // A readable signalfd means a child exited (SIGCHLD) or a lifecycle
+        // signal should be forwarded. Either way, reap afterwards. SIGCHLD is
+        // not forwarded.
         if let Some(signals) = signals {
-            // Read the signal.
-            match signals.read_signal() {
-                Ok(Some(info)) => {
-                    if let Ok(sig) = Signal::try_from(info.ssi_signo as i32) {
-                        // Forward the signal the container if it's running.
-                        info!("Received signal: {:?}", sig);
-                        if let Some(raw_pid) = self.container_pid {
-                            let pid = Pid::from_raw(raw_pid);
-                            kill(pid, sig)?;
-                        }
+            while let Ok(Some(info)) = signals.read_signal() {
+                let Ok(sig) = Signal::try_from(info.ssi_signo as i32) else {
+                    continue;
+                };
+                if sig == Signal::SIGCHLD {
+                    debug!("Received SIGCHLD");
+                    continue;
+                }
+                info!("Received signal: {:?}", sig);
+                if let Some(raw_pid) = self.container_pid {
+                    let pid = Pid::from_raw(raw_pid);
+                    // ESRCH: the container is already gone. Collect its zombie below.
+                    if let Err(e) = kill(pid, sig)
+                        && e != Errno::ESRCH
+                    {
+                        return Err(ConmonError::new(
+                            format!("Failed to forward signal {sig} to container {pid}: {e}"),
+                            1,
+                        ));
                     }
                 }
-                Ok(None) => return Ok(true),
-                Err(_) => return Ok(true),
             }
-            return Ok(self.container_status.is_none());
-        }
-
-        // Stop the event-loop if we reach a timeout.
-        if self.timeout.is_some_and(|t| Instant::now() >= t) {
+        } else if self.timeout.is_some_and(|t| Instant::now() >= t) {
             info!("Timed out - exiting event-loop.");
             // Kill the container in case it exists.
             if let Some(raw_pid) = self.container_pid {
@@ -893,9 +900,23 @@ impl RuntimeSession {
             return Ok(false);
         }
 
-        match self.poll_children_once()? {
-            PollChildrenResult::KeepRunning | PollChildrenResult::ReapedOther => Ok(true),
-            PollChildrenResult::StopEventLoop => Ok(false),
+        self.collect_exited_children()
+    }
+
+    /// `waitpid` until the container is collected or no child has exited.
+    ///
+    /// One unrelated zombie must not hide the container: `waitpid(-1)` returns
+    /// a single child, so keep going until it reports the container or `StillAlive`.
+    fn collect_exited_children(&mut self) -> ConmonResult<bool> {
+        loop {
+            if self.container_status.is_some() {
+                return Ok(false);
+            }
+            match self.poll_children_once()? {
+                PollChildrenResult::ReapedOther => continue,
+                PollChildrenResult::KeepRunning => return Ok(true),
+                PollChildrenResult::StopEventLoop => return Ok(false),
+            }
         }
     }
 
